@@ -1,0 +1,8 @@
+build/
+build-*/
+addons/goldnet/bin/*.dylib
+addons/goldnet/bin/*.so
+addons/goldnet/bin/*.dll
+addons/goldnet/bin/*.pdb
+.DS_Store
+*.o
