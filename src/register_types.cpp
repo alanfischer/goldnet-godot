@@ -5,6 +5,7 @@
 #include <godot_cpp/core/defs.hpp>
 #include <godot_cpp/godot.hpp>
 
+#include "goldnet_link.h"
 #include "goldnet_multiplayer.h"
 
 using namespace godot;
@@ -13,6 +14,7 @@ void initialize_goldnet_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
+	ClassDB::register_class<GoldNetLink>();
 	ClassDB::register_class<GoldNetMultiplayer>();
 }
 

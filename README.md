@@ -18,14 +18,38 @@ this repo as the **goldnet-godot** binding. See
 `MultiplayerAPIExtension` and forwards every virtual to an inner
 `SceneMultiplayer` (`MultiplayerAPI::create_default_interface()`), relaying the
 inner's lifecycle signals up to itself. Installing it changes nothing observable —
-this proves the composition boundary before any custom protocol exists. Verified
-in WizardWars: headless host + client, synchronizers/spawners/RPCs/connect/
-disconnect all behave identically, zero errors.
+this proves the composition boundary before any custom protocol exists.
 
-Later phases replace only the *state-replication* layer (intercept
-synchronizer/spawner configs in `_object_configuration_add`, drive them in
-`_poll` as ack-delta snapshots) while still delegating handshake, auth, peer
-lifecycle, and all `@rpc` traffic to the inner `SceneMultiplayer`.
+**Phase 1 — registry + full-state snapshot (complete).** We now intercept the
+synchronizers we can fully own — *map-static* ones (doors, platforms), identified
+by their owner node not being a direct child of any `MultiplayerSpawner`'s
+spawn-parent — into a registry, and stream their complete state ourselves each
+tick as one unreliable snapshot per peer (`GoldNetLink` RPC carrier). The client
+applies it (`set_indexed` each property) and re-emits the synchronizer's
+`synchronized` signal, which is how the consuming game reacts to replicated state.
+Spawner-managed synchronizers (players, projectiles) and all `@rpc` still flow
+through the inner. Verified in WizardWars: 381 map-entity synchronizers stream and
+apply through our path, no path cache involved (entities are keyed by a hash of
+their scene path, identical on both peers). This is "old netcode (ALWAYS
+full-state) on our path" — parity, not yet the delta.
+
+Two honest limitations at this phase, both resolved later:
+- **No PVS cull yet.** Godot does not bind `MultiplayerSynchronizer::is_visible_to`,
+  so a GDExtension `MultiplayerAPI` cannot evaluate `add_visibility_filter()`
+  callbacks. We honor the *exposed* visibility API (`is_visibility_public()` +
+  explicit `set_visibility_for`) and stream every publicly-visible owned entity.
+  Correctness is safe (a client drops net_ids it hasn't registered and self-heals
+  — there is no path cache to poison), but the game's BSP-PVS bandwidth cull is
+  not applied. Phase 2's ack-delta makes the dominant static movers ~free
+  regardless; restoring the cull needs either an engine/godot-cpp binding for
+  `is_visible_to` or a game-side `set_visibility_for` bridge.
+- **Full-state, not delta.** Every visible entity's full state ships every tick
+  (~60 B/entity). That is the wasteful baseline Phase 2 replaces with
+  delta-against-acked-baseline.
+
+Later phases replace the encoding (Phase 2 ack-delta), fold spawns/despawns into
+the stream (Phase 3), and add client helper nodes (Phase 4). Set `GOLDNET_DEBUG=1`
+for periodic per-peer snapshot stats (entities / bytes / matched-on-apply).
 
 ## Building
 
