@@ -22,6 +22,8 @@
 #include <godot_cpp/classes/multiplayer_peer.hpp>
 #include <godot_cpp/classes/multiplayer_synchronizer.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
+#include <godot_cpp/templates/hash_set.hpp>
+#include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 
@@ -46,12 +48,42 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<uint64_t, SyncEntry> owned_syncs;    // ObjectID -> entry
 	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id   -> ObjectID (client apply lookup)
 
-	// ObjectIDs of the nodes MultiplayerSpawners spawn *into* (their resolved
-	// spawn_path). A synchronizer whose owner node is a direct child of one of these
-	// is spawner-managed (players, projectiles) — its spawn identity rides the inner's
-	// spawner, so we leave it (and its state) on the inner until Phase 3. Everything
-	// else (map-static movers) we intercept.
-	HashMap<uint64_t, uint64_t> spawner_parents;  // spawn-parent ObjectID -> spawner ObjectID
+	// --- Phase 3: spawn / despawn (agnostic — projectiles & players stream like movers) ---
+	// We own every MultiplayerSpawner too, so runtime entities flow through this stream
+	// instead of the inner. Spawns and their STATE use independent hash-id spaces that both
+	// match across peers: the spawn record is keyed by the spawned NODE's path hash; its
+	// child synchronizer registers under its OWN path hash and streams state exactly like a
+	// map mover. Creating the node on the client makes the child synchronizer auto-register;
+	// freeing it auto-unregisters. Nothing distinguishes a mover from a projectile downstream.
+	struct SpawnerEntry {
+		uint32_t net_id = 0; // hash of the spawner's path
+		Callable orig_fn;    // the game's real spawn_function (we wrap it to capture spawn data)
+	};
+	HashMap<uint64_t, SpawnerEntry> spawners;       // spawner ObjectID -> entry
+	HashMap<uint32_t, uint64_t> spawner_netid_to_objid;
+
+	// Server: spawn data captured by the trampoline before the node is in the tree.
+	struct PendingSpawn {
+		uint64_t spawner_objid = 0;
+		Variant data;
+	};
+	HashMap<uint64_t, PendingSpawn> pending_spawns; // spawned-node ObjectID -> captured data
+
+	// Server: live spawn records (one per currently-spawned runtime entity).
+	struct SpawnRecord {
+		uint32_t spawner_net_id = 0;
+		uint64_t node_objid = 0;   // to poll-detect despawn (node freed)
+		Variant data;
+	};
+	HashMap<uint32_t, SpawnRecord> spawn_records;   // node net_id -> record
+
+	// Server: despawns awaiting delivery. Value = the peers that still need it (reliable-
+	// until-acked); erased once every such peer acks a frame carrying it.
+	HashMap<uint32_t, HashSet<int32_t>> despawn_pending; // node net_id -> peers still needing it
+
+	// Client: nodes we spawned, so a despawn can free the right one. Also lets us emit the
+	// spawner's spawned/despawned signals (the game hangs bookkeeping off them).
+	HashMap<uint32_t, uint64_t> client_spawned;     // node net_id -> node ObjectID
 
 	// --- Phase 2: delta-against-acked-baseline ---
 	// A frame is { net_id -> its sync-property values, in slot order }.
@@ -68,6 +100,10 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		uint16_t next_seq = 1;         // 0 is reserved for "no baseline / full state"
 		uint16_t last_acked = 0;
 		bool has_ack = false;
+		// Reliable-until-acked spawn/despawn delivery. net_id -> first seq we (re)sent it in
+		// the current unacked run; once last_acked >= that seq the peer has it and we stop.
+		HashMap<uint32_t, uint16_t> spawn_wait;
+		HashMap<uint32_t, uint16_t> despawn_wait;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
 
@@ -94,11 +130,23 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _relay_server_disconnected();
 
 	// Internals.
-	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // map-static, not spawner-managed
+	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // has streamable sync props
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
 	uint32_t _min_interval_ms() const;
 	static bool _seq_newer(uint16_t a, uint16_t b) { return (int16_t)(a - b) > 0; }
+	static bool _seq_le(uint16_t a, uint16_t b) { return !_seq_newer(a, b); }
+
+	// Phase 3 spawn/despawn.
+	bool spawners_scanned = false;
+	void _wrap_spawner(class MultiplayerSpawner *p_spawner);  // capture its spawn_function
+	void _on_node_added(Node *p_node);                        // SceneTree.node_added → wrap new spawners
+	void _scan_spawners();                                    // one-time: wrap spawners already in tree
+	Variant _spawn_trampoline(Variant p_data, int64_t p_spawner_objid); // wraps the game's spawn_function
+	void _drain_pending_spawns();  // promote captured spawns (now in-tree) to spawn_records
+	void _detect_despawns();       // poll: spawned nodes that were freed become despawns
+	void _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data); // client
+	void _apply_despawn(uint32_t p_net_id);                                                  // client
 
 protected:
 	static void _bind_methods() {}

@@ -77,11 +77,23 @@ void GoldNetMultiplayer::_reset_client_state() {
 	}
 	client_last_seq = 0;
 	client_has = false;
+	client_spawned.clear(); // spawner nodes are torn down with the session
 }
 
 void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	peer_rings.erase((int32_t)p_id); // drop the server-side send history for this peer
+	// Drop the peer from any despawn needer-set so those despawns can still retire.
+	Vector<uint32_t> emptied;
+	for (KeyValue<uint32_t, HashSet<int32_t>> &kv : despawn_pending) {
+		kv.value.erase((int32_t)p_id);
+		if (kv.value.is_empty()) {
+			emptied.push_back(kv.key);
+		}
+	}
+	for (int i = 0; i < emptied.size(); i++) {
+		despawn_pending.erase(emptied[i]);
+	}
 	emit_signal("peer_disconnected", p_id);
 }
 void GoldNetMultiplayer::_relay_connected_to_server() {
@@ -94,30 +106,23 @@ void GoldNetMultiplayer::_relay_server_disconnected() {
 	emit_signal("server_disconnected");
 }
 
-// A synchronizer we can fully own. We intercept map-static synchronizers (doors,
-// platforms — present in the loaded scene identically on both peers) and leave
-// spawner-managed ones (players, projectiles) on the inner: their spawn identity
-// rides the inner's MultiplayerSpawner, which Phase 3 will fold into our stream.
-//
-// The discriminator is *not* the config's spawn flag — add_property() defaults spawn
-// to true, so every runtime-built config (including the movers) has it. Instead we
-// ask whether the synchronizer's owner node is a direct child of a spawner's
-// spawn-parent: spawned nodes land directly under the spawn_path node (Main), while
-// map entities are deeper in the scene (Main/<map>/<entity>).
+// We own every synchronizer that carries at least one sync (per-tick) property. Since
+// Phase 3 also owns the MultiplayerSpawners, there is no longer a map-static vs.
+// spawner-managed split — movers, projectiles, and players all stream their state
+// through the same delta path. (Spawn-only configs, if any, carry no per-tick state
+// and are left alone.)
 bool GoldNetMultiplayer::_should_intercept(MultiplayerSynchronizer *p_sync) const {
 	Ref<SceneReplicationConfig> cfg = p_sync->get_replication_config();
-	if (cfg.is_null() || cfg->get_properties().is_empty()) {
+	if (cfg.is_null()) {
 		return false;
 	}
-	Node *owner = p_sync->get_node_or_null(p_sync->get_root_path());
-	if (!owner) {
-		return false;
+	TypedArray<NodePath> props = cfg->get_properties();
+	for (int i = 0; i < props.size(); i++) {
+		if (cfg->property_get_sync(props[i])) {
+			return true;
+		}
 	}
-	Node *parent = owner->get_parent();
-	if (parent && spawner_parents.has(parent->get_instance_id())) {
-		return false; // spawner-managed — leave to the inner
-	}
-	return true;
+	return false;
 }
 
 // Find (or lazily create) the snapshot carrier at /root/__GoldNetLink. Stateless —
@@ -131,6 +136,14 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 	Window *root = tree->get_root();
 	if (!root) {
 		return nullptr;
+	}
+	// One-time: catch spawners already in the tree (created during _ready, before our first
+	// poll) and every spawner added afterward, so their spawn_function is wrapped before any
+	// spawn() call.
+	if (!spawners_scanned) {
+		spawners_scanned = true;
+		tree->connect("node_added", callable_mp(this, &GoldNetMultiplayer::_on_node_added));
+		_scan_spawners();
 	}
 	GoldNetLink *l = Object::cast_to<GoldNetLink>(root->get_node_or_null(NodePath("__GoldNetLink")));
 	if (!l) {
@@ -161,6 +174,179 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 // freed (godot-cpp has no is_instance_valid; ObjectDB::get_instance does the check).
 static MultiplayerSynchronizer *sync_from_objid(uint64_t p_objid) {
 	return Object::cast_to<MultiplayerSynchronizer>(ObjectDB::get_instance(p_objid));
+}
+
+// --- Phase 3: spawn / despawn ---
+
+// Replace a spawner's spawn_function with our trampoline, so a server spawn(data) hands us
+// the reconstruction data. We must do this BEFORE the first spawn — the spawn itself is the
+// first time object_configuration_add reveals the spawner, which is too late — so we hook
+// SceneTree.node_added (and a one-time scan for spawners already in the tree). Idempotent.
+void GoldNetMultiplayer::_wrap_spawner(MultiplayerSpawner *p_spawner) {
+	if (!p_spawner) {
+		return;
+	}
+	uint64_t objid = p_spawner->get_instance_id();
+	if (spawners.has(objid)) {
+		return;
+	}
+	SpawnerEntry e;
+	e.net_id = (uint32_t)String(p_spawner->get_path()).hash();
+	e.orig_fn = p_spawner->get_spawn_function();
+	spawners[objid] = e;
+	spawner_netid_to_objid[e.net_id] = objid;
+	p_spawner->set_spawn_function(
+			callable_mp(this, &GoldNetMultiplayer::_spawn_trampoline).bind((int64_t)objid));
+}
+
+void GoldNetMultiplayer::_on_node_added(Node *p_node) {
+	MultiplayerSpawner *sp = Object::cast_to<MultiplayerSpawner>(p_node);
+	if (sp) {
+		_wrap_spawner(sp);
+	}
+}
+
+void GoldNetMultiplayer::_scan_spawners() {
+	SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+	if (!tree || !tree->get_root()) {
+		return;
+	}
+	TypedArray<Node> found = tree->get_root()->find_children("*", "MultiplayerSpawner", true, false);
+	for (int i = 0; i < found.size(); i++) {
+		_wrap_spawner(Object::cast_to<MultiplayerSpawner>(found[i]));
+	}
+}
+
+// The wrapper installed over each spawner's spawn_function. On the server, spawn(data)
+// calls this; we run the game's real function to build the node, stash the reconstruction
+// data (the node isn't in the tree yet — _drain_pending_spawns promotes it once it is), and
+// return the node so spawn() proceeds normally.
+Variant GoldNetMultiplayer::_spawn_trampoline(Variant p_data, int64_t p_spawner_objid) {
+	uint64_t sobj = (uint64_t)p_spawner_objid;
+	Variant node_v;
+	if (spawners.has(sobj)) {
+		node_v = spawners[sobj].orig_fn.callv(Array::make(p_data));
+	}
+	Node *node = Object::cast_to<Node>(node_v);
+	if (node) {
+		PendingSpawn ps;
+		ps.spawner_objid = sobj;
+		ps.data = p_data;
+		pending_spawns[node->get_instance_id()] = ps;
+	}
+	return node_v;
+}
+
+// Server: promote captured spawns to spawn_records once the node is in the tree (so its
+// path — and thus net_id — is stable).
+void GoldNetMultiplayer::_drain_pending_spawns() {
+	if (pending_spawns.is_empty()) {
+		return;
+	}
+	Vector<uint64_t> done;
+	for (const KeyValue<uint64_t, PendingSpawn> &kv : pending_spawns) {
+		Node *node = Object::cast_to<Node>(ObjectDB::get_instance(kv.key));
+		if (!node) {
+			done.push_back(kv.key); // freed before it entered the tree
+			continue;
+		}
+		if (!node->is_inside_tree()) {
+			continue; // wait for spawn() to add it
+		}
+		uint32_t net_id = (uint32_t)String(node->get_path()).hash();
+		SpawnRecord rec;
+		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
+		rec.node_objid = kv.key;
+		rec.data = kv.value.data;
+		spawn_records[net_id] = rec;
+		despawn_pending.erase(net_id); // a reused net_id is a fresh spawn, not a despawn
+		done.push_back(kv.key);
+	}
+	for (int i = 0; i < done.size(); i++) {
+		pending_spawns.erase(done[i]);
+	}
+}
+
+// Server: a spawned node that has been freed becomes a despawn owed to every current peer.
+void GoldNetMultiplayer::_detect_despawns() {
+	if (spawn_records.is_empty()) {
+		return;
+	}
+	Vector<uint32_t> gone;
+	for (const KeyValue<uint32_t, SpawnRecord> &kv : spawn_records) {
+		if (!ObjectDB::get_instance(kv.value.node_objid)) {
+			gone.push_back(kv.key);
+		}
+	}
+	if (gone.is_empty()) {
+		return;
+	}
+	PackedInt32Array peers = inner->get_peers();
+	for (int i = 0; i < gone.size(); i++) {
+		uint32_t net_id = gone[i];
+		spawn_records.erase(net_id);
+		HashSet<int32_t> needers;
+		for (int p = 0; p < peers.size(); p++) {
+			needers.insert(peers[p]);
+		}
+		if (!needers.is_empty()) {
+			despawn_pending[net_id] = needers;
+		}
+		for (KeyValue<int32_t, PeerRing> &pr : peer_rings) {
+			pr.value.spawn_wait.erase(net_id); // stop resending the (now void) spawn
+		}
+	}
+}
+
+// Client: build a spawned node from its recipe, add it under the spawner's spawn_path, and
+// fire the spawner's `spawned` signal so the game runs its per-node bookkeeping. The node's
+// child synchronizer auto-registers on enter-tree and streams state like any other entity.
+void GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
+	if (client_spawned.has(p_net_id)) {
+		return; // already have it (redundant reliable-until-acked resend)
+	}
+	if (!spawner_netid_to_objid.has(p_spawner_net_id)) {
+		return; // spawner not registered here yet — a later resend will land
+	}
+	uint64_t sobj = spawner_netid_to_objid[p_spawner_net_id];
+	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(ObjectDB::get_instance(sobj));
+	if (!spawner || !spawners.has(sobj)) {
+		return;
+	}
+	Node *spawn_root = spawner->get_node_or_null(spawner->get_spawn_path());
+	if (!spawn_root) {
+		return;
+	}
+	Variant node_v = spawners[sobj].orig_fn.callv(Array::make(p_data));
+	Node *node = Object::cast_to<Node>(node_v);
+	if (!node) {
+		return;
+	}
+	spawn_root->add_child(node);
+	client_spawned[p_net_id] = node->get_instance_id();
+	spawner->emit_signal("spawned", node);
+}
+
+// Client: free a spawned node and fire the spawner's `despawned` signal.
+void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
+	if (!client_spawned.has(p_net_id)) {
+		return;
+	}
+	uint64_t objid = client_spawned[p_net_id];
+	client_spawned.erase(p_net_id);
+	Node *node = Object::cast_to<Node>(ObjectDB::get_instance(objid));
+	if (!node) {
+		return;
+	}
+	Node *parent = node->get_parent();
+	for (const KeyValue<uint64_t, SpawnerEntry> &kv : spawners) {
+		MultiplayerSpawner *s = Object::cast_to<MultiplayerSpawner>(ObjectDB::get_instance(kv.key));
+		if (s && s->get_node_or_null(s->get_spawn_path()) == parent) {
+			s->emit_signal("despawned", node);
+			break;
+		}
+	}
+	node->queue_free();
 }
 
 uint32_t GoldNetMultiplayer::_min_interval_ms() const {
@@ -260,6 +446,56 @@ void GoldNetMultiplayer::_server_tick() {
 			pr.next_seq = 1; // 0 is reserved for "no baseline"
 		}
 
+		// Spawns owed to this peer (reliable-until-acked): include each until the peer
+		// acks a frame carrying it. spawn_wait[net_id] is the first seq of the current
+		// unacked run; once last_acked >= that, it's delivered and we stop.
+		Ref<StreamPeerBuffer> spawn_body;
+		spawn_body.instantiate();
+		uint16_t spawn_ct = 0;
+		for (const KeyValue<uint32_t, SpawnRecord> &kv : spawn_records) {
+			uint32_t nid = kv.key;
+			uint16_t fs;
+			if (pr.spawn_wait.has(nid)) {
+				fs = pr.spawn_wait[nid];
+			} else {
+				fs = seq;
+				pr.spawn_wait[nid] = seq;
+			}
+			if (pr.has_ack && _seq_le(fs, pr.last_acked)) {
+				pr.spawn_wait.erase(nid);
+				continue; // delivered
+			}
+			spawn_body->put_u32(nid);
+			spawn_body->put_u32(kv.value.spawner_net_id);
+			spawn_body->put_var(kv.value.data);
+			spawn_ct++;
+		}
+
+		// Despawns owed to this peer (same reliable-until-acked scheme).
+		Ref<StreamPeerBuffer> despawn_body;
+		despawn_body.instantiate();
+		uint16_t despawn_ct = 0;
+		for (KeyValue<uint32_t, HashSet<int32_t>> &kv : despawn_pending) {
+			if (!kv.value.has(peer)) {
+				continue;
+			}
+			uint32_t nid = kv.key;
+			uint16_t fs;
+			if (pr.despawn_wait.has(nid)) {
+				fs = pr.despawn_wait[nid];
+			} else {
+				fs = seq;
+				pr.despawn_wait[nid] = seq;
+			}
+			if (pr.has_ack && _seq_le(fs, pr.last_acked)) {
+				pr.despawn_wait.erase(nid);
+				kv.value.erase(peer);
+				continue; // delivered to this peer
+			}
+			despawn_body->put_u32(nid);
+			despawn_ct++;
+		}
+
 		// Build this frame's full value set (stored as the next baseline) and, in
 		// parallel, the delta records against `base`.
 		FrameData frame;
@@ -308,6 +544,10 @@ void GoldNetMultiplayer::_server_tick() {
 		buf->put_u16(seq);
 		buf->put_u16(base_seq);
 		buf->put_u32(now);
+		buf->put_u16(spawn_ct);
+		buf->put_data(spawn_body->get_data_array());
+		buf->put_u16(despawn_ct);
+		buf->put_data(despawn_body->get_data_array());
 		buf->put_u16(changed);
 		buf->put_data(body->get_data_array());
 		PackedByteArray bytes = buf->get_data_array();
@@ -340,7 +580,6 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	uint16_t base_seq = buf->get_u16();
 	uint32_t server_time = buf->get_u32(); // header (game carries its own per-entity stamp prop)
 	(void)server_time;
-	int count = buf->get_u16();
 
 	// Drop stale/reordered snapshots (unreliable transport). We only advance forward.
 	if (client_has && !_seq_newer(seq, client_last_seq)) {
@@ -366,6 +605,24 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			return;
 		}
 	}
+
+	// Spawns first: create the nodes so their child synchronizers register before the
+	// entity deltas below reference them (add_child fires enter-tree synchronously).
+	int spawn_ct = buf->get_u16();
+	for (int i = 0; i < spawn_ct; i++) {
+		uint32_t nid = buf->get_u32();
+		uint32_t spawner_nid = buf->get_u32();
+		Variant data = buf->get_var();
+		_apply_spawn(nid, spawner_nid, data);
+	}
+	// Despawns: collect now (wire order), free after the entity deltas are applied.
+	int despawn_ct = buf->get_u16();
+	Vector<uint32_t> despawns;
+	for (int i = 0; i < despawn_ct; i++) {
+		despawns.push_back(buf->get_u32());
+	}
+
+	int count = buf->get_u16();
 
 	// New frame = baseline carried forward, with this delta's changed fields applied.
 	FrameData frame;
@@ -430,8 +687,14 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		}
 	}
 
-	// Drop entities no longer registered here (e.g. after a map change) so the client
-	// baseline can't diverge from the server's, which only tracks live entities.
+	// Now free despawned nodes (after entity deltas so nothing applies to a node we then
+	// free — queue_free is deferred anyway, but this keeps the ordering clean).
+	for (int i = 0; i < despawns.size(); i++) {
+		_apply_despawn(despawns[i]);
+	}
+
+	// Drop entities no longer registered here (e.g. after a map change / despawn) so the
+	// client baseline can't diverge from the server's, which only tracks live entities.
 	{
 		Vector<uint32_t> stale;
 		for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
@@ -477,16 +740,51 @@ void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
 		pr->last_acked = seq;
 		pr->has_ack = true;
 	}
+	// Retire spawn/despawn records this ack confirms delivered.
+	{
+		Vector<uint32_t> d;
+		for (const KeyValue<uint32_t, uint16_t> &kv : pr->spawn_wait) {
+			if (_seq_le(kv.value, pr->last_acked)) {
+				d.push_back(kv.key);
+			}
+		}
+		for (int i = 0; i < d.size(); i++) {
+			pr->spawn_wait.erase(d[i]);
+		}
+	}
+	{
+		Vector<uint32_t> d;
+		for (const KeyValue<uint32_t, uint16_t> &kv : pr->despawn_wait) {
+			if (_seq_le(kv.value, pr->last_acked)) {
+				d.push_back(kv.key);
+			}
+		}
+		for (int i = 0; i < d.size(); i++) {
+			uint32_t nid = d[i];
+			pr->despawn_wait.erase(nid);
+			HashSet<int32_t> *needers = despawn_pending.getptr(nid);
+			if (needers) {
+				needers->erase(p_peer);
+				if (needers->is_empty()) {
+					despawn_pending.erase(nid); // all peers have it — done
+				}
+			}
+		}
+	}
 }
 
 Error GoldNetMultiplayer::_poll() {
 	Error e = inner->poll();
 	_ensure_link();
-	if (inner->get_unique_id() == 1 && inner->get_peers().size() > 0) {
-		uint64_t now = Time::get_singleton()->get_ticks_msec();
-		if (now - last_send_ms >= _min_interval_ms()) {
-			last_send_ms = now;
-			_server_tick();
+	if (inner->get_unique_id() == 1) {
+		_drain_pending_spawns(); // every poll — pick up spawns promptly
+		_detect_despawns();
+		if (inner->get_peers().size() > 0) {
+			uint64_t now = Time::get_singleton()->get_ticks_msec();
+			if (now - last_send_ms >= _min_interval_ms()) {
+				last_send_ms = now;
+				_server_tick();
+			}
 		}
 	}
 	return e;
@@ -517,16 +815,12 @@ int32_t GoldNetMultiplayer::_get_remote_sender_id() const {
 }
 
 Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Variant &p_config) {
-	// Track spawners so _should_intercept can tell spawner-managed nodes from
-	// map-static ones. Always forward the spawner itself to the inner (it still owns
-	// spawn/despawn in Phase 1).
-	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(p_config);
-	if (spawner) {
-		Node *parent = spawner->get_node_or_null(spawner->get_spawn_path());
-		if (parent) {
-			spawner_parents[parent->get_instance_id()] = spawner->get_instance_id();
-		}
-		return inner->object_configuration_add(p_object, p_config);
+	// A spawn is reported to the MultiplayerAPI as object_configuration_add(spawned_node,
+	// spawner). We already learned the reconstruction data from the wrapped spawn_function
+	// (see _wrap_spawner / _spawn_trampoline), so nothing to do here but claim it — do not
+	// forward to the inner.
+	if (Object::cast_to<MultiplayerSpawner>(p_config)) {
+		return OK;
 	}
 
 	MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(p_config);
@@ -542,13 +836,10 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 }
 
 Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const Variant &p_config) {
-	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(p_config);
-	if (spawner) {
-		Node *parent = spawner->get_node_or_null(spawner->get_spawn_path());
-		if (parent) {
-			spawner_parents.erase(parent->get_instance_id());
-		}
-		return inner->object_configuration_remove(p_object, p_config);
+	// Despawn is reported as object_configuration_remove(node, spawner); we detect the freed
+	// node by polling instead (a node can be freed without this firing), so just claim it.
+	if (Object::cast_to<MultiplayerSpawner>(p_config)) {
+		return OK;
 	}
 
 	MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(p_config);

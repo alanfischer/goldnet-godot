@@ -71,9 +71,27 @@ Two limitations that predate this phase and are resolved later:
   (~60 B/entity). That is the wasteful baseline Phase 2 replaces with
   delta-against-acked-baseline.
 
-Later phases replace the encoding (Phase 2 ack-delta), fold spawns/despawns into
-the stream (Phase 3), and add client helper nodes (Phase 4). Set `GOLDNET_DEBUG=1`
-for periodic per-peer snapshot stats (entities / bytes / matched-on-apply).
+**Phase 3 — spawn / despawn, fully agnostic (complete).** goldnet now owns the
+MultiplayerSpawners too, so runtime entities (players, projectiles) flow through the
+exact same stream as map-static movers — there is no static-vs-spawnable split
+anywhere downstream. A spawn is captured by wrapping each spawner's `spawn_function`
+(hooked early via `SceneTree.node_added` + a one-time scan, since the spawn event
+itself is the first time the API sees the spawner); the reconstruction data rides a
+reliable-until-acked spawn record `[node_net_id][spawner_net_id][var data]`. The
+client rebuilds the node with the spawner's real function, adds it under the
+spawn_path, and fires the spawner's `spawned` signal so the game's per-node
+bookkeeping runs; the node's child synchronizer then auto-registers and streams
+state like any mover. Despawns are detected by polling (the spawned node was freed),
+sent as `[node_net_id]` reliable-until-acked, and applied by freeing the node +
+firing `despawned`. Spawn and state use independent hash-id spaces (node path vs.
+synchronizer path) that both match across peers. Verified in WizardWars: 2 players +
+a stream of projectiles spawn, replicate, and despawn through goldnet with no ghosts
+and no leaks (`remaining_spawned` returns to just the live players), zero errors.
+
+Remaining: Phase 4 client helper nodes (`InterpolationBuffer` / `PredictedBody`),
+Phase 5 packaging + full build matrix, Phase 6 the engine-agnostic library split.
+Set `GOLDNET_DEBUG=1` for periodic per-peer snapshot stats, `GOLDNET_LOSS=<pct>` to
+drop snapshots.
 
 ## Building
 
