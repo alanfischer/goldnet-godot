@@ -50,6 +50,10 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 
 GoldNetMultiplayer::GoldNetMultiplayer() {
 	dbg = getenv("GOLDNET_DEBUG") != nullptr;
+	{
+		const char *loss = getenv("GOLDNET_LOSS");
+		dbg_loss = loss ? atoi(loss) : 0;
+	}
 	inner = MultiplayerAPI::create_default_interface(); // a SceneMultiplayer
 
 	SceneMultiplayer *sm = Object::cast_to<SceneMultiplayer>(inner.ptr());
@@ -66,11 +70,29 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 
 GoldNetMultiplayer::~GoldNetMultiplayer() {}
 
+void GoldNetMultiplayer::_reset_client_state() {
+	for (int i = 0; i < RING; i++) {
+		client_frames[i].clear();
+		client_frame_seq[i] = 0;
+	}
+	client_last_seq = 0;
+	client_has = false;
+}
+
 void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
-void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) { emit_signal("peer_disconnected", p_id); }
-void GoldNetMultiplayer::_relay_connected_to_server() { emit_signal("connected_to_server"); }
+void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
+	peer_rings.erase((int32_t)p_id); // drop the server-side send history for this peer
+	emit_signal("peer_disconnected", p_id);
+}
+void GoldNetMultiplayer::_relay_connected_to_server() {
+	_reset_client_state(); // fresh session — old baselines are meaningless
+	emit_signal("connected_to_server");
+}
 void GoldNetMultiplayer::_relay_connection_failed() { emit_signal("connection_failed"); }
-void GoldNetMultiplayer::_relay_server_disconnected() { emit_signal("server_disconnected"); }
+void GoldNetMultiplayer::_relay_server_disconnected() {
+	_reset_client_state();
+	emit_signal("server_disconnected");
+}
 
 // A synchronizer we can fully own. We intercept map-static synchronizers (doors,
 // platforms — present in the loaded scene identically on both peers) and leave
@@ -122,6 +144,15 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 		rpc_cfg["call_local"] = false;
 		rpc_cfg["channel"] = 0;
 		l->rpc_config("_gn_recv", rpc_cfg);
+
+		// Client → server frame ack. unreliable_ordered so a newer ack always
+		// supersedes an older one and a lost ack self-heals on the next.
+		Dictionary ack_cfg;
+		ack_cfg["rpc_mode"] = MultiplayerAPI::RPC_MODE_ANY_PEER;
+		ack_cfg["transfer_mode"] = MultiplayerPeer::TRANSFER_MODE_UNRELIABLE_ORDERED;
+		ack_cfg["call_local"] = false;
+		ack_cfg["channel"] = 0;
+		l->rpc_config("_gn_ack", ack_cfg);
 	}
 	return l;
 }
@@ -151,34 +182,32 @@ uint32_t GoldNetMultiplayer::_min_interval_ms() const {
 	return best == 0 ? DEFAULT_INTERVAL_MS : best;
 }
 
-void GoldNetMultiplayer::_write_entity(StreamPeerBuffer *p_buf, MultiplayerSynchronizer *sync, uint32_t p_net_id) {
-	Node *root = sync->get_node_or_null(sync->get_root_path());
-	Ref<SceneReplicationConfig> cfg = sync->get_replication_config();
-	TypedArray<NodePath> props = cfg->get_properties();
-
-	// Collect (index, value) for synced properties, then write. Index is the
-	// property's position in the config list — identical on server & client.
-	Vector<int> idxs;
-	Vector<Variant> vals;
-	for (int i = 0; i < props.size(); i++) {
-		NodePath cp = props[i];
-		if (!cfg->property_get_sync(cp)) {
-			continue;
-		}
-		NodePath prop;
-		Node *target = root ? resolve_property(root, cp, prop) : nullptr;
-		if (!target) {
-			continue;
-		}
-		idxs.push_back(i);
-		vals.push_back(target->get_indexed(prop));
+// The ordered list of a synchronizer's *synced* replication-config property paths.
+// This "slot" order (config order, sync props only) is identical on server and
+// client — the changed-field bitmask indexes into it. Capped at 32 (u32 mask).
+static void get_sync_slots(MultiplayerSynchronizer *p_sync, Vector<NodePath> &r_paths) {
+	Ref<SceneReplicationConfig> cfg = p_sync->get_replication_config();
+	if (cfg.is_null()) {
+		return;
 	}
+	TypedArray<NodePath> props = cfg->get_properties();
+	for (int i = 0; i < props.size() && r_paths.size() < 32; i++) {
+		NodePath p = props[i];
+		if (cfg->property_get_sync(p)) {
+			r_paths.push_back(p);
+		}
+	}
+}
 
-	p_buf->put_u32(p_net_id);
-	p_buf->put_u8((uint8_t)idxs.size());
-	for (int i = 0; i < idxs.size(); i++) {
-		p_buf->put_u8((uint8_t)idxs[i]);
-		p_buf->put_var(vals[i]);
+// Read the current value of every slot of a synchronizer into r_vals (sized to the
+// slot count; unresolved targets yield a nil Variant).
+static void read_slot_values(MultiplayerSynchronizer *p_sync, const Vector<NodePath> &p_slots, Vector<Variant> &r_vals) {
+	Node *root = p_sync->get_node_or_null(p_sync->get_root_path());
+	r_vals.resize(p_slots.size());
+	for (int s = 0; s < p_slots.size(); s++) {
+		NodePath prop;
+		Node *target = root ? resolve_property(root, p_slots[s], prop) : nullptr;
+		r_vals.write[s] = target ? target->get_indexed(prop) : Variant();
 	}
 }
 
@@ -197,48 +226,107 @@ void GoldNetMultiplayer::_server_tick() {
 
 	for (int pi = 0; pi < peers.size(); pi++) {
 		int peer = peers[pi];
+		PeerRing &pr = peer_rings[peer]; // default-constructs on first use
 
-		// Gather the entities visible to this peer.
+		// Gather the entities visible to this peer (see Phase-1 visibility note:
+		// we honor the exposed public/explicit visibility, not filter callbacks).
 		Vector<Vis> visible;
 		for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
 			MultiplayerSynchronizer *sync = sync_from_objid(kv.key);
-			if (!sync || !sync->is_inside_tree()) {
+			if (!sync || !sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
 				continue;
 			}
-			if (!sync->is_multiplayer_authority()) {
-				continue; // only the authority streams its state
-			}
-			// Honor the exposed visibility API: public flag OR an explicit per-peer
-			// set_visibility_for override. Godot does NOT bind is_visible_to, so a
-			// GDExtension MultiplayerAPI cannot evaluate add_visibility_filter()
-			// callbacks (WizardWars' BSP-PVS cull rides those). We therefore stream
-			// to any peer the node is publicly visible to — correctness-safe here
-			// because a client silently drops net_ids it hasn't registered yet and
-			// self-heals once its map loads (no path cache to poison). The lost PVS
-			// cull is a bandwidth-only regression that Phase 2's delta makes moot for
-			// the static movers that dominate the set. See docs / follow-up.
 			if (!(sync->is_visibility_public() || sync->get_visibility_for(peer))) {
 				continue;
 			}
 			visible.push_back({ sync, kv.value.net_id });
 		}
 
+		// Baseline = the frame this peer last acked, if we still hold it. Otherwise
+		// send a full frame (baseline seq 0) — first send, or an ack aged out of the
+		// ring under heavy loss.
+		uint16_t base_seq = 0;
+		FrameData *base = nullptr;
+		if (pr.has_ack) {
+			int bslot = pr.last_acked & (RING - 1);
+			if (pr.frame_seq[bslot] == pr.last_acked && pr.last_acked != 0) {
+				base_seq = pr.last_acked;
+				base = &pr.frames[bslot];
+			}
+		}
+
+		uint16_t seq = pr.next_seq++;
+		if (pr.next_seq == 0) {
+			pr.next_seq = 1; // 0 is reserved for "no baseline"
+		}
+
+		// Build this frame's full value set (stored as the next baseline) and, in
+		// parallel, the delta records against `base`.
+		FrameData frame;
+		Ref<StreamPeerBuffer> body;
+		body.instantiate();
+		uint16_t changed = 0;
+		for (int i = 0; i < visible.size(); i++) {
+			MultiplayerSynchronizer *sync = visible[i].sync;
+			uint32_t net_id = visible[i].net_id;
+			Vector<NodePath> slots;
+			get_sync_slots(sync, slots);
+			Vector<Variant> vals;
+			read_slot_values(sync, slots, vals);
+			frame[net_id] = vals;
+
+			const Vector<Variant> *bvals = base ? base->getptr(net_id) : nullptr;
+			uint32_t mask = 0;
+			if (!bvals || bvals->size() != vals.size()) {
+				mask = slots.size() >= 32 ? 0xFFFFFFFFu : ((1u << slots.size()) - 1u); // new → all slots
+			} else {
+				for (int s = 0; s < vals.size(); s++) {
+					if (vals[s] != (*bvals)[s]) {
+						mask |= (1u << s);
+					}
+				}
+			}
+			if (mask == 0) {
+				continue; // unchanged since the acked baseline — costs nothing
+			}
+			body->put_u32(net_id);
+			body->put_u32(mask);
+			for (int s = 0; s < vals.size(); s++) {
+				if (mask & (1u << s)) {
+					body->put_var(vals[s]);
+				}
+			}
+			changed++;
+		}
+
+		int slot = seq & (RING - 1);
+		pr.frames[slot] = frame;
+		pr.frame_seq[slot] = seq;
+
 		Ref<StreamPeerBuffer> buf;
 		buf.instantiate();
+		buf->put_u16(seq);
+		buf->put_u16(base_seq);
 		buf->put_u32(now);
-		buf->put_u16((uint16_t)visible.size());
-		for (int i = 0; i < visible.size(); i++) {
-			_write_entity(buf.ptr(), visible[i].sync, visible[i].net_id);
-		}
+		buf->put_u16(changed);
+		buf->put_data(body->get_data_array());
 		PackedByteArray bytes = buf->get_data_array();
-		inner->rpc(peer, l, "_gn_recv", Array::make(bytes));
-		if (dbg && now - dbg_last_ms > 2000) {
-			UtilityFunctions::print("[goldnet] send peer=", peer, " ents=", (int)visible.size(),
-					" owned=", (int)owned_syncs.size(), " bytes=", (int)bytes.size());
+
+		// GOLDNET_LOSS=<pct> drops snapshots to exercise self-heal: the peer's ack
+		// stalls, so the next frame keeps diffing against the same acked baseline and
+		// re-carries whatever changed since — no desync, no retransmit.
+		if (dbg_loss == 0 || (UtilityFunctions::randi() % 100) >= dbg_loss) {
+			inner->rpc(peer, l, "_gn_recv", Array::make(bytes));
 		}
+		dbg_bytes += bytes.size();
 	}
+
 	if (dbg && now - dbg_last_ms > 2000) {
+		double kbps = (double)dbg_bytes / (double)(now - dbg_last_ms); // bytes/ms == KB/s
+		UtilityFunctions::print("[goldnet] send owned=", (int)owned_syncs.size(),
+				" peers=", peers.size(), " ~", kbps, " KB/s (all peers)");
 		dbg_last_ms = now;
+		dbg_bytes = 0;
 	}
 }
 
@@ -248,67 +336,146 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	buf->set_data_array(p_bytes);
 	buf->seek(0);
 
-	uint32_t count_time = buf->get_u32(); // server_time_ms (the game carries its own
-	(void)count_time;                     // per-entity stamp prop; header kept for Phase 2)
+	uint16_t seq = buf->get_u16();
+	uint16_t base_seq = buf->get_u16();
+	uint32_t server_time = buf->get_u32(); // header (game carries its own per-entity stamp prop)
+	(void)server_time;
 	int count = buf->get_u16();
 
-	int matched = 0;
-	int applied_ct = 0;
+	// Drop stale/reordered snapshots (unreliable transport). We only advance forward.
+	if (client_has && !_seq_newer(seq, client_last_seq)) {
+		return;
+	}
+
+	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means
+	// full state. If the server diffed against a frame we no longer hold, we can't
+	// reconstruct unchanged fields — re-ack our last good frame so the server falls
+	// back to a baseline we have (eventually a full frame), and drop this one.
+	FrameData *base = nullptr;
+	if (base_seq != 0) {
+		int bslot = base_seq & (RING - 1);
+		if (client_frame_seq[bslot] == base_seq) {
+			base = &client_frames[bslot];
+		} else {
+			if (client_has) {
+				GoldNetLink *l = _ensure_link();
+				if (l) {
+					inner->rpc(1, l, "_gn_ack", Array::make((int)client_last_seq));
+				}
+			}
+			return;
+		}
+	}
+
+	// New frame = baseline carried forward, with this delta's changed fields applied.
+	FrameData frame;
+	if (base) {
+		frame = *base;
+	}
 
 	for (int i = 0; i < count; i++) {
 		uint32_t net_id = buf->get_u32();
-		int pc = buf->get_u8();
+		uint32_t mask = buf->get_u32();
 
 		MultiplayerSynchronizer *sync = nullptr;
 		if (netid_to_objid.has(net_id)) {
-			uint64_t objid = netid_to_objid[net_id];
-			MultiplayerSynchronizer *s = sync_from_objid(objid);
+			MultiplayerSynchronizer *s = sync_from_objid(netid_to_objid[net_id]);
 			if (s && s->is_inside_tree()) {
 				sync = s;
 			}
 		}
-
+		Vector<NodePath> slots;
 		Node *root = nullptr;
-		TypedArray<NodePath> props;
 		if (sync) {
+			get_sync_slots(sync, slots);
 			root = sync->get_node_or_null(sync->get_root_path());
-			Ref<SceneReplicationConfig> cfg = sync->get_replication_config();
-			if (cfg.is_valid()) {
-				props = cfg->get_properties();
-			}
 		}
 
+		// Start from this entity's baseline values (carried in `frame`), then overlay
+		// the changed slots. Values are read for every set bit regardless of whether
+		// we can resolve the node, so the stream stays aligned even for unknown ids.
+		Vector<Variant> *cur = frame.getptr(net_id);
+		Vector<Variant> vals;
+		if (cur) {
+			vals = *cur;
+		}
+		if (sync && vals.size() != slots.size()) {
+			vals.resize(slots.size());
+		}
 		bool applied = false;
-		for (int j = 0; j < pc; j++) {
-			int idx = buf->get_u8();
+		for (int s = 0; s < 32; s++) {
+			if (!(mask & (1u << s))) {
+				continue;
+			}
 			Variant v = buf->get_var(); // self-delimiting — always consume
-			if (sync && root && idx >= 0 && idx < props.size()) {
+			if (s < vals.size()) {
+				vals.write[s] = v;
+			}
+			if (sync && root && s < slots.size()) {
 				NodePath prop;
-				Node *target = resolve_property(root, props[idx], prop);
+				Node *target = resolve_property(root, slots[s], prop);
 				if (target) {
 					target->set_indexed(prop, v);
 					applied = true;
 				}
 			}
 		}
-		// The game applies replicated state by reacting to the synchronizer's
-		// `synchronized` signal (it reads the net_* props there and feeds its interp
-		// buffer), so writing the props isn't enough — re-emit it ourselves.
+		if (!vals.is_empty()) {
+			frame[net_id] = vals;
+		}
+		// The game reacts to replicated state in the synchronizer's `synchronized`
+		// signal handler, so re-emit it (only when something actually changed).
 		if (sync && applied) {
 			sync->emit_signal("synchronized");
-			applied_ct++;
-		}
-		if (sync) {
-			matched++;
 		}
 	}
+
+	// Drop entities no longer registered here (e.g. after a map change) so the client
+	// baseline can't diverge from the server's, which only tracks live entities.
+	{
+		Vector<uint32_t> stale;
+		for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
+			if (!netid_to_objid.has(kv.key)) {
+				stale.push_back(kv.key);
+			}
+		}
+		for (int i = 0; i < stale.size(); i++) {
+			frame.erase(stale[i]);
+		}
+	}
+
+	// Commit this frame to the client ring and ack it (newest wins, unreliable).
+	int slot = seq & (RING - 1);
+	client_frames[slot] = frame;
+	client_frame_seq[slot] = seq;
+	client_last_seq = seq;
+	client_has = true;
+
+	GoldNetLink *l = _ensure_link();
+	if (l) {
+		inner->rpc(1, l, "_gn_ack", Array::make((int)seq));
+	}
+
 	if (dbg) {
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (now - dbg_last_ms > 2000) {
 			dbg_last_ms = now;
-			UtilityFunctions::print("[goldnet] recv ents=", count, " matched=", matched,
-					" applied=", applied_ct, " registered=", (int)owned_syncs.size());
+			UtilityFunctions::print("[goldnet] recv seq=", seq, " base=", base_seq,
+					" changed=", count, " bytes=", (int)p_bytes.size(),
+					" registered=", (int)owned_syncs.size());
 		}
+	}
+}
+
+void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
+	uint16_t seq = (uint16_t)p_seq;
+	PeerRing *pr = peer_rings.getptr(p_peer);
+	if (!pr) {
+		return;
+	}
+	if (!pr->has_ack || _seq_newer(seq, pr->last_acked)) {
+		pr->last_acked = seq;
+		pr->has_ack = true;
 	}
 }
 

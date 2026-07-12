@@ -33,7 +33,31 @@ apply through our path, no path cache involved (entities are keyed by a hash of
 their scene path, identical on both peers). This is "old netcode (ALWAYS
 full-state) on our path" — parity, not yet the delta.
 
-Two honest limitations at this phase, both resolved later:
+**Phase 2 — delta against acked baseline, the GoldSrc core (complete).** Each new
+frame carries a sequence number and the baseline it is diffed against (the peer's
+last-acked frame). The server keeps a per-peer ring of recent frames; the client
+keeps a matching ring and acks the newest frame it applied (unreliable_ordered,
+newest wins). An entity record is `[u32 net_id][u32 changed_mask]{[var value] per
+set bit}` where the mask indexes the config's sync-property "slots"; an entity
+whose every slot equals the baseline is skipped entirely. On packet loss the ack
+stalls, so the server keeps diffing against the same acked baseline and re-carries
+whatever changed since — the client reconstructs from its ring with no desync and
+no retransmit. Verified in WizardWars: acks flow (baseline = previous frame),
+per-slot skipping drops ~60→~20 B/entity (3.1x on the wire), and under `GOLDNET_LOSS=30`
+the server falls back to older baselines (`seq=320 base=317`) with the client still
+tracking correctly — zero crashes, zero desync.
+
+> **Note on the full "static = 0 bytes" ideal:** goldnet skips any entity whose
+> fields are unchanged, but WizardWars' movers write a fresh `mover_net_stamp =
+> Time.get_ticks_msec()` *every* tick (a leftover of the stock ALWAYS design), so
+> every mover always has one changed slot and is never skipped whole. The frame
+> header already carries a server timestamp, making the per-entity stamp redundant;
+> dropping it — and decoupling the mover *presence* watchdog from per-tick sync
+> (idle movers currently deactivate after 200 ms of silence) — is the game-side
+> dogfood change (Phase 4) that unlocks true idle-free replication. The module
+> itself is complete and correct.
+
+Two limitations that predate this phase and are resolved later:
 - **No PVS cull yet.** Godot does not bind `MultiplayerSynchronizer::is_visible_to`,
   so a GDExtension `MultiplayerAPI` cannot evaluate `add_visibility_filter()`
   callbacks. We honor the *exposed* visibility API (`is_visibility_public()` +
