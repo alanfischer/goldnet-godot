@@ -23,6 +23,7 @@
 #include <godot_cpp/classes/multiplayer_synchronizer.hpp>
 #include <godot_cpp/templates/hash_map.hpp>
 #include <godot_cpp/templates/hash_set.hpp>
+#include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/callable.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
@@ -115,6 +116,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool client_has = false;
 
 	uint64_t last_send_ms = 0;                   // server send throttle
+	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
@@ -136,6 +138,13 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint32_t _min_interval_ms() const;
 	static bool _seq_newer(uint16_t a, uint16_t b) { return (int16_t)(a - b) > 0; }
 	static bool _seq_le(uint16_t a, uint16_t b) { return !_seq_newer(a, b); }
+
+	// Reliable-until-acked delivery shared by the spawn and despawn sections. `wait[net_id]`
+	// records the first seq of the current unacked run; _reliable_include returns whether to
+	// (re)send this record to the peer and stops tracking once it's acked; _retire_acked drops
+	// the records an ack confirms delivered.
+	static bool _reliable_include(HashMap<uint32_t, uint16_t> &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_last_acked, bool p_has_ack);
+	static void _retire_acked(HashMap<uint32_t, uint16_t> &p_wait, uint16_t p_last_acked, Vector<uint32_t> &r_retired);
 
 	// Phase 3 spawn/despawn.
 	bool spawners_scanned = false;

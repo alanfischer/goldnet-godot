@@ -21,6 +21,18 @@ using namespace godot;
 // Default snapshot cadence when a synchronizer reports no interval (30 Hz).
 static const uint32_t DEFAULT_INTERVAL_MS = 33;
 
+// Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
+// collection, mask building, and the apply loop all key off this.
+static const int MAX_SYNC_SLOTS = 32;
+
+// An entity's cross-peer identity: a hash of the node's scene path. Server and client
+// derive it the same way from the same path, so it matches without a handshake. Used for
+// synchronizers (state), spawned nodes (spawn record), and spawners — must stay in sync
+// everywhere, hence one helper.
+static uint32_t net_id_for(Node *p_node) {
+	return (uint32_t)String(p_node->get_path()).hash();
+}
+
 // Split a replication-config property path (relative to the synchronizer's root
 // node, e.g. ".:position" or "NetInterp:net_pos") into the target node under
 // `p_root` and the property path to get_indexed/set_indexed on it. Returns null
@@ -176,6 +188,34 @@ static MultiplayerSynchronizer *sync_from_objid(uint64_t p_objid) {
 	return Object::cast_to<MultiplayerSynchronizer>(ObjectDB::get_instance(p_objid));
 }
 
+bool GoldNetMultiplayer::_reliable_include(HashMap<uint32_t, uint16_t> &p_wait, uint32_t p_net_id,
+		uint16_t p_seq, uint16_t p_last_acked, bool p_has_ack) {
+	uint16_t fs;
+	if (p_wait.has(p_net_id)) {
+		fs = p_wait[p_net_id];
+	} else {
+		fs = p_seq;
+		p_wait[p_net_id] = p_seq;
+	}
+	if (p_has_ack && _seq_le(fs, p_last_acked)) {
+		p_wait.erase(p_net_id);
+		return false; // delivered — stop resending
+	}
+	return true;
+}
+
+void GoldNetMultiplayer::_retire_acked(HashMap<uint32_t, uint16_t> &p_wait, uint16_t p_last_acked,
+		Vector<uint32_t> &r_retired) {
+	for (const KeyValue<uint32_t, uint16_t> &kv : p_wait) {
+		if (_seq_le(kv.value, p_last_acked)) {
+			r_retired.push_back(kv.key);
+		}
+	}
+	for (int i = 0; i < r_retired.size(); i++) {
+		p_wait.erase(r_retired[i]);
+	}
+}
+
 // --- Phase 3: spawn / despawn ---
 
 // Replace a spawner's spawn_function with our trampoline, so a server spawn(data) hands us
@@ -191,7 +231,7 @@ void GoldNetMultiplayer::_wrap_spawner(MultiplayerSpawner *p_spawner) {
 		return;
 	}
 	SpawnerEntry e;
-	e.net_id = (uint32_t)String(p_spawner->get_path()).hash();
+	e.net_id = net_id_for(p_spawner);
 	e.orig_fn = p_spawner->get_spawn_function();
 	spawners[objid] = e;
 	spawner_netid_to_objid[e.net_id] = objid;
@@ -253,7 +293,7 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 		if (!node->is_inside_tree()) {
 			continue; // wait for spawn() to add it
 		}
-		uint32_t net_id = (uint32_t)String(node->get_path()).hash();
+		uint32_t net_id = net_id_for(node);
 		SpawnRecord rec;
 		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
 		rec.node_objid = kv.key;
@@ -377,7 +417,7 @@ static void get_sync_slots(MultiplayerSynchronizer *p_sync, Vector<NodePath> &r_
 		return;
 	}
 	TypedArray<NodePath> props = cfg->get_properties();
-	for (int i = 0; i < props.size() && r_paths.size() < 32; i++) {
+	for (int i = 0; i < props.size() && r_paths.size() < MAX_SYNC_SLOTS; i++) {
 		NodePath p = props[i];
 		if (cfg->property_get_sync(p)) {
 			r_paths.push_back(p);
@@ -405,28 +445,33 @@ void GoldNetMultiplayer::_server_tick() {
 	PackedInt32Array peers = inner->get_peers();
 	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 
-	struct Vis {
+	// Read every owned entity's current state ONCE per tick — the values are the server's
+	// authoritative state, identical for all peers. Only the delta mask (vs. each peer's
+	// baseline) and the visibility filter below are peer-specific, so those stay in the
+	// per-peer loop; the expensive get_indexed / path resolution does not.
+	struct TickEnt {
 		MultiplayerSynchronizer *sync;
 		uint32_t net_id;
+		Vector<Variant> vals;
 	};
+	Vector<TickEnt> ents;
+	for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
+		MultiplayerSynchronizer *sync = sync_from_objid(kv.key);
+		if (!sync || !sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
+			continue;
+		}
+		Vector<NodePath> slots;
+		get_sync_slots(sync, slots);
+		TickEnt e;
+		e.sync = sync;
+		e.net_id = kv.value.net_id;
+		read_slot_values(sync, slots, e.vals);
+		ents.push_back(e);
+	}
 
 	for (int pi = 0; pi < peers.size(); pi++) {
 		int peer = peers[pi];
 		PeerRing &pr = peer_rings[peer]; // default-constructs on first use
-
-		// Gather the entities visible to this peer (see Phase-1 visibility note:
-		// we honor the exposed public/explicit visibility, not filter callbacks).
-		Vector<Vis> visible;
-		for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
-			MultiplayerSynchronizer *sync = sync_from_objid(kv.key);
-			if (!sync || !sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
-				continue;
-			}
-			if (!(sync->is_visibility_public() || sync->get_visibility_for(peer))) {
-				continue;
-			}
-			visible.push_back({ sync, kv.value.net_id });
-		}
 
 		// Baseline = the frame this peer last acked, if we still hold it. Otherwise
 		// send a full frame (baseline seq 0) — first send, or an ack aged out of the
@@ -446,32 +491,19 @@ void GoldNetMultiplayer::_server_tick() {
 			pr.next_seq = 1; // 0 is reserved for "no baseline"
 		}
 
-		// Spawns owed to this peer (reliable-until-acked): include each until the peer
-		// acks a frame carrying it. spawn_wait[net_id] is the first seq of the current
-		// unacked run; once last_acked >= that, it's delivered and we stop.
+		// Spawns / despawns owed to this peer, reliable-until-acked (see _reliable_include).
 		Ref<StreamPeerBuffer> spawn_body;
 		spawn_body.instantiate();
 		uint16_t spawn_ct = 0;
 		for (const KeyValue<uint32_t, SpawnRecord> &kv : spawn_records) {
-			uint32_t nid = kv.key;
-			uint16_t fs;
-			if (pr.spawn_wait.has(nid)) {
-				fs = pr.spawn_wait[nid];
-			} else {
-				fs = seq;
-				pr.spawn_wait[nid] = seq;
+			if (!_reliable_include(pr.spawn_wait, kv.key, seq, pr.last_acked, pr.has_ack)) {
+				continue;
 			}
-			if (pr.has_ack && _seq_le(fs, pr.last_acked)) {
-				pr.spawn_wait.erase(nid);
-				continue; // delivered
-			}
-			spawn_body->put_u32(nid);
+			spawn_body->put_u32(kv.key);
 			spawn_body->put_u32(kv.value.spawner_net_id);
 			spawn_body->put_var(kv.value.data);
 			spawn_ct++;
 		}
-
-		// Despawns owed to this peer (same reliable-until-acked scheme).
 		Ref<StreamPeerBuffer> despawn_body;
 		despawn_body.instantiate();
 		uint16_t despawn_ct = 0;
@@ -479,42 +511,33 @@ void GoldNetMultiplayer::_server_tick() {
 			if (!kv.value.has(peer)) {
 				continue;
 			}
-			uint32_t nid = kv.key;
-			uint16_t fs;
-			if (pr.despawn_wait.has(nid)) {
-				fs = pr.despawn_wait[nid];
-			} else {
-				fs = seq;
-				pr.despawn_wait[nid] = seq;
+			if (!_reliable_include(pr.despawn_wait, kv.key, seq, pr.last_acked, pr.has_ack)) {
+				kv.value.erase(peer); // delivered → this peer no longer needs it
+				continue;
 			}
-			if (pr.has_ack && _seq_le(fs, pr.last_acked)) {
-				pr.despawn_wait.erase(nid);
-				kv.value.erase(peer);
-				continue; // delivered to this peer
-			}
-			despawn_body->put_u32(nid);
+			despawn_body->put_u32(kv.key);
 			despawn_ct++;
 		}
 
-		// Build this frame's full value set (stored as the next baseline) and, in
-		// parallel, the delta records against `base`.
+		// Per-peer entity delta: filter the pre-read entities by visibility, store the
+		// visible subset as this peer's next baseline, and emit only the changed slots.
 		FrameData frame;
 		Ref<StreamPeerBuffer> body;
 		body.instantiate();
 		uint16_t changed = 0;
-		for (int i = 0; i < visible.size(); i++) {
-			MultiplayerSynchronizer *sync = visible[i].sync;
-			uint32_t net_id = visible[i].net_id;
-			Vector<NodePath> slots;
-			get_sync_slots(sync, slots);
-			Vector<Variant> vals;
-			read_slot_values(sync, slots, vals);
+		for (int i = 0; i < ents.size(); i++) {
+			MultiplayerSynchronizer *sync = ents[i].sync;
+			if (!(sync->is_visibility_public() || sync->get_visibility_for(peer))) {
+				continue;
+			}
+			uint32_t net_id = ents[i].net_id;
+			const Vector<Variant> &vals = ents[i].vals;
 			frame[net_id] = vals;
 
 			const Vector<Variant> *bvals = base ? base->getptr(net_id) : nullptr;
 			uint32_t mask = 0;
 			if (!bvals || bvals->size() != vals.size()) {
-				mask = slots.size() >= 32 ? 0xFFFFFFFFu : ((1u << slots.size()) - 1u); // new → all slots
+				mask = vals.size() >= MAX_SYNC_SLOTS ? 0xFFFFFFFFu : ((1u << vals.size()) - 1u); // new → all slots
 			} else {
 				for (int s = 0; s < vals.size(); s++) {
 					if (vals[s] != (*bvals)[s]) {
@@ -660,7 +683,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			vals.resize(slots.size());
 		}
 		bool applied = false;
-		for (int s = 0; s < 32; s++) {
+		for (int s = 0; s < MAX_SYNC_SLOTS; s++) {
 			if (!(mask & (1u << s))) {
 				continue;
 			}
@@ -741,33 +764,17 @@ void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
 		pr->has_ack = true;
 	}
 	// Retire spawn/despawn records this ack confirms delivered.
-	{
-		Vector<uint32_t> d;
-		for (const KeyValue<uint32_t, uint16_t> &kv : pr->spawn_wait) {
-			if (_seq_le(kv.value, pr->last_acked)) {
-				d.push_back(kv.key);
-			}
-		}
-		for (int i = 0; i < d.size(); i++) {
-			pr->spawn_wait.erase(d[i]);
-		}
-	}
-	{
-		Vector<uint32_t> d;
-		for (const KeyValue<uint32_t, uint16_t> &kv : pr->despawn_wait) {
-			if (_seq_le(kv.value, pr->last_acked)) {
-				d.push_back(kv.key);
-			}
-		}
-		for (int i = 0; i < d.size(); i++) {
-			uint32_t nid = d[i];
-			pr->despawn_wait.erase(nid);
-			HashSet<int32_t> *needers = despawn_pending.getptr(nid);
-			if (needers) {
-				needers->erase(p_peer);
-				if (needers->is_empty()) {
-					despawn_pending.erase(nid); // all peers have it — done
-				}
+	Vector<uint32_t> retired;
+	_retire_acked(pr->spawn_wait, pr->last_acked, retired);
+	retired.clear();
+	_retire_acked(pr->despawn_wait, pr->last_acked, retired);
+	for (int i = 0; i < retired.size(); i++) {
+		uint32_t nid = retired[i];
+		HashSet<int32_t> *needers = despawn_pending.getptr(nid);
+		if (needers) {
+			needers->erase(p_peer);
+			if (needers->is_empty()) {
+				despawn_pending.erase(nid); // all peers have it — done
 			}
 		}
 	}
@@ -781,7 +788,7 @@ Error GoldNetMultiplayer::_poll() {
 		_detect_despawns();
 		if (inner->get_peers().size() > 0) {
 			uint64_t now = Time::get_singleton()->get_ticks_msec();
-			if (now - last_send_ms >= _min_interval_ms()) {
+			if (now - last_send_ms >= cached_min_interval_ms) {
 				last_send_ms = now;
 				_server_tick();
 			}
@@ -827,9 +834,10 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 	if (sync && _should_intercept(sync)) {
 		uint64_t objid = sync->get_instance_id();
 		SyncEntry entry;
-		entry.net_id = (uint32_t)String(sync->get_path()).hash();
+		entry.net_id = net_id_for(sync);
 		owned_syncs[objid] = entry;
 		netid_to_objid[entry.net_id] = objid;
+		cached_min_interval_ms = _min_interval_ms(); // intervals are set before the sync enters the tree
 		return OK; // we own it — do not forward to the inner
 	}
 	return inner->object_configuration_add(p_object, p_config);
@@ -848,6 +856,7 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 		if (owned_syncs.has(objid)) {
 			netid_to_objid.erase(owned_syncs[objid].net_id);
 			owned_syncs.erase(objid);
+			cached_min_interval_ms = _min_interval_ms();
 			return OK;
 		}
 	}

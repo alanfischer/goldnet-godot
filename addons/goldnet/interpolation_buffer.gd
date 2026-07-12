@@ -37,7 +37,6 @@ var teleport_dist_sq := 144.0  # (12 units)²
 var extrap_max := 0.25
 
 var _buf: Array = []
-var _last_time := -INF  # out-of-order guard: reject snapshots not newer than the last
 
 
 ## True once at least one snapshot has been received.
@@ -45,23 +44,21 @@ func has_data() -> bool:
 	return not _buf.is_empty()
 
 
-## Server time of the most recent snapshot (-INF if empty).
+## Server time of the most recent snapshot (-INF if empty). Doubles as the out-of-order guard.
 func last_time() -> float:
 	return _buf[_buf.size() - 1][_T] if not _buf.is_empty() else -INF
 
 
 func clear() -> void:
 	_buf.clear()
-	_last_time = -INF
 
 
 ## Feed one authoritative snapshot. Silently drops out-of-order/duplicate times (unreliable
 ## transport reorders), and clears history on a teleport-sized jump so we don't lerp across it.
 ## velocity is optional and only used to extrapolate when the buffer runs dry.
 func push(time: float, pos: Vector3, rot: Vector3, vel := Vector3.ZERO) -> void:
-	if time <= _last_time:
+	if time <= last_time():
 		return
-	_last_time = time
 	if not _buf.is_empty() and pos.distance_squared_to(_buf[_buf.size() - 1][_POS]) > teleport_dist_sq:
 		_buf.clear()
 	_buf.append([time, pos, rot, vel])
