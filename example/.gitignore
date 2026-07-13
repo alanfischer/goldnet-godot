@@ -1,0 +1,4 @@
+# Godot generates these on run/open; keep only extension_list.cfg so the demo loads the
+# GDExtension headless without first opening the editor.
+/.godot/*
+!/.godot/extension_list.cfg

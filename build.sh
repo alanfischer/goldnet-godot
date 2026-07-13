@@ -61,7 +61,10 @@ build_macos() {
     universal template_release
 }
 
-build_linux()   { build build-linux-x86_64-release toolchain-linux-x86_64.cmake Release; }
+build_linux() {
+    build build-linux-x86_64-release toolchain-linux-x86_64.cmake Release
+    build build-linux-arm64-release  toolchain-linux-arm64.cmake  Release   # matches the .gdextension's linux.arm64
+}
 # GODOTCPP_USE_STATIC_CPP=OFF: godot-cpp's Windows static block adds a bare -static
 # that conflicts with -shared under Zig ("-femit-implib allowed only when building a
 # DLL"). Zig statically links its own runtime, so the DLL stays self-contained anyway.

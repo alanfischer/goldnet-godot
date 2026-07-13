@@ -8,9 +8,7 @@ synchronizers, spawners, and `@rpc` methods; installing goldnet swaps only the
 *state-replication* layer underneath them.
 
 It is the netcode sibling to [`goldsrc-godot`](../goldsrc-godot) (the asset
-loader) and mirrors the [`hop`](../hop-godot) split: a single GDExtension today,
-with an engine-agnostic **goldnet** core and this **goldnet-godot** binding as the
-eventual factoring.
+loader), built as a single Godot GDExtension.
 
 ## Why
 
@@ -120,8 +118,7 @@ reliable-ordered replication for real-time state on adverse networks.
 
 ## Status
 
-Built as a single GDExtension; the engine-agnostic core/binding split is the final
-step.
+Built as a single Godot GDExtension; all planned phases (0–5) are complete.
 
 - **Phase 0 — pass-through composition** ✅ every virtual forwarded to the inner;
   installing it changes nothing observable.
@@ -141,13 +138,13 @@ step.
 - **Per-peer PVS cull** ✅ via the `set_visibility_for` push bridge above — the
   former open limitation is resolved.
 - **Compact wire encoding** ✅ tagged f32 / varint value codec.
-- **Phase 5 — generalize / configure** (in progress): a config surface on the
-  installed API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`) and
-  opt-in per-property **quantization hints** — angles to a u16, floats/Vector3 to
-  IEEE half — via a synchronizer's `gn_quant` meta (self-describing tags, so only
-  the sender needs the hint). WizardWars quantizes player yaw/pitch.
-- Remaining: full build-matrix packaging + a minimal example project, and the
-  engine-agnostic `goldnet` core / `goldnet-godot` binding split (Phase 6).
+- **Phase 5 — generalize / configure / package** ✅ a config surface on the installed
+  API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`); opt-in per-property
+  **quantization hints** — angles to a u16, floats/Vector3 to IEEE half — via a
+  synchronizer's `gn_quant` meta (self-describing, so only the sender needs the hint;
+  WizardWars quantizes player yaw/pitch); a standalone drop-in demo in
+  [`example/`](example/) (stock spawner + synchronizers, no goldnet-specific code); and
+  the full build matrix (macOS/Linux/Windows, Android-arm64 via `build.sh` with an NDK).
 
 ## Building
 

@@ -1,9 +1,8 @@
 # GoldSrc-style netcode as a Godot MultiplayerAPI — implementation plan
 
 > Name: **goldnet** (verified clear in the Godot/game-netcode namespace). Sibling to
-> `goldsrc-godot` (the asset loader); this is the *netcode* counterpart. Phases 0–5 build
-> it as a single Godot GDExtension; Phase 6 splits it into the engine-agnostic **goldnet**
-> library + the **goldnet-godot** binding, mirroring how `hop-godot` wraps `hop`.
+> `goldsrc-godot` (the asset loader); this is the *netcode* counterpart, built as a single
+> Godot GDExtension (`goldnet-godot`).
 > (Earlier drafts used the placeholder "SnapNet" — treat any remaining "SnapNet"/"SnapNetMultiplayer"
 > below as "goldnet"/"GoldNetMultiplayer".)
 
@@ -160,33 +159,6 @@ Each phase ends at a **playable, verifiable** state; risk is front-loaded.
 - Full cross-platform build matrix (macOS/Linux/Windows/**Android-arm64 for Quest**).
 - **Exit criterion:** a fresh project adds the `.gdextension`, sets the multiplayer,
   drops in helper nodes, keeps its stock synchronizers, and gets GoldSrc netcode.
-
-### Phase 6 — Extract the engine-agnostic core (**goldnet / goldnet-godot split**)
-Done **last, after the coupled version is proven** — you learn the real seams by building
-against the game first, so the abstractions are earned, not guessed. Mirrors `hop` / `hop-godot`.
-
-- **`goldnet`** (pure C++ library, no Godot): the protocol and its math — snapshot ring,
-  delta-against-acked encoding, ack tracking, wire format, the interpolation-buffer math, and
-  the prediction/reconciliation replay framework. Operates on an *abstract* entity-state model.
-  Unit-testable with zero engine: deterministic protocol tests, packet-loss/jitter sims,
-  delta-correctness checks, all headless. Can also back a **non-Godot dedicated server** (ENet is
-  a C library, engine-agnostic) via the same interfaces.
-- **`goldnet-godot`** (godot-cpp GDExtension): the glue. The `MultiplayerAPIExtension` from
-  Phases 0–5 becomes this — it delegates all protocol work to `goldnet` and supplies the
-  engine-specific bindings.
-
-The seams `goldnet` must define (this is the honest asymmetry vs. `hop`: physics has ~1 seam,
-bodies in/out; netcode has ~4–5):
-- **Transport** — `send(peer, channel, reliable, bytes)` + `poll()`. `goldnet-godot` backs it
-  with Godot's `ENetMultiplayerPeer`; a headless server backs it with raw ENet.
-- **Entity-state model** — field schema (types + quantization hints) + get/set over opaque
-  handles. `goldnet-godot` marshals Godot node properties ↔ `goldnet` state.
-- **Relevancy** — `is_relevant(entity, peer) -> bool`. `goldnet-godot` answers with BSP PVS.
-- **Clock/tick source** — driven by the Godot frame loop in the binding.
-
-- **Exit criterion:** `goldnet` builds and its protocol test-suite passes with no Godot present;
-  WizardWars runs on `goldnet-godot` (which is only bindings) with no behavior change; the split
-  is a refactor, not a rewrite.
 
 ## 4. Cross-cutting concerns
 - **Server-authoritative** model assumed and documented; the module is transport +
