@@ -10,7 +10,7 @@ synchronizers, spawners, and `@rpc` methods; installing goldnet swaps only the
 It is the netcode sibling to [`goldsrc-godot`](../goldsrc-godot) (the asset
 loader) and mirrors the [`hop`](../hop-godot) split: a single GDExtension today,
 with an engine-agnostic **goldnet** core and this **goldnet-godot** binding as the
-eventual factoring. See `../../docs/goldsrc_netcode_plan.md` for the full plan.
+eventual factoring.
 
 ## Why
 
