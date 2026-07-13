@@ -15,6 +15,7 @@
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
+#include <godot_cpp/variant/vector3.hpp>
 
 using namespace godot;
 
@@ -58,6 +59,84 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 	}
 	r_prop = NodePath(prop);
 	return target;
+}
+
+// Compact, self-delimiting wire encoding for per-slot delta values. Stock Variant
+// put_var tags every value with a 4-byte type header and stores floats/ints at 64-bit
+// width — unaffordable on the hot per-tick delta path, where the same handful of
+// property types (float, int, Vector3, bool) recur across every entity. We pack those
+// behind a 1-byte tag using 32-bit floats and zig-zag varint ints (a moving player's
+// ~8 props drop from ~112 to ~48 bytes), and fall back to put_var for anything else so
+// the stream stays self-delimiting and any Variant still round-trips.
+enum GNValueTag : uint8_t { GN_T_VAR = 0, GN_T_FLOAT = 1, GN_T_INT = 2, GN_T_VEC3 = 3, GN_T_BOOL = 4 };
+
+static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) {
+	uint64_t u = ((uint64_t)p_v << 1) ^ (uint64_t)(p_v >> 63); // zig-zag: small magnitudes → few bytes
+	while (u >= 0x80) {
+		buf->put_u8((uint8_t)u | 0x80);
+		u >>= 7;
+	}
+	buf->put_u8((uint8_t)u);
+}
+
+static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) {
+	uint64_t u = 0;
+	int shift = 0;
+	uint8_t b;
+	do {
+		b = buf->get_u8();
+		u |= (uint64_t)(b & 0x7F) << shift;
+		shift += 7;
+	} while (b & 0x80);
+	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
+}
+
+static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v) {
+	switch (v.get_type()) {
+		case Variant::FLOAT:
+			buf->put_u8(GN_T_FLOAT);
+			buf->put_float((float)(double)v);
+			break;
+		case Variant::INT:
+			buf->put_u8(GN_T_INT);
+			gn_put_varint(buf, (int64_t)v);
+			break;
+		case Variant::VECTOR3: {
+			buf->put_u8(GN_T_VEC3);
+			Vector3 vv = v;
+			buf->put_float(vv.x);
+			buf->put_float(vv.y);
+			buf->put_float(vv.z);
+		} break;
+		case Variant::BOOL:
+			buf->put_u8(GN_T_BOOL);
+			buf->put_u8((bool)v ? 1 : 0);
+			break;
+		default:
+			buf->put_u8(GN_T_VAR);
+			buf->put_var(v);
+			break;
+	}
+}
+
+static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf) {
+	uint8_t t = buf->get_u8();
+	switch (t) {
+		case GN_T_FLOAT:
+			return (double)buf->get_float();
+		case GN_T_INT:
+			return gn_get_varint(buf);
+		case GN_T_VEC3: {
+			float x = buf->get_float();
+			float y = buf->get_float();
+			float z = buf->get_float();
+			return Vector3(x, y, z);
+		}
+		case GN_T_BOOL:
+			return buf->get_u8() != 0;
+		default:
+			return buf->get_var();
+	}
 }
 
 GoldNetMultiplayer::GoldNetMultiplayer() {
@@ -333,7 +412,8 @@ void GoldNetMultiplayer::_detect_despawns() {
 			despawn_pending[net_id] = needers;
 		}
 		for (KeyValue<int32_t, PeerRing> &pr : peer_rings) {
-			pr.value.spawn_wait.erase(net_id); // stop resending the (now void) spawn
+			pr.value.spawn_wait.erase(net_id);  // stop resending the (now void) spawn
+			pr.value.spawn_acked.erase(net_id); // and forget delivery, so a reused id re-spawns cleanly
 		}
 	}
 }
@@ -496,6 +576,11 @@ void GoldNetMultiplayer::_server_tick() {
 		spawn_body.instantiate();
 		uint16_t spawn_ct = 0;
 		for (const KeyValue<uint32_t, SpawnRecord> &kv : spawn_records) {
+			if (pr.spawn_acked.has(kv.key)) {
+				continue; // peer already has this node — don't re-arm the spawn every frame
+			}
+			// on_ack is the sole populator of spawn_acked: it retires+marks a record the moment
+			// last_acked reaches it, before _reliable_include here could ever see it delivered.
 			if (!_reliable_include(pr.spawn_wait, kv.key, seq, pr.last_acked, pr.has_ack)) {
 				continue;
 			}
@@ -527,6 +612,10 @@ void GoldNetMultiplayer::_server_tick() {
 		uint16_t changed = 0;
 		for (int i = 0; i < ents.size(); i++) {
 			MultiplayerSynchronizer *sync = ents[i].sync;
+			// Per-peer PVS. The game drives each synchronizer's peer_visibility via set_visibility_for
+			// once per net tick (NetworkManager.push_pvs_visibility), so this native read is the whole
+			// gate — public_visibility for map-static "visible to all" entities, else the per-peer bit.
+			// (We can't use MultiplayerSynchronizer's visibility *filters* — is_visible_to isn't bound.)
 			if (!(sync->is_visibility_public() || sync->get_visibility_for(peer))) {
 				continue;
 			}
@@ -552,7 +641,7 @@ void GoldNetMultiplayer::_server_tick() {
 			body->put_u32(mask);
 			for (int s = 0; s < vals.size(); s++) {
 				if (mask & (1u << s)) {
-					body->put_var(vals[s]);
+					gn_put_value(body, vals[s]);
 				}
 			}
 			changed++;
@@ -687,7 +776,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			if (!(mask & (1u << s))) {
 				continue;
 			}
-			Variant v = buf->get_var(); // self-delimiting — always consume
+			Variant v = gn_get_value(buf); // self-delimiting — always consume
 			if (s < vals.size()) {
 				vals.write[s] = v;
 			}
@@ -747,6 +836,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		if (now - dbg_last_ms > 2000) {
 			dbg_last_ms = now;
 			UtilityFunctions::print("[goldnet] recv seq=", seq, " base=", base_seq,
+					" spawn=", spawn_ct, " despawn=", despawn_ct,
 					" changed=", count, " bytes=", (int)p_bytes.size(),
 					" registered=", (int)owned_syncs.size());
 		}
@@ -766,6 +856,9 @@ void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
 	// Retire spawn/despawn records this ack confirms delivered.
 	Vector<uint32_t> retired;
 	_retire_acked(pr->spawn_wait, pr->last_acked, retired);
+	for (int i = 0; i < retired.size(); i++) {
+		pr->spawn_acked.insert(retired[i]); // durably remember delivery (spawn source record persists)
+	}
 	retired.clear();
 	_retire_acked(pr->despawn_wait, pr->last_acked, retired);
 	for (int i = 0; i < retired.size(); i++) {

@@ -105,6 +105,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// the current unacked run; once last_acked >= that seq the peer has it and we stop.
 		HashMap<uint32_t, uint16_t> spawn_wait;
 		HashMap<uint32_t, uint16_t> despawn_wait;
+		// Spawns already acked by this peer. Unlike despawns (one-shot — the record is dropped
+		// once delivered), a spawn's source record lives as long as the entity, so "absent from
+		// spawn_wait" can't mean "delivered" — it would re-arm the spawn every frame. This set is
+		// the durable "peer already has this node" marker; a net_id here is never re-sent until
+		// the entity despawns (which clears it).
+		HashSet<uint32_t> spawn_acked;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
 
