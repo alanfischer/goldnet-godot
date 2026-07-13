@@ -45,6 +45,11 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// nodes alike).
 	struct SyncEntry {
 		uint32_t net_id = 0;
+		// Per-slot quantization tag (GN_Q_AUTO = none), aligned to the sync-property slots. Read
+		// lazily on the first tick (so the game has set the "gn_quant" meta by then) and cached;
+		// empty means all-auto.
+		Vector<uint8_t> quant;
+		bool quant_read = false;
 	};
 	HashMap<uint64_t, SyncEntry> owned_syncs;    // ObjectID -> entry
 	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id   -> ObjectID (client apply lookup)
@@ -123,6 +128,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 
 	uint64_t last_send_ms = 0;                   // server send throttle
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
+	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
@@ -139,6 +145,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 
 	// Internals.
 	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // has streamable sync props
+	// Build the per-slot quantization tags from a synchronizer's "gn_quant" meta (see gn_put_value).
+	static void _read_quant(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_quant);
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
 	uint32_t _min_interval_ms() const;
@@ -164,10 +172,23 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _apply_despawn(uint32_t p_net_id);                                                  // client
 
 protected:
-	static void _bind_methods() {}
+	static void _bind_methods();
 
 public:
 	GoldNetMultiplayer();
+
+	// --- Config surface (Phase 5) — settable from GDScript on the installed API instance ---
+	// Snapshot send cadence override in ms; 0 (default) derives it from the synchronizers'
+	// replication_interval (min across owned syncs). Set >0 to pin one global tick rate.
+	void set_snapshot_interval_ms(int p_ms);
+	int get_snapshot_interval_ms() const;
+	// Periodic per-peer snapshot stats to stdout (also enabled by GOLDNET_DEBUG=1).
+	void set_debug_enabled(bool p_enabled);
+	bool is_debug_enabled() const;
+	// Drop this percent of outbound snapshots server-side to exercise the ack self-heal without a
+	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
+	void set_loss_percent(int p_pct);
+	int get_loss_percent() const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

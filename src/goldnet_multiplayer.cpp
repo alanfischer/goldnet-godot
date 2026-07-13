@@ -1,6 +1,9 @@
 #include "goldnet_multiplayer.h"
 #include "goldnet_link.h"
 
+#include <cmath>
+#include <cstring>
+
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/multiplayer_spawner.hpp>
 #include <godot_cpp/classes/scene_multiplayer.hpp>
@@ -68,7 +71,22 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 // behind a 1-byte tag using 32-bit floats and zig-zag varint ints (a moving player's
 // ~8 props drop from ~112 to ~48 bytes), and fall back to put_var for anything else so
 // the stream stays self-delimiting and any Variant still round-trips.
-enum GNValueTag : uint8_t { GN_T_VAR = 0, GN_T_FLOAT = 1, GN_T_INT = 2, GN_T_VEC3 = 3, GN_T_BOOL = 4 };
+//
+// Optional per-property QUANTIZATION (Phase 5): a synchronizer may hint that a slot is an angle,
+// or that a float / Vector3 tolerates half precision, via its "gn_quant" meta (see _read_quant).
+// We then pack it lossily behind its own tag — angles to a u16 (~0.0055° steps), floats/Vector3 to
+// IEEE binary16. The tags stay self-describing, so the DECODER needs no hint (it reads the tag and
+// knows the width, preserving the "consume even for unknown ids" invariant); only the SENDER
+// consults the hint. A moving player's yaw+pitch drop 10→6 B, net_pos (if hinted) 13→7 B.
+enum GNValueTag : uint8_t {
+	GN_T_VAR = 0, GN_T_FLOAT = 1, GN_T_INT = 2, GN_T_VEC3 = 3, GN_T_BOOL = 4,
+	GN_T_ANGLE16 = 5,   // float radians -> u16 over [0, TAU)
+	GN_T_HALF = 6,      // float -> IEEE binary16
+	GN_T_VEC3_HALF = 7, // Vector3 -> 3x binary16
+};
+// Sentinel for "no quantization hint on this slot — pick the tag from the runtime type".
+static const uint8_t GN_Q_AUTO = 255;
+static const float GN_TAU = 6.28318530717958647692f;
 
 static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) {
 	uint64_t u = ((uint64_t)p_v << 1) ^ (uint64_t)(p_v >> 63); // zig-zag: small magnitudes → few bytes
@@ -91,7 +109,93 @@ static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) {
 	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
 }
 
-static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v) {
+// float32 <-> IEEE binary16. Truncating mantissa (round-toward-zero) is plenty for game state.
+static uint16_t gn_f32_to_f16(float f) {
+	uint32_t x;
+	memcpy(&x, &f, 4);
+	uint32_t sign = (x >> 16) & 0x8000u;
+	int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+	uint32_t mant = x & 0x7FFFFFu;
+	if (exp <= 0) {
+		return (uint16_t)sign; // underflow / zero -> signed zero
+	}
+	if (exp >= 0x1F) {
+		return (uint16_t)(sign | 0x7C00u); // overflow / inf / nan -> inf
+	}
+	return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+static float gn_f16_to_f32(uint16_t h) {
+	uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp = (h >> 10) & 0x1Fu;
+	uint32_t mant = h & 0x3FFu;
+	uint32_t f;
+	if (exp == 0) {
+		if (mant == 0) {
+			f = sign;
+		} else {
+			exp = 1;
+			while (!(mant & 0x400u)) { mant <<= 1; exp--; }
+			mant &= 0x3FFu;
+			f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+		}
+	} else if (exp == 0x1Fu) {
+		f = sign | 0x7F800000u | (mant << 13);
+	} else {
+		f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+	}
+	float out;
+	memcpy(&out, &f, 4);
+	return out;
+}
+static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_u16(gn_f32_to_f16(f)); }
+static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return gn_f16_to_f32(buf->get_u16()); }
+
+static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) {
+	float t = fmodf(radians, GN_TAU);
+	if (t < 0.0f) {
+		t += GN_TAU;
+	}
+	buf->put_u16((uint16_t)((t / GN_TAU) * 65536.0f)); // wraps: TAU and 0 both map to 0
+}
+static float gn_get_angle16(const Ref<StreamPeerBuffer> &buf) {
+	return ((float)buf->get_u16() / 65536.0f) * GN_TAU;
+}
+
+// Map a "gn_quant" hint name to its tag, or GN_Q_AUTO if the name is unknown.
+static uint8_t gn_quant_from_name(const String &name) {
+	if (name == "angle16") {
+		return GN_T_ANGLE16;
+	}
+	if (name == "half") {
+		return GN_T_HALF;
+	}
+	if (name == "vec3_half") {
+		return GN_T_VEC3_HALF;
+	}
+	return GN_Q_AUTO;
+}
+
+static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uint8_t quant = GN_Q_AUTO) {
+	switch (quant) {
+		case GN_T_ANGLE16:
+			buf->put_u8(GN_T_ANGLE16);
+			gn_put_angle16(buf, (float)(double)v);
+			return;
+		case GN_T_HALF:
+			buf->put_u8(GN_T_HALF);
+			gn_put_half(buf, (float)(double)v);
+			return;
+		case GN_T_VEC3_HALF: {
+			buf->put_u8(GN_T_VEC3_HALF);
+			Vector3 vv = v;
+			gn_put_half(buf, vv.x);
+			gn_put_half(buf, vv.y);
+			gn_put_half(buf, vv.z);
+			return;
+		}
+		default:
+			break; // GN_Q_AUTO (or a hint that can't apply) → type-based encoding below
+	}
 	switch (v.get_type()) {
 		case Variant::FLOAT:
 			buf->put_u8(GN_T_FLOAT);
@@ -134,6 +238,16 @@ static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf) {
 		}
 		case GN_T_BOOL:
 			return buf->get_u8() != 0;
+		case GN_T_ANGLE16:
+			return (double)gn_get_angle16(buf);
+		case GN_T_HALF:
+			return (double)gn_get_half(buf);
+		case GN_T_VEC3_HALF: {
+			float x = gn_get_half(buf);
+			float y = gn_get_half(buf);
+			float z = gn_get_half(buf);
+			return Vector3(x, y, z);
+		}
 		default:
 			return buf->get_var();
 	}
@@ -470,6 +584,9 @@ void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
 }
 
 uint32_t GoldNetMultiplayer::_min_interval_ms() const {
+	if (snapshot_interval_override > 0) {
+		return (uint32_t)snapshot_interval_override; // config override pins one global cadence
+	}
 	uint32_t best = 0;
 	for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
 		MultiplayerSynchronizer *s = sync_from_objid(kv.key);
@@ -486,6 +603,40 @@ uint32_t GoldNetMultiplayer::_min_interval_ms() const {
 		}
 	}
 	return best == 0 ? DEFAULT_INTERVAL_MS : best;
+}
+
+// --- Config surface (Phase 5) ---
+
+void GoldNetMultiplayer::set_snapshot_interval_ms(int p_ms) {
+	snapshot_interval_override = p_ms > 0 ? p_ms : 0;
+	cached_min_interval_ms = _min_interval_ms();
+}
+int GoldNetMultiplayer::get_snapshot_interval_ms() const {
+	return snapshot_interval_override;
+}
+void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
+	dbg = p_enabled;
+}
+bool GoldNetMultiplayer::is_debug_enabled() const {
+	return dbg;
+}
+void GoldNetMultiplayer::set_loss_percent(int p_pct) {
+	dbg_loss = p_pct < 0 ? 0 : (p_pct > 100 ? 100 : p_pct);
+}
+int GoldNetMultiplayer::get_loss_percent() const {
+	return dbg_loss;
+}
+
+void GoldNetMultiplayer::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
+	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
+	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
+	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
+	ClassDB::bind_method(D_METHOD("set_loss_percent", "pct"), &GoldNetMultiplayer::set_loss_percent);
+	ClassDB::bind_method(D_METHOD("get_loss_percent"), &GoldNetMultiplayer::get_loss_percent);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "loss_percent"), "set_loss_percent", "get_loss_percent");
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -517,6 +668,44 @@ static void read_slot_values(MultiplayerSynchronizer *p_sync, const Vector<NodeP
 	}
 }
 
+// Build the per-slot quantization tags from a synchronizer's "gn_quant" meta: a Dictionary keyed
+// by the sync property's leaf name (e.g. "net_yaw") -> hint name ("angle16" | "half" | "vec3_half").
+// Leaves r_quant empty when there's no meta or no recognized hint (the common case = all-auto).
+void GoldNetMultiplayer::_read_quant(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_quant) {
+	r_quant.clear();
+	const StringName meta_key("gn_quant");
+	if (!p_sync->has_meta(meta_key)) {
+		return;
+	}
+	Variant mv = p_sync->get_meta(meta_key);
+	if (mv.get_type() != Variant::DICTIONARY) {
+		return;
+	}
+	Dictionary hints = mv;
+	Vector<NodePath> slots;
+	get_sync_slots(p_sync, slots);
+	Vector<uint8_t> q;
+	q.resize(slots.size());
+	bool any = false;
+	for (int s = 0; s < slots.size(); s++) {
+		uint8_t code = GN_Q_AUTO;
+		int sc = slots[s].get_subname_count();
+		if (sc > 0) {
+			String leaf = slots[s].get_subname(sc - 1);
+			if (hints.has(leaf)) {
+				code = gn_quant_from_name(String(hints[leaf]));
+			}
+		}
+		q.write[s] = code;
+		if (code != GN_Q_AUTO) {
+			any = true;
+		}
+	}
+	if (any) {
+		r_quant = q;
+	}
+}
+
 void GoldNetMultiplayer::_server_tick() {
 	GoldNetLink *l = _ensure_link();
 	if (!l) {
@@ -533,18 +722,25 @@ void GoldNetMultiplayer::_server_tick() {
 		MultiplayerSynchronizer *sync;
 		uint32_t net_id;
 		Vector<Variant> vals;
+		const Vector<uint8_t> *quant; // per-slot quantization tags (may be empty = all-auto)
 	};
 	Vector<TickEnt> ents;
-	for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
+	for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
 		MultiplayerSynchronizer *sync = sync_from_objid(kv.key);
 		if (!sync || !sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
 			continue;
+		}
+		// Read the gn_quant hint once, on first tick — by now the game has set the meta.
+		if (!kv.value.quant_read) {
+			_read_quant(sync, kv.value.quant);
+			kv.value.quant_read = true;
 		}
 		Vector<NodePath> slots;
 		get_sync_slots(sync, slots);
 		TickEnt e;
 		e.sync = sync;
 		e.net_id = kv.value.net_id;
+		e.quant = &kv.value.quant;
 		read_slot_values(sync, slots, e.vals);
 		ents.push_back(e);
 	}
@@ -639,9 +835,10 @@ void GoldNetMultiplayer::_server_tick() {
 			}
 			body->put_u32(net_id);
 			body->put_u32(mask);
+			const Vector<uint8_t> &q = *ents[i].quant;
 			for (int s = 0; s < vals.size(); s++) {
 				if (mask & (1u << s)) {
-					gn_put_value(body, vals[s]);
+					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO);
 				}
 			}
 			changed++;

@@ -141,6 +141,11 @@ step.
 - **Per-peer PVS cull** ✅ via the `set_visibility_for` push bridge above — the
   former open limitation is resolved.
 - **Compact wire encoding** ✅ tagged f32 / varint value codec.
+- **Phase 5 — generalize / configure** (in progress): a config surface on the
+  installed API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`) and
+  opt-in per-property **quantization hints** — angles to a u16, floats/Vector3 to
+  IEEE half — via a synchronizer's `gn_quant` meta (self-describing tags, so only
+  the sender needs the hint). WizardWars quantizes player yaw/pitch.
 - Remaining: full build-matrix packaging + a minimal example project, and the
   engine-agnostic `goldnet` core / `goldnet-godot` binding split (Phase 6).
 
@@ -177,6 +182,18 @@ In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
    # each net tick, per peer:
    sync.set_visibility_for(peer_id, my_pvs_predicate(peer_id))
    ```
+5. (Optional) Tune the installed API and opt into lossy per-property quantization:
+   ```gdscript
+   var gn := ClassDB.instantiate(&"GoldNetMultiplayer")
+   gn.snapshot_interval_ms = 33   # 0 = derive from synchronizers' replication_interval
+   get_tree().set_multiplayer(gn)
+
+   # Per property, keyed by the sync property's leaf name. Set before the sync enters
+   # the tree. Recognized hints: "angle16" (radians→u16), "half", "vec3_half".
+   sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
+   ```
+   `debug_enabled` / `loss_percent` are also settable (mirror `GOLDNET_DEBUG` /
+   `GOLDNET_LOSS`).
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
