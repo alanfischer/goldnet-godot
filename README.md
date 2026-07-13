@@ -132,13 +132,17 @@ step.
 - **Phase 3 — spawn / despawn in the stream** ✅ own the spawners too; players and
   projectiles are agnostic with map movers.
 - **Phase 4 — client helpers + idle-free replication** ✅ reusable
-  `InterpolationBuffer` (server-clock-synced jitter buffer), and idle entities
-  freeze their shadow state so unchanged frames are skipped whole.
+  `InterpolationBuffer` (server-clock-synced jitter buffer) and `PredictedBody`
+  (simulation-agnostic input prediction + reconciliation harness — owns the seq
+  counter, unacked-input history, out-of-order rejection, chain-correction
+  suppression, and replay ordering; the domain supplies snapshot/divergence/replay).
+  Idle entities freeze their shadow state so unchanged frames are skipped whole.
+  WizardWars' netmove movement dogfoods `PredictedBody`.
 - **Per-peer PVS cull** ✅ via the `set_visibility_for` push bridge above — the
   former open limitation is resolved.
 - **Compact wire encoding** ✅ tagged f32 / varint value codec.
-- Remaining: `PredictedBody` prediction helper, full build-matrix packaging, and
-  the engine-agnostic library split.
+- Remaining: full build-matrix packaging + a minimal example project, and the
+  engine-agnostic `goldnet` core / `goldnet-godot` binding split (Phase 6).
 
 ## Building
 
