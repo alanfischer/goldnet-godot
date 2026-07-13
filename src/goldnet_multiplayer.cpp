@@ -2,7 +2,6 @@
 #include "goldnet_link.h"
 
 #include <cmath>
-#include <cstring>
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/multiplayer_spawner.hpp>
@@ -109,46 +108,9 @@ static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) {
 	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
 }
 
-// float32 <-> IEEE binary16. Truncating mantissa (round-toward-zero) is plenty for game state.
-static uint16_t gn_f32_to_f16(float f) {
-	uint32_t x;
-	memcpy(&x, &f, 4);
-	uint32_t sign = (x >> 16) & 0x8000u;
-	int32_t exp = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
-	uint32_t mant = x & 0x7FFFFFu;
-	if (exp <= 0) {
-		return (uint16_t)sign; // underflow / zero -> signed zero
-	}
-	if (exp >= 0x1F) {
-		return (uint16_t)(sign | 0x7C00u); // overflow / inf / nan -> inf
-	}
-	return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
-}
-static float gn_f16_to_f32(uint16_t h) {
-	uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
-	uint32_t exp = (h >> 10) & 0x1Fu;
-	uint32_t mant = h & 0x3FFu;
-	uint32_t f;
-	if (exp == 0) {
-		if (mant == 0) {
-			f = sign;
-		} else {
-			exp = 1;
-			while (!(mant & 0x400u)) { mant <<= 1; exp--; }
-			mant &= 0x3FFu;
-			f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-		}
-	} else if (exp == 0x1Fu) {
-		f = sign | 0x7F800000u | (mant << 13);
-	} else {
-		f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-	}
-	float out;
-	memcpy(&out, &f, 4);
-	return out;
-}
-static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_u16(gn_f32_to_f16(f)); }
-static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return gn_f16_to_f32(buf->get_u16()); }
+// IEEE binary16 via StreamPeer's built-in half codec (round-to-nearest, handles subnormals).
+static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_half(f); }
+static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return buf->get_half(); }
 
 static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) {
 	float t = fmodf(radians, GN_TAU);

@@ -39,6 +39,10 @@ var _next_seq := 1
 var _highest_reconciled_seq := -1  # reject out-of-order / already-superseded server acks
 var _replay_end_seq := -1          # inputs <= this were produced by a replay; don't re-correct them
 
+## reconcile()'s shared "no correction" result — the common (per-tick) return. Read-only, so it
+## allocates nothing on the hot path; callers must not mutate it.
+const _NO_CORRECTION := { "corrected": false, "replay": [] }
+
 
 ## Monotonic id for the next input. Never resets across clear() — the server drops a repeated seq
 ## as a duplicate, so it must keep climbing (e.g. across respawns).
@@ -64,41 +68,39 @@ func record(seq: int, input: Variant, snapshot: Variant, context: Variant = null
 
 ## Process the server's ack for `acked_seq` (whose authoritative state your `diverged` predicate
 ## closes over). Returns a Dictionary:
-##   { corrected: bool, replay: Array, predicted, unacked: int }
+##   { corrected: bool, replay: Array, predicted }
 ## When corrected is true, `replay` is the still-unacked inputs (each { input, context }, in order)
-## to re-simulate after you snap the body to the server state, `predicted` is the opaque snapshot
-## recorded for the acked input, and `unacked` is how many inputs will be replayed — the last two
-## are there for the caller's own diagnostics. When false, `replay` is empty and the other fields
-## are absent. The acked input and everything older are pruned in every accepted path, so the
-## buffer then holds only still-unacked inputs.
+## to re-simulate after you snap the body to the server state, and `predicted` is the opaque snapshot
+## recorded for the acked input (there for the caller's diagnostics; `replay.size()` is the number of
+## inputs replayed). When false, `replay` is empty and `predicted` is absent. The acked input and
+## everything older are pruned in every accepted path, so the buffer then holds only still-unacked
+## inputs.
 ##
 ## `diverged.call(predicted_snapshot) -> bool` decides whether the prediction for the acked input
 ## is far enough from the server's state to warrant a correction. It is called at most once per
 ## reconcile, and only when the acked input hasn't already been superseded or replayed.
 func reconcile(acked_seq: int, diverged: Callable) -> Dictionary:
-	var none := { "corrected": false, "replay": [] }
 	# Out-of-order / superseded: we already reconciled this seq or a newer one.
 	if acked_seq <= _highest_reconciled_seq:
-		return none
+		return _NO_CORRECTION
 	var match_idx := -1
 	for i in _buffer.size():
 		if _buffer[i]["seq"] == acked_seq:
 			match_idx = i
 			break
 	if match_idx == -1:
-		return none
+		return _NO_CORRECTION
 	_highest_reconciled_seq = acked_seq
 	# Suppress corrections for inputs a prior correction already replayed: replayed snapshots are
 	# non-deterministic (the caller re-runs many sim steps in one frame vs one/frame on the server),
 	# so re-comparing them chains corrections. Trust the server state and let fresh predictions settle.
 	if acked_seq <= _replay_end_seq:
 		_prune_up_to(match_idx)
-		return none
+		return _NO_CORRECTION
 	var predicted: Variant = _buffer[match_idx]["snapshot"]
-	var unacked := _buffer.size() - match_idx - 1
 	if not diverged.call(predicted):
 		_prune_up_to(match_idx)
-		return none
+		return _NO_CORRECTION
 	var replay: Array = []
 	for i in range(match_idx + 1, _buffer.size()):
 		replay.append({ "input": _buffer[i]["input"], "context": _buffer[i]["context"] })
@@ -106,7 +108,7 @@ func reconcile(acked_seq: int, diverged: Callable) -> Dictionary:
 	if _buffer.size() > 0:
 		_replay_end_seq = _buffer[_buffer.size() - 1]["seq"]
 	_prune_up_to(match_idx)
-	return { "corrected": true, "replay": replay, "predicted": predicted, "unacked": unacked }
+	return { "corrected": true, "replay": replay, "predicted": predicted }
 
 
 ## Number of still-unacked recorded inputs.
