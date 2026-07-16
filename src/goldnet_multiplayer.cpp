@@ -8,6 +8,7 @@
 #include <godot_cpp/classes/scene_multiplayer.hpp>
 #include <godot_cpp/classes/scene_replication_config.hpp>
 #include <godot_cpp/classes/scene_tree.hpp>
+#include <godot_cpp/classes/script.hpp>
 #include <godot_cpp/classes/stream_peer_buffer.hpp>
 #include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/window.hpp>
@@ -15,6 +16,7 @@
 #include <godot_cpp/templates/vector.hpp>
 #include <godot_cpp/variant/callable_method_pointer.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/vector3.hpp>
@@ -226,6 +228,35 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
 		dbg_loss = loss ? atoi(loss) : 0;
+	}
+	{
+		// GOLDNET_LATENCY=min,max (per-leg ms range) or a single fixed value; GOLDNET_SPIKE=ms,interval,duration.
+		// These let a headless server simulate its own send leg with no admin console (see netsim_plan §3.5).
+		// Route through the setters (not raw fields) so clamping/side-effects live in exactly one place.
+		const char *lat = getenv("GOLDNET_LATENCY");
+		if (lat) {
+			PackedStringArray parts = String(lat).split(",");
+			if (parts.size() >= 2) {
+				set_latency_min_ms(parts[0].to_int());
+				set_latency_max_ms(parts[1].to_int());
+			} else if (parts.size() == 1 && !parts[0].is_empty()) {
+				set_latency_min_ms(parts[0].to_int());
+				set_latency_max_ms(parts[0].to_int());
+			}
+		}
+		const char *spike = getenv("GOLDNET_SPIKE");
+		if (spike) {
+			PackedStringArray parts = String(spike).split(",");
+			if (parts.size() >= 1 && !parts[0].is_empty()) {
+				set_spike_ms(parts[0].to_int());
+			}
+			if (parts.size() >= 2) {
+				set_spike_interval_s((float)parts[1].to_float());
+			}
+			if (parts.size() >= 3) {
+				set_spike_duration_s((float)parts[2].to_float());
+			}
+		}
 	}
 	inner = MultiplayerAPI::create_default_interface(); // a SceneMultiplayer
 
@@ -630,6 +661,186 @@ void GoldNetMultiplayer::set_relevance_events(bool p_enabled) {
 bool GoldNetMultiplayer::get_relevance_events() const {
 	return relevance_events_enabled;
 }
+void GoldNetMultiplayer::set_latency_min_ms(int p_ms) {
+	latency_min_ms = p_ms < 0 ? 0 : p_ms;
+}
+int GoldNetMultiplayer::get_latency_min_ms() const {
+	return latency_min_ms;
+}
+void GoldNetMultiplayer::set_latency_max_ms(int p_ms) {
+	latency_max_ms = p_ms < 0 ? 0 : p_ms;
+}
+int GoldNetMultiplayer::get_latency_max_ms() const {
+	return latency_max_ms;
+}
+void GoldNetMultiplayer::set_spike_ms(int p_ms) {
+	spike_ms = p_ms < 0 ? 0 : p_ms;
+	if (spike_ms == 0) { // disabling clears any in-flight spike
+		_spike_active = false;
+		_spike_timer = 0.0f;
+		_spike_elapsed = 0.0f;
+	}
+}
+int GoldNetMultiplayer::get_spike_ms() const {
+	return spike_ms;
+}
+void GoldNetMultiplayer::set_spike_interval_s(float p_s) {
+	spike_interval_s = p_s < 0.0f ? 0.0f : p_s;
+}
+float GoldNetMultiplayer::get_spike_interval_s() const {
+	return spike_interval_s;
+}
+void GoldNetMultiplayer::set_spike_duration_s(float p_s) {
+	spike_duration_s = p_s < 0.0f ? 0.0f : p_s;
+}
+float GoldNetMultiplayer::get_spike_duration_s() const {
+	return spike_duration_s;
+}
+void GoldNetMultiplayer::sim_reset() {
+	_sim_queue.clear();
+	_last_fire_at = 0;
+	_spike_active = false;
+	_spike_timer = 0.0f;
+	_spike_elapsed = 0.0f;
+	_rpc_unreliable_cache.clear();
+}
+
+// --- Send-side sim engine (port of net_latency_sim.gd) ---
+
+// Advance the WiFi-spike state machine by one poll's worth of elapsed time. A spike is a brief
+// window where every send is held by spike_ms instead of the normal latency range, modelling a
+// power-save stall that releases a burst of packets at once.
+void GoldNetMultiplayer::_sim_update_spike(float p_delta) {
+	if (spike_ms <= 0) {
+		return;
+	}
+	if (_spike_active) {
+		_spike_elapsed += p_delta;
+		if (_spike_elapsed >= spike_duration_s) {
+			_spike_active = false;
+			_spike_elapsed = 0.0f;
+			_spike_timer = 0.0f;
+		}
+	} else {
+		_spike_timer += p_delta;
+		if (_spike_timer >= spike_interval_s) {
+			_spike_active = true;
+			_spike_elapsed = 0.0f;
+			_spike_timer = 0.0f;
+		}
+	}
+}
+
+// The delay (ms) to apply to the current send: the full spike latency while a spike is active,
+// otherwise a random draw from [latency_min_ms, latency_max_ms]. 0 ⇒ send immediately. Unlike the
+// GDScript original there is no >>1 half-split — this is the full per-leg delay (netsim_plan §4b).
+int GoldNetMultiplayer::_sim_delay_ms() {
+	if (_spike_active && spike_ms > 0) {
+		return spike_ms > 1 ? spike_ms : 1;
+	}
+	if (latency_max_ms <= 0) {
+		return 0;
+	}
+	return (int)UtilityFunctions::randi_range(latency_min_ms, latency_max_ms);
+}
+
+// The shared tail of both send funnels (the snapshot send and _rpc, minus their own loss gates):
+// apply this send's latency/spike, sending immediately when there's none or queuing it otherwise.
+Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
+	int d = _sim_delay_ms();
+	if (d <= 0) {
+		return inner->rpc(p_peer, p_object, p_method, p_args);
+	}
+	_sim_queue_send(d, p_peer, p_object, p_method, p_args);
+	return OK;
+}
+
+// Queue inner->rpc(peer,object,method,args) to fire after p_delay_ms, clamped so packets never
+// overtake earlier ones (a pipe, not per-packet jitter): a late-released send fires no sooner than
+// the last one queued. One cursor suffices — every send routes through here, so there's no separate
+// reliable stream to order against.
+void GoldNetMultiplayer::_sim_queue_send(int p_delay_ms, int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
+	uint64_t fire_at = Time::get_singleton()->get_ticks_msec() + (uint64_t)p_delay_ms;
+	if (fire_at < _last_fire_at) {
+		fire_at = _last_fire_at;
+	}
+	_last_fire_at = fire_at;
+	PendingSend ps;
+	ps.fire_at_ms = fire_at;
+	ps.peer = p_peer;
+	ps.object_id = p_object->get_instance_id();
+	ps.method = p_method;
+	ps.args = p_args;
+	_sim_queue.push_back(ps);
+}
+
+// Called every poll (client and server): advance the spike timer by the real elapsed delta and
+// replay every queued send whose fire time has passed. A target freed during its delay is a no-op.
+void GoldNetMultiplayer::_sim_pump(uint64_t p_now_ms) {
+	float delta = _sim_last_poll_ms != 0 ? (float)(p_now_ms - _sim_last_poll_ms) / 1000.0f : 0.0f;
+	_sim_last_poll_ms = p_now_ms;
+	_sim_update_spike(delta);
+
+	int i = 0;
+	while (i < _sim_queue.size()) {
+		if (_sim_queue[i].fire_at_ms <= p_now_ms) {
+			PendingSend ps = _sim_queue[i];
+			_sim_queue.remove_at(i);
+			Object *o = ObjectDB::get_instance(ps.object_id);
+			if (o) {
+				inner->rpc(ps.peer, o, ps.method, ps.args);
+			}
+		} else {
+			i++;
+		}
+	}
+}
+
+// Look p_method up in one rpc-config Dictionary (method name → per-method config carrying a
+// "transfer_mode" MultiplayerPeer::TransferMode). Sets r_unreliable and returns true if the method
+// is present; returns false (r_unreliable untouched) if absent or the config isn't a Dictionary.
+static bool rpc_cfg_lookup(const Variant &p_config, const StringName &p_method, bool &r_unreliable) {
+	if (p_config.get_type() != Variant::DICTIONARY) {
+		return false;
+	}
+	Dictionary cfg = p_config;
+	if (!cfg.has(p_method)) {
+		return false;
+	}
+	Dictionary mc = cfg[p_method];
+	int tm = (int)mc.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE);
+	r_unreliable = (tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE ||
+			tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE_ORDERED);
+	return true;
+}
+
+// Resolve whether an @rpc method is unreliable (loss-droppable), caching per (object, method). The
+// mode lives in two places the engine merges: node-level runtime rpc_config() (an explicit per-node
+// override) and the script's @rpc annotation config (the common case — WizardWars uses only these,
+// and get_node_rpc_config() does NOT surface them, so the script lookup is essential). A method in
+// neither, or a scriptless target, is treated as reliable → never dropped (safe default).
+bool GoldNetMultiplayer::_rpc_is_unreliable(Object *p_object, const StringName &p_method) {
+	uint64_t oid = p_object->get_instance_id();
+	HashMap<uint64_t, HashMap<StringName, bool>>::Iterator oit = _rpc_unreliable_cache.find(oid);
+	if (oit != _rpc_unreliable_cache.end()) {
+		HashMap<StringName, bool>::Iterator mit = oit->value.find(p_method);
+		if (mit != oit->value.end()) {
+			return mit->value;
+		}
+	}
+
+	bool unreliable = false;
+	Node *n = Object::cast_to<Node>(p_object);
+	// Node-level override takes priority; fall back to the script's annotation config.
+	if (!(n && rpc_cfg_lookup(n->get_node_rpc_config(), p_method, unreliable))) {
+		Ref<Script> scr = p_object->get_script();
+		if (scr.is_valid()) {
+			rpc_cfg_lookup(scr->get_rpc_config(), p_method, unreliable);
+		}
+	}
+	_rpc_unreliable_cache[oid][p_method] = unreliable;
+	return unreliable;
+}
 
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
@@ -644,6 +855,22 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
+	ClassDB::bind_method(D_METHOD("set_latency_min_ms", "ms"), &GoldNetMultiplayer::set_latency_min_ms);
+	ClassDB::bind_method(D_METHOD("get_latency_min_ms"), &GoldNetMultiplayer::get_latency_min_ms);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_min_ms"), "set_latency_min_ms", "get_latency_min_ms");
+	ClassDB::bind_method(D_METHOD("set_latency_max_ms", "ms"), &GoldNetMultiplayer::set_latency_max_ms);
+	ClassDB::bind_method(D_METHOD("get_latency_max_ms"), &GoldNetMultiplayer::get_latency_max_ms);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_max_ms"), "set_latency_max_ms", "get_latency_max_ms");
+	ClassDB::bind_method(D_METHOD("set_spike_ms", "ms"), &GoldNetMultiplayer::set_spike_ms);
+	ClassDB::bind_method(D_METHOD("get_spike_ms"), &GoldNetMultiplayer::get_spike_ms);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "spike_ms"), "set_spike_ms", "get_spike_ms");
+	ClassDB::bind_method(D_METHOD("set_spike_interval_s", "s"), &GoldNetMultiplayer::set_spike_interval_s);
+	ClassDB::bind_method(D_METHOD("get_spike_interval_s"), &GoldNetMultiplayer::get_spike_interval_s);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_interval_s"), "set_spike_interval_s", "get_spike_interval_s");
+	ClassDB::bind_method(D_METHOD("set_spike_duration_s", "s"), &GoldNetMultiplayer::set_spike_duration_s);
+	ClassDB::bind_method(D_METHOD("get_spike_duration_s"), &GoldNetMultiplayer::get_spike_duration_s);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_duration_s"), "set_spike_duration_s", "get_spike_duration_s");
+	ClassDB::bind_method(D_METHOD("sim_reset"), &GoldNetMultiplayer::sim_reset);
 	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
@@ -950,9 +1177,11 @@ void GoldNetMultiplayer::_server_tick() {
 
 		// GOLDNET_LOSS=<pct> drops snapshots to exercise self-heal: the peer's ack
 		// stalls, so the next frame keeps diffing against the same acked baseline and
-		// re-carries whatever changed since — no desync, no retransmit.
+		// re-carries whatever changed since — no desync, no retransmit. Surviving snapshots
+		// route through the send-side sim (latency/spike) — this is one of goldnet's two send
+		// funnels (see netsim_plan §3.4); the snapshot stream is unreliable.
 		if (dbg_loss == 0 || (UtilityFunctions::randi() % 100) >= dbg_loss) {
-			inner->rpc(peer, l, "_gn_recv", Array::make(bytes));
+			_sim_send(peer, l, "_gn_recv", Array::make(bytes));
 		}
 		dbg_bytes += bytes.size();
 	}
@@ -1199,11 +1428,14 @@ void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
 Error GoldNetMultiplayer::_poll() {
 	Error e = inner->poll();
 	_ensure_link();
+	uint64_t now = Time::get_singleton()->get_ticks_msec();
+	// Pump the send-side sim every poll on BOTH ends: a client delays its input RPCs here (the
+	// client→server leg), a server its snapshots + RPCs (server→client). Also advances the spike timer.
+	_sim_pump(now);
 	if (inner->get_unique_id() == 1) {
 		_drain_pending_spawns(); // every poll — pick up spawns promptly
 		_detect_despawns();
 		if (inner->get_peers().size() > 0) {
-			uint64_t now = Time::get_singleton()->get_ticks_msec();
 			if (now - last_send_ms >= cached_min_interval_ms) {
 				last_send_ms = now;
 				_server_tick();
@@ -1233,7 +1465,16 @@ PackedInt32Array GoldNetMultiplayer::_get_peer_ids() const {
 }
 
 Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
-	return inner->rpc(p_peer, p_object, p_method, p_args);
+	// The single chokepoint every game @rpc passes through — goldnet's other send funnel. Apply
+	// send-side loss (unreliable only) + latency/spike here; the game can't observe the few-ms
+	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
+	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
+	// (netsim_plan §4a). This is what lets /sim_loss exercise the input-command redundancy ring.
+	if (dbg_loss > 0 && _rpc_is_unreliable(p_object, p_method) &&
+			(int)((uint32_t)UtilityFunctions::randi() % 100) < dbg_loss) {
+		return OK; // simulated drop
+	}
+	return _sim_send(p_peer, p_object, p_method, p_args);
 }
 
 int32_t GoldNetMultiplayer::_get_remote_sender_id() const {
