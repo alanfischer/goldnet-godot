@@ -28,6 +28,12 @@ static const uint32_t DEFAULT_INTERVAL_MS = 33;
 // collection, mask building, and the apply loop all key off this.
 static const int MAX_SYNC_SLOTS = 32;
 
+// Snapshot wire-protocol magic + version, written as the first u32 of every snapshot. Bump the low
+// byte on any wire-format change so a client talking to a mismatched build fails loudly (one clear
+// warning + dropped snapshot) instead of misparsing every packet into a flood of decode errors.
+// 'G''N''S' + version. Old builds (no magic) start with a small seq value, which never matches.
+static const uint32_t GN_SNAPSHOT_MAGIC = 0x474E5302u; // "GNS" + v2 (v2 added spawn-lazy + leave section)
+
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
 // synchronizers (state), spawned nodes (spawn record), and spawners — must stay in sync
@@ -304,14 +310,11 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 	if (!root) {
 		return nullptr;
 	}
-	// One-time: catch spawners already in the tree (created during _ready, before our first
-	// poll) and every spawner added afterward, so their spawn_function is wrapped before any
-	// spawn() call.
-	if (!spawners_scanned) {
-		spawners_scanned = true;
-		tree->connect("node_added", callable_mp(this, &GoldNetMultiplayer::_on_node_added));
-		_scan_spawners();
-	}
+	// Catch spawners already in the tree and every one added afterward, so their spawn_function is
+	// wrapped before any spawn() call. This runs on our first poll — but a game that spawns during
+	// _ready (before any poll) must call capture_spawners() right after installing us, or those early
+	// spawns use the unwrapped function and are never replicated.
+	capture_spawners();
 	GoldNetLink *l = Object::cast_to<GoldNetLink>(root->get_node_or_null(NodePath("__GoldNetLink")));
 	if (!l) {
 		l = memnew(GoldNetLink);
@@ -341,6 +344,21 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 // freed (godot-cpp has no is_instance_valid; ObjectDB::get_instance does the check).
 static MultiplayerSynchronizer *sync_from_objid(uint64_t p_objid) {
 	return Object::cast_to<MultiplayerSynchronizer>(ObjectDB::get_instance(p_objid));
+}
+
+// Collect the instance ids of every MultiplayerSynchronizer at or under p_node (used to gate a spawn
+// on the entity's per-peer visibility — see SpawnRecord::sync_objids).
+static void collect_syncs(Node *p_node, Vector<uint64_t> &r_out) {
+	if (Object::cast_to<MultiplayerSynchronizer>(p_node)) {
+		r_out.push_back(p_node->get_instance_id());
+	}
+	TypedArray<Node> children = p_node->get_children();
+	for (int i = 0; i < children.size(); i++) {
+		Node *c = Object::cast_to<Node>((Object *)children[i]);
+		if (c) {
+			collect_syncs(c, r_out);
+		}
+	}
 }
 
 bool GoldNetMultiplayer::_reliable_include(HashMap<uint32_t, uint16_t> &p_wait, uint32_t p_net_id,
@@ -412,6 +430,22 @@ void GoldNetMultiplayer::_scan_spawners() {
 	}
 }
 
+// Arm spawner capture: wrap every spawner currently in the tree and connect node_added so future ones
+// are wrapped on entry. Idempotent. Called on our first poll, but a game that spawns during _ready must
+// call this immediately after set_multiplayer() so the spawn_function is wrapped before those spawns.
+void GoldNetMultiplayer::capture_spawners() {
+	if (spawners_scanned) {
+		return;
+	}
+	SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+	if (!tree || !tree->get_root()) {
+		return; // tree not ready yet — the first poll will retry
+	}
+	spawners_scanned = true;
+	tree->connect("node_added", callable_mp(this, &GoldNetMultiplayer::_on_node_added));
+	_scan_spawners();
+}
+
 // The wrapper installed over each spawner's spawn_function. On the server, spawn(data)
 // calls this; we run the game's real function to build the node, stash the reconstruction
 // data (the node isn't in the tree yet — _drain_pending_spawns promotes it once it is), and
@@ -453,6 +487,7 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
 		rec.node_objid = kv.key;
 		rec.data = kv.value.data;
+		collect_syncs(node, rec.sync_objids); // for lazy, visibility-gated spawning
 		spawn_records[net_id] = rec;
 		despawn_pending.erase(net_id); // a reused net_id is a fresh spawn, not a despawn
 		done.push_back(kv.key);
@@ -462,7 +497,9 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 	}
 }
 
-// Server: a spawned node that has been freed becomes a despawn owed to every current peer.
+// Server: a spawned node that has been freed becomes a despawn owed to every peer that RECEIVED the
+// spawn. With lazy spawning, peers that never saw the entity never got the spawn, so they're owed
+// nothing — scope the despawn to peers with the node in spawn_acked (delivered) or spawn_wait (in flight).
 void GoldNetMultiplayer::_detect_despawns() {
 	if (spawn_records.is_empty()) {
 		return;
@@ -476,20 +513,19 @@ void GoldNetMultiplayer::_detect_despawns() {
 	if (gone.is_empty()) {
 		return;
 	}
-	PackedInt32Array peers = inner->get_peers();
 	for (int i = 0; i < gone.size(); i++) {
 		uint32_t net_id = gone[i];
 		spawn_records.erase(net_id);
 		HashSet<int32_t> needers;
-		for (int p = 0; p < peers.size(); p++) {
-			needers.insert(peers[p]);
+		for (KeyValue<int32_t, PeerRing> &pr : peer_rings) {
+			if (pr.value.spawn_acked.has(net_id) || pr.value.spawn_wait.has(net_id)) {
+				needers.insert(pr.key); // this peer has (or is mid-receiving) the node → owes a despawn
+			}
+			pr.value.spawn_wait.erase(net_id);  // stop resending the (now void) spawn
+			pr.value.spawn_acked.erase(net_id); // and forget delivery, so a reused id re-spawns cleanly
 		}
 		if (!needers.is_empty()) {
 			despawn_pending[net_id] = needers;
-		}
-		for (KeyValue<int32_t, PeerRing> &pr : peer_rings) {
-			pr.value.spawn_wait.erase(net_id);  // stop resending the (now void) spawn
-			pr.value.spawn_acked.erase(net_id); // and forget delivery, so a reused id re-spawns cleanly
 		}
 	}
 }
@@ -588,6 +624,12 @@ void GoldNetMultiplayer::set_loss_percent(int p_pct) {
 int GoldNetMultiplayer::get_loss_percent() const {
 	return dbg_loss;
 }
+void GoldNetMultiplayer::set_relevance_events(bool p_enabled) {
+	relevance_events_enabled = p_enabled;
+}
+bool GoldNetMultiplayer::get_relevance_events() const {
+	return relevance_events_enabled;
+}
 
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
@@ -599,6 +641,14 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_loss_percent", "pct"), &GoldNetMultiplayer::set_loss_percent);
 	ClassDB::bind_method(D_METHOD("get_loss_percent"), &GoldNetMultiplayer::get_loss_percent);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "loss_percent"), "set_loss_percent", "get_loss_percent");
+	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
+	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
+	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
+	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
+	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
+	// a re-entering entity arrives as a full delta and fires the synchronizer's own `synchronized`.
+	ADD_SIGNAL(MethodInfo("entity_relevance_lost", PropertyInfo(Variant::OBJECT, "sync")));
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -737,6 +787,24 @@ void GoldNetMultiplayer::_server_tick() {
 			if (pr.spawn_acked.has(kv.key)) {
 				continue; // peer already has this node — don't re-arm the spawn every frame
 			}
+			// Lazy spawn (GoldSrc): defer sending the spawn to this peer until the entity is visible to
+			// it — created client-side the first time it enters your PVS. Once delivered it PERSISTS
+			// (spawn_acked keeps it; despawn only on server-free), so there's no create/destroy churn as
+			// it moves in and out of view. A spawn with no synchronizers has no visibility info, so it
+			// ships to everyone (fail open, matching the old always-spawn behaviour).
+			if (!kv.value.sync_objids.is_empty()) {
+				bool visible = false;
+				for (int si = 0; si < kv.value.sync_objids.size(); si++) {
+					MultiplayerSynchronizer *s = sync_from_objid(kv.value.sync_objids[si]);
+					if (s && (s->is_visibility_public() || s->get_visibility_for(peer))) {
+						visible = true;
+						break;
+					}
+				}
+				if (!visible) {
+					continue; // not in this peer's PVS yet — defer the spawn
+				}
+			}
 			// on_ack is the sole populator of spawn_acked: it retires+marks a record the moment
 			// last_acked reaches it, before _reliable_include here could ever see it delivered.
 			if (!_reliable_include(pr.spawn_wait, kv.key, seq, pr.last_acked, pr.has_ack)) {
@@ -806,12 +874,63 @@ void GoldNetMultiplayer::_server_tick() {
 			changed++;
 		}
 
+		// Relevance leaves (OPT-IN — off unless the consumer game enables relevance_events): owned_syncs
+		// that were in this peer's PVS last tick but aren't in `frame` now, delivered reliable-until-acked
+		// so the client can hide them. Enters need no event — an entering entity re-appears in the changed
+		// set above with a full baseline, firing the synchronizer's `synchronized` signal the game already
+		// listens to. Dropping the entity from `frame` when invisible also drops it from this peer's next
+		// baseline, so re-entry is a clean all-slots delta (matching the client, which erases the same
+		// net_id from its reconstructed frame on the leave). When disabled, no diff runs and leave_ct is 0
+		// (2 bytes on the wire) — goldnet stays agnostic and games that don't opt in are unaffected.
+		Ref<StreamPeerBuffer> leave_body;
+		leave_body.instantiate();
+		uint16_t leave_ct = 0;
+		if (relevance_events_enabled && (pr.relevance_seeded || !frame.is_empty())) {
+			// Seed on first contact: treat "everything" as previously relevant so the first diff emits a
+			// leave for every out-of-PVS entity (clients default entities to present). Deferred until the
+			// frame is non-empty — a non-empty frame means the game's visibility predicate passed, which it
+			// only does once the peer is map-ready and has therefore registered the map's syncs. Seeding
+			// earlier would emit leaves for net_ids the client hasn't loaded yet; it would ack and drop them
+			// (they resolve to nothing), and the server would retire them — losing the hide permanently.
+			if (!pr.relevance_seeded) {
+				for (int i = 0; i < ents.size(); i++) {
+					pr.relevant.insert(ents[i].net_id);
+				}
+				pr.relevance_seeded = true;
+			}
+			for (const uint32_t &rid : pr.relevant) {
+				if (!frame.has(rid) && !pr.leave_wait.has(rid)) {
+					pr.leave_wait[rid] = seq;
+				}
+			}
+			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
+				pr.leave_wait.erase(kv.key); // re-entered → cancel any pending leave
+			}
+			Vector<uint32_t> retired_leaves;
+			for (const KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
+				if (pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
+					retired_leaves.push_back(kv.key); // delivered
+				} else {
+					leave_body->put_u32(kv.key);
+					leave_ct++;
+				}
+			}
+			for (int ri = 0; ri < retired_leaves.size(); ri++) {
+				pr.leave_wait.erase(retired_leaves[ri]);
+			}
+			pr.relevant.clear();
+			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
+				pr.relevant.insert(kv.key);
+			}
+		}
+
 		int slot = seq & (RING - 1);
 		pr.frames[slot] = frame;
 		pr.frame_seq[slot] = seq;
 
 		Ref<StreamPeerBuffer> buf;
 		buf.instantiate();
+		buf->put_u32(GN_SNAPSHOT_MAGIC);
 		buf->put_u16(seq);
 		buf->put_u16(base_seq);
 		buf->put_u32(now);
@@ -819,6 +938,8 @@ void GoldNetMultiplayer::_server_tick() {
 		buf->put_data(spawn_body->get_data_array());
 		buf->put_u16(despawn_ct);
 		buf->put_data(despawn_body->get_data_array());
+		buf->put_u16(leave_ct);
+		buf->put_data(leave_body->get_data_array());
 		buf->put_u16(changed);
 		buf->put_data(body->get_data_array());
 		PackedByteArray bytes = buf->get_data_array();
@@ -846,6 +967,17 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	buf.instantiate();
 	buf->set_data_array(p_bytes);
 	buf->seek(0);
+
+	// Protocol guard: a mismatched goldnet build (different wire format) would misparse every field.
+	// Fail loudly once and drop, rather than flooding the log with decode errors.
+	if (buf->get_u32() != GN_SNAPSHOT_MAGIC) {
+		if (!warned_protocol_mismatch) {
+			warned_protocol_mismatch = true;
+			UtilityFunctions::push_error("goldnet: snapshot protocol mismatch — the server and client are "
+					"running different goldnet builds. Rebuild/redeploy both to the same version.");
+		}
+		return;
+	}
 
 	uint16_t seq = buf->get_u16();
 	uint16_t base_seq = buf->get_u16();
@@ -891,6 +1023,13 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	Vector<uint32_t> despawns;
 	for (int i = 0; i < despawn_ct; i++) {
 		despawns.push_back(buf->get_u32());
+	}
+	// Relevance leaves: owned_syncs that left this peer's PVS. Collect now (wire order),
+	// apply after the entity deltas (drop from the reconstructed frame + signal the game).
+	int leave_ct = buf->get_u16();
+	Vector<uint32_t> leaves;
+	for (int i = 0; i < leave_ct; i++) {
+		leaves.push_back(buf->get_u32());
 	}
 
 	int count = buf->get_u16();
@@ -978,6 +1117,20 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		}
 	}
 
+	// Relevance leaves: drop from the reconstructed frame (so it matches the server's baseline,
+	// which also dropped these) and signal the game to hide the entity. Enter needs no signal — a
+	// re-entering entity arrives as a full delta above and fires the synchronizer's `synchronized`.
+	for (int i = 0; i < leaves.size(); i++) {
+		uint32_t net_id = leaves[i];
+		frame.erase(net_id);
+		if (netid_to_objid.has(net_id)) {
+			MultiplayerSynchronizer *s = sync_from_objid(netid_to_objid[net_id]);
+			if (s) {
+				emit_signal("entity_relevance_lost", s);
+			}
+		}
+	}
+
 	// Commit this frame to the client ring and ack it (newest wins, unreliable).
 	int slot = seq & (RING - 1);
 	client_frames[slot] = frame;
@@ -1050,6 +1203,9 @@ Error GoldNetMultiplayer::_poll() {
 }
 
 void GoldNetMultiplayer::_set_multiplayer_peer(const Ref<MultiplayerPeer> &p_peer) {
+	// Backstop: arm spawner capture the moment a session starts, so a game that spawns after setting the
+	// peer (but before our first poll) doesn't need to call capture_spawners() itself. Idempotent.
+	capture_spawners();
 	inner->set_multiplayer_peer(p_peer);
 }
 

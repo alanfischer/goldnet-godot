@@ -67,14 +67,21 @@ func push(time: float, pos: Vector3, rot: Vector3, vel := Vector3.ZERO) -> void:
 
 
 ## Sample the interpolated transform at render_time (your server-clock estimate minus the
-## interpolation delay). Returns { valid: bool, position: Vector3, rotation: Vector3 }.
-## valid is false only when no snapshot has ever arrived.
+## interpolation delay). Returns { valid: bool, position: Vector3, rotation: Vector3, holding: bool }.
+## valid is false only when no snapshot has ever arrived. holding is true once the buffer has run
+## dry PAST the extrapolation window and is just freezing the last position — the caller can then
+## stop re-asserting the transform, so an out-of-band teleport (a reliable state RPC that repositions
+## the entity while its PVS-gated snapshot stream is quiet) isn't clobbered frame after frame.
+## Note the gap: during the [0, extrap_max] window right after the stream goes quiet, holding is
+## still false, so an out-of-band write landing in that brief window can be overridden until the
+## buffer settles into the hold. Callers that need the teleport to win immediately must reset the
+## buffer instead of relying on holding.
 func sample(render_time: float) -> Dictionary:
 	if _buf.is_empty():
-		return { "valid": false, "position": Vector3.ZERO, "rotation": Vector3.ZERO }
+		return { "valid": false, "position": Vector3.ZERO, "rotation": Vector3.ZERO, "holding": false }
 
 	if _buf.size() == 1:
-		return { "valid": true, "position": _buf[0][_POS], "rotation": _buf[0][_ROT] }
+		return { "valid": true, "position": _buf[0][_POS], "rotation": _buf[0][_ROT], "holding": false }
 
 	# Find the latest snapshot at or before render_time.
 	var s0_idx := -1
@@ -85,17 +92,21 @@ func sample(render_time: float) -> Dictionary:
 
 	# render_time precedes the buffer (fresh entity, clock still warming up) → hold oldest.
 	if s0_idx == -1:
-		return { "valid": true, "position": _buf[0][_POS], "rotation": _buf[0][_ROT] }
+		return { "valid": true, "position": _buf[0][_POS], "rotation": _buf[0][_ROT], "holding": false }
 
-	# Buffer ran dry → extrapolate from the last snapshot's velocity, capped, then hold.
+	# Buffer ran dry → extrapolate from the last snapshot's velocity, capped, then hold. Once we're
+	# past the extrapolation window we're just freezing a static position (holding), which the caller
+	# should stop writing so external teleports survive.
 	if s0_idx >= _buf.size() - 1:
 		var last: Array = _buf[_buf.size() - 1]
 		var vel: Vector3 = last[_VEL] if last.size() > _VEL else Vector3.ZERO
-		var overshoot := clampf(render_time - last[_T], 0.0, extrap_max)
+		var dt_since: float = render_time - last[_T]
+		var overshoot := clampf(dt_since, 0.0, extrap_max)
 		return {
 			"valid": true,
 			"position": (last[_POS] as Vector3) + vel * overshoot,
 			"rotation": last[_ROT],
+			"holding": dt_since > extrap_max,
 		}
 
 	# Interpolate between the two bracketing snapshots.
@@ -114,4 +125,5 @@ func sample(render_time: float) -> Dictionary:
 			lerp_angle(r0.x, r1.x, t),
 			lerp_angle(r0.y, r1.y, t),
 			lerp_angle(r0.z, r1.z, t)),
+		"holding": false,
 	}

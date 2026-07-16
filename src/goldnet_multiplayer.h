@@ -80,6 +80,11 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		uint32_t spawner_net_id = 0;
 		uint64_t node_objid = 0;   // to poll-detect despawn (node freed)
 		Variant data;
+		// The spawned node's own + descendant synchronizers, for lazy spawning: the spawn is only sent
+		// to a peer once one of these is visible to it (GoldSrc: an entity is created client-side the
+		// first time it enters your PVS, then persists until the server destroys it). Empty ⇒ no sync
+		// ⇒ no visibility info ⇒ send to everyone (fail open, matching the old always-spawn behaviour).
+		Vector<uint64_t> sync_objids;
 	};
 	HashMap<uint32_t, SpawnRecord> spawn_records;   // node net_id -> record
 
@@ -116,6 +121,18 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// the durable "peer already has this node" marker; a net_id here is never re-sent until
 		// the entity despawns (which clears it).
 		HashSet<uint32_t> spawn_acked;
+		// Per-peer relevance (PVS) for owned_syncs. `relevant` is the set of owned-sync net_ids
+		// visible to this peer as of the last snapshot; diffing it each tick yields the entities that
+		// LEFT this peer's PVS, delivered reliable-until-acked in `leave_wait` so the client can hide
+		// them. (Enter needs no event — an entering entity re-appears in the changed set with a full
+		// baseline, which fires the synchronizer's `synchronized` signal the game already listens to.)
+		HashSet<uint32_t> relevant;
+		HashMap<uint32_t, uint16_t> leave_wait;
+		// Seed: on a peer's first snapshot, `relevant` is initialized to ALL owned syncs so the very
+		// first leave-diff emits a leave for everything currently out of this peer's PVS. The client
+		// defaults entities to present, so without this seed the initially-out-of-PVS ones would render
+		// through walls until they first entered+left. Mirrors the game's old first-pass "all present".
+		bool relevance_seeded = false;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
 
@@ -125,6 +142,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint16_t client_frame_seq[RING] = {};
 	uint16_t client_last_seq = 0;
 	bool client_has = false;
+	bool warned_protocol_mismatch = false; // one-shot guard for the wire-version-mismatch warning
 
 	uint64_t last_send_ms = 0;                   // server send throttle
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
@@ -133,6 +151,10 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
 	int dbg_loss = 0;                            // GOLDNET_LOSS=<pct> → drop that % of snapshots
+	// Opt-in relevance events (see the leave block in _server_tick). Off by default so goldnet stays a
+	// pure state-replication transport; a consuming game that wants PVS render-relevance through the
+	// snapshot (instead of its own reliable RPC) sets this true and connects `entity_relevance_lost`.
+	bool relevance_events_enabled = false;
 
 	void _reset_client_state();
 
@@ -189,6 +211,13 @@ public:
 	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
 	void set_loss_percent(int p_pct);
 	int get_loss_percent() const;
+	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
+	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
+	void set_relevance_events(bool p_enabled);
+	bool get_relevance_events() const;
+	// Arm spawner capture now (wrap existing spawners + hook node_added). Call right after installing
+	// GoldNet if the game spawns during _ready, before the first poll would otherwise do it.
+	void capture_spawners();
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).
