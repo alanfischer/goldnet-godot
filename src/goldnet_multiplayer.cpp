@@ -649,6 +649,10 @@ void GoldNetMultiplayer::_bind_methods() {
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
 	// a re-entering entity arrives as a full delta and fires the synchronizer's own `synchronized`.
 	ADD_SIGNAL(MethodInfo("entity_relevance_lost", PropertyInfo(Variant::OBJECT, "sync")));
+	// Emitted on a client for every received snapshot, carrying the server's send-time (ms, the header
+	// clock). An always-on server-time feed regardless of entity traffic — feed it to a clock estimator
+	// (see the ServerClock addon helper) instead of running a separate server-time beacon RPC.
+	ADD_SIGNAL(MethodInfo("server_time_received", PropertyInfo(Variant::INT, "server_time_ms")));
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -981,13 +985,20 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 
 	uint16_t seq = buf->get_u16();
 	uint16_t base_seq = buf->get_u16();
-	uint32_t server_time = buf->get_u32(); // header (game carries its own per-entity stamp prop)
-	(void)server_time;
+	uint32_t server_time = buf->get_u32();
 
 	// Drop stale/reordered snapshots (unreliable transport). We only advance forward.
 	if (client_has && !_seq_newer(seq, client_last_seq)) {
 		return;
 	}
+
+	// Surface the header clock: every snapshot the server ticks out carries its send-time, so this is an
+	// always-on server-time feed (independent of entity traffic) a client can drive a clock estimator from
+	// — no separate beacon RPC needed on the goldnet path. Emitted after the stale-seq drop (a reordered
+	// snapshot's time is <= one we've already fed, so ServerClock would reject it — no point dispatching)
+	// but before the baseline-resolution drop below, so a forward snapshot we can't reconstruct for state
+	// still contributes its valid clock sample. See ServerClock.
+	emit_signal("server_time_received", (int64_t)server_time);
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means
 	// full state. If the server diffed against a frame we no longer hold, we can't

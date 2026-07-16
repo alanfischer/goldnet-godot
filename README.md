@@ -52,9 +52,11 @@ pipeline. A node lands in:
 server emits one unreliable snapshot:
 
 ```
+[u32 magic]      "GNS" + wire version — a mismatched build is dropped, not misparsed
 [u16 seq][u16 base_seq][u32 server_time]
 [u16 spawn_ct]   { [u32 net_id][u32 spawner_net_id][var data] } *   (reliable-until-acked)
 [u16 despawn_ct] { [u32 net_id] } *                                 (reliable-until-acked)
+[u16 leave_ct]   { [u32 net_id] } *                                 (reliable-until-acked, opt-in — see PVS below)
 [u16 changed]    { [u32 net_id][u32 changed_mask]{ value } per set bit } *
 ```
 
@@ -71,6 +73,16 @@ server emits one unreliable snapshot:
   acks a frame carrying them, then retired. A spawn's source record outlives
   delivery, so each peer keeps a durable `spawn_acked` set — a spawn is delivered
   exactly once, never re-armed frame after frame.
+- The **leave** section is the opt-in PVS-relevance channel (off by default;
+  `leave_ct` is 0 and costs 2 bytes when disabled): net_ids that dropped out of the
+  peer's PVS since last tick, delivered reliable-until-acked so the client can hide
+  them. Re-entry needs no event — the entity simply reappears in `changed` with a
+  full baseline. See **Per-peer visibility** below.
+- `server_time` is the server's send-time (ms). Since a snapshot goes to every peer
+  every tick regardless of entity traffic, it's an **always-on server-clock feed** —
+  the client re-emits it as the `server_time_received(server_time_ms)` signal, which
+  you feed to the `ServerClock` helper for interpolation timing. No separate
+  server-time beacon RPC is needed on the goldnet path.
 
 **Compact value encoding.** Each changed slot is written with a 1-byte type tag
 plus a tight payload — `f32` for floats, zig-zag varint for ints, 3×`f32` for
@@ -91,6 +103,28 @@ call `set_visibility_for(peer, visible)` each net tick, with
 the stock replicator reads it via `is_visible_to`, goldnet via
 `get_visibility_for`. (WizardWars does this with a small `NetworkManager` registry;
 see its `register_pvs_sync` / `push_pvs_visibility`.)
+
+> **Engine limitation — want to fix upstream.** The push detour exists only because
+> `MultiplayerSynchronizer::is_visible_to(peer)` is not exposed to GDExtension (it isn't
+> `ClassDB`-bound), so a GDExtension `MultiplayerAPI` has no way to *evaluate* the
+> `add_visibility_filter()` callbacks the engine stores — it can read the resolved
+> `get_visibility_for()` state but not run the filters that would populate it. A stock
+> `SceneMultiplayer` (engine-internal C++) calls `is_visible_to` directly and thus
+> honors `add_visibility_filter` transparently; goldnet cannot, which is the one place
+> the stock replication API does **not** map through cleanly. The proper fix is upstream
+> in Godot: bind `MultiplayerSynchronizer::is_visible_to` (and/or `get_visibility_filters`)
+> so a custom `MultiplayerAPIExtension` can evaluate filters itself. With that in place
+> goldnet could read `add_visibility_filter` natively and the `set_visibility_for` push
+> loop below would become optional. Until then, use the push API.
+
+Culling alone stops sending an out-of-PVS entity, but the client still holds its last
+state and would render it frozen through a wall. So goldnet also exposes an **opt-in
+relevance channel**: enable it with `set_relevance_events(true)`, and the server emits
+reliable-until-acked *leave* markers (the section above) for owned syncs that drop out
+of a peer's PVS, surfaced to the game as the `entity_relevance_lost(sync)` signal so it
+can hide/despawn its view of them. It is off by default — with it off goldnet stays a
+pure state-replication transport and games drive relevance however they like.
+(WizardWars turns it on and connects `NetworkManager._on_entity_relevance_lost`.)
 
 ## Performance
 
@@ -128,8 +162,10 @@ Built as a single Godot GDExtension; all planned phases (0–5) are complete.
   per-peer rings, self-heal under loss.
 - **Phase 3 — spawn / despawn in the stream** ✅ own the spawners too; players and
   projectiles are agnostic with map movers.
-- **Phase 4 — client helpers + idle-free replication** ✅ reusable
-  `InterpolationBuffer` (server-clock-synced jitter buffer) and `PredictedBody`
+- **Phase 4 — client helpers + idle-free replication** ✅ three reusable, transport-
+  agnostic client helpers: `ServerClock` (a smoothly-slewed server-time estimator —
+  the render timeline), `InterpolationBuffer` (a server-clock-synced jitter buffer,
+  sampled at `ServerClock.now() - interp_delay`), and `PredictedBody`
   (simulation-agnostic input prediction + reconciliation harness — owns the seq
   counter, unacked-input history, out-of-order rejection, chain-correction
   suppression, and replay ordering; the domain supplies snapshot/divergence/replay).
@@ -139,7 +175,8 @@ Built as a single Godot GDExtension; all planned phases (0–5) are complete.
   former open limitation is resolved.
 - **Compact wire encoding** ✅ tagged f32 / varint value codec.
 - **Phase 5 — generalize / configure / package** ✅ a config surface on the installed
-  API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`); opt-in per-property
+  API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`, `relevance_events`);
+  opt-in per-property
   **quantization hints** — angles to a u16, floats/Vector3 to IEEE half — via a
   synchronizer's `gn_quant` meta (self-describing, so only the sender needs the hint;
   WizardWars quantizes player yaw/pitch); a standalone drop-in demo in
@@ -190,7 +227,9 @@ In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
    ```
    `debug_enabled` / `loss_percent` are also settable (mirror `GOLDNET_DEBUG` /
-   `GOLDNET_LOSS`).
+   `GOLDNET_LOSS`). To receive PVS leave events, `set_relevance_events(true)` and
+   connect the `entity_relevance_lost(sync)` signal (see **How it works → Per-peer
+   visibility**).
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
