@@ -150,39 +150,6 @@ reliable-ordered replication for real-time state on adverse networks.
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
 
-## Status
-
-Built as a single Godot GDExtension; all planned phases (0–5) are complete.
-
-- **Phase 0 — pass-through composition** ✅ every virtual forwarded to the inner;
-  installing it changes nothing observable.
-- **Phase 1 — registry + full-state snapshot** ✅ own the map-static synchronizers,
-  stream their state ourselves.
-- **Phase 2 — delta against acked baseline** ✅ the GoldSrc core; per-slot skipping,
-  per-peer rings, self-heal under loss.
-- **Phase 3 — spawn / despawn in the stream** ✅ own the spawners too; players and
-  projectiles are agnostic with map movers.
-- **Phase 4 — client helpers + idle-free replication** ✅ three reusable, transport-
-  agnostic client helpers: `ServerClock` (a smoothly-slewed server-time estimator —
-  the render timeline), `InterpolationBuffer` (a server-clock-synced jitter buffer,
-  sampled at `ServerClock.now() - interp_delay`), and `PredictedBody`
-  (simulation-agnostic input prediction + reconciliation harness — owns the seq
-  counter, unacked-input history, out-of-order rejection, chain-correction
-  suppression, and replay ordering; the domain supplies snapshot/divergence/replay).
-  Idle entities freeze their shadow state so unchanged frames are skipped whole.
-  WizardWars' netmove movement dogfoods `PredictedBody`.
-- **Per-peer PVS cull** ✅ via the `set_visibility_for` push bridge above — the
-  former open limitation is resolved.
-- **Compact wire encoding** ✅ tagged f32 / varint value codec.
-- **Phase 5 — generalize / configure / package** ✅ a config surface on the installed
-  API (`snapshot_interval_ms`, `debug_enabled`, `loss_percent`, `relevance_events`);
-  opt-in per-property
-  **quantization hints** — angles to a u16, floats/Vector3 to IEEE half — via a
-  synchronizer's `gn_quant` meta (self-describing, so only the sender needs the hint;
-  WizardWars quantizes player yaw/pitch); a standalone drop-in demo in
-  [`example/`](example/) (stock spawner + synchronizers, no goldnet-specific code); and
-  the full build matrix (macOS/Linux/Windows, Android-arm64 via `build.sh` with an NDK).
-
 ## Building
 
 ```bash
