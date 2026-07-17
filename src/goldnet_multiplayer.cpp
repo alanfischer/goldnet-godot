@@ -131,7 +131,7 @@ static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) {
 	// NaN/inf guard: fmodf(NaN or ±inf, TAU) == NaN, and casting NaN — or the boundary value that
 	// rounds to exactly 65536.0 — straight to uint16 is undefined behaviour (a debug build traps it,
 	// crashing the server). Sanitize to 0 and go through uint32+mask so the wrap is well-defined.
-	if (!(t == t)) { // NaN
+	if (std::isnan(t)) {
 		t = 0.0f;
 	} else if (t < 0.0f) {
 		t += GN_TAU;
