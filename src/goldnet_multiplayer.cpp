@@ -1131,18 +1131,14 @@ void GoldNetMultiplayer::_server_tick() {
 		leave_body.instantiate();
 		uint16_t leave_ct = 0;
 		if (relevance_events_enabled && (pr.relevance_seeded || !frame.is_empty())) {
-			// Seed on first contact: treat "everything" as previously relevant so the first diff emits a
-			// leave for every out-of-PVS entity (clients default entities to present). Deferred until the
-			// frame is non-empty — a non-empty frame means the game's visibility predicate passed, which it
-			// only does once the peer is map-ready and has therefore registered the map's syncs. Seeding
-			// earlier would emit leaves for net_ids the client hasn't loaded yet; it would ack and drop them
-			// (they resolve to nothing), and the server would retire them — losing the hide permanently.
-			if (!pr.relevance_seeded) {
-				for (int i = 0; i < ents.size(); i++) {
-					pr.relevant.insert(ents[i].net_id);
-				}
-				pr.relevance_seeded = true;
-			}
+			// Seed on first contact with an EMPTY relevant-set: the client defaults each owned sync ABSENT
+			// (GoldSrc-faithful — see EntityBase._setup_mover_sync) and materializes it only when its state
+			// first arrives, so there is nothing to hide up front. This replaces the old "seed everything
+			// relevant, then leave every out-of-PVS entity" scheme, whose first diff emitted a leave per
+			// out-of-PVS entity — hundreds on a big map, overrunning the MTU so the snapshot was dropped and
+			// never acked (the backlog then resent forever). Now leaves only fire for genuine PVS exits of
+			// entities the client actually saw. The MAX_LEAVES_PER_SNAPSHOT cap remains as a backstop.
+			pr.relevance_seeded = true;
 			for (const uint32_t &rid : pr.relevant) {
 				if (!frame.has(rid) && !pr.leave_wait.has(rid)) {
 					pr.leave_wait[rid] = 0; // 0 = queued, not yet sent (seq 0 is reserved elsewhere)
