@@ -26,6 +26,12 @@ using namespace godot;
 // Default snapshot cadence when a synchronizer reports no interval (30 Hz).
 static const uint32_t DEFAULT_INTERVAL_MS = 33;
 
+// Max PVS-leave markers per snapshot (4 bytes each on the wire). A fresh peer's relevance seed can
+// queue hundreds of leaves (every out-of-PVS entity on a big map); emitting them all in one frame
+// overruns the MTU, so it's dropped and never acked — and the same oversized frame resends forever.
+// Capping keeps each frame under MTU; leaves are reliable-until-acked, so they drain over a few ticks.
+static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
+
 // Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
 // collection, mask building, and the apply loop all key off this.
 static const int MAX_SYNC_SLOTS = 32;
@@ -122,10 +128,17 @@ static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return buf->get_hal
 
 static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) {
 	float t = fmodf(radians, GN_TAU);
-	if (t < 0.0f) {
+	// NaN/inf guard: fmodf(NaN or ±inf, TAU) == NaN, and casting NaN — or the boundary value that
+	// rounds to exactly 65536.0 — straight to uint16 is undefined behaviour (a debug build traps it,
+	// crashing the server). Sanitize to 0 and go through uint32+mask so the wrap is well-defined.
+	if (!(t == t)) { // NaN
+		t = 0.0f;
+	} else if (t < 0.0f) {
 		t += GN_TAU;
 	}
-	buf->put_u16((uint16_t)((t / GN_TAU) * 65536.0f)); // wraps: TAU and 0 both map to 0
+	// [0,TAU) → [0,65536); cast through uint32 (always in range) then mask to 16 bits so the boundary
+	// 65536 wraps to 0 without the out-of-range float→uint16 cast the comment used to rely on.
+	buf->put_u16((uint16_t)((uint32_t)((t / GN_TAU) * 65536.0f) & 0xFFFFu));
 }
 static float gn_get_angle16(const Ref<StreamPeerBuffer> &buf) {
 	return ((float)buf->get_u16() / 65536.0f) * GN_TAU;
@@ -281,6 +294,7 @@ void GoldNetMultiplayer::_reset_client_state() {
 	}
 	client_last_seq = 0;
 	client_has = false;
+	defer_streak = 0;
 	client_spawned.clear(); // spawner nodes are torn down with the session
 }
 
@@ -1131,19 +1145,27 @@ void GoldNetMultiplayer::_server_tick() {
 			}
 			for (const uint32_t &rid : pr.relevant) {
 				if (!frame.has(rid) && !pr.leave_wait.has(rid)) {
-					pr.leave_wait[rid] = seq;
+					pr.leave_wait[rid] = 0; // 0 = queued, not yet sent (seq 0 is reserved elsewhere)
 				}
 			}
 			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
 				pr.leave_wait.erase(kv.key); // re-entered → cancel any pending leave
 			}
+			// Emit leaves bounded per snapshot: a fresh peer's seed can queue hundreds of leaves at once
+			// (every out-of-PVS entity on a big map), and dumping them all in one frame blows past the MTU,
+			// so the snapshot is dropped, never acked, and the same oversized frame resends forever —
+			// nothing is ever delivered. Cap the count so each frame fits; the rest ride the next frames.
+			// Stamp each SENT leave with the seq that actually carries it (not queue time), so a leave held
+			// back by the cap isn't retired by an ack for a frame it was never in. Reliable-until-acked, so
+			// spreading them out loses nothing — they drain over a few ticks.
 			Vector<uint32_t> retired_leaves;
-			for (const KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
-				if (pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
-					retired_leaves.push_back(kv.key); // delivered
-				} else {
+			for (KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
+				if (kv.value != 0 && pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
+					retired_leaves.push_back(kv.key); // sent and acked → delivered
+				} else if (leave_ct < MAX_LEAVES_PER_SNAPSHOT) {
 					leave_body->put_u32(kv.key);
 					leave_ct++;
+					kv.value = seq; // stamp with the seq we're sending it in
 				}
 			}
 			for (int ri = 0; ri < retired_leaves.size(); ri++) {
@@ -1280,6 +1302,12 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		frame = *base;
 	}
 
+	// Set if a KNOWN entity (registered net_id, live object) couldn't be applied because its node
+	// isn't in the tree yet — the recv-nodes warmup window. We must not ack this frame as delivered
+	// (see the defer block after the loop), or the server folds the entity into this peer's baseline
+	// and — for an idle mover whose state never changes again — never resends it, stranding it hidden.
+	bool defer_ack = false;
+
 	for (int i = 0; i < count; i++) {
 		uint32_t net_id = buf->get_u32();
 		uint32_t mask = buf->get_u32();
@@ -1289,6 +1317,11 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			MultiplayerSynchronizer *s = sync_from_objid(netid_to_objid[net_id]);
 			if (s && s->is_inside_tree()) {
 				sync = s;
+			} else if (s && mask != 0) {
+				// Registered and still alive, but not in the tree yet: a warmup miss we should retry
+				// rather than silently swallow. Freed/unknown ids fall through (s == null) — nothing
+				// to wait for — so they don't defer and can't stall the stream.
+				defer_ack = true;
 			}
 		}
 		Vector<NodePath> slots;
@@ -1370,6 +1403,23 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			}
 		}
 	}
+
+	// Warmup defer: a known entity's node wasn't in the tree yet, so we couldn't apply (reveal) it.
+	// Committing + acking this seq would advance the server's baseline past the entity; an idle mover
+	// that never changes again would then never be resent — stranded hidden. Instead re-ack our last
+	// good frame so the server keeps resending its full baseline against a frame we hold, and drop
+	// this one uncommitted; we'll apply it once the node finishes entering the tree (usually 1-2
+	// frames). Capped so a node that never resolves can't stall the stream forever. Needs a prior good
+	// frame to fall back to (client_has); on the very first frame we just accept it.
+	if (defer_ack && client_has && defer_streak < MAX_DEFER_STREAK) {
+		defer_streak++;
+		GoldNetLink *dl = _ensure_link();
+		if (dl) {
+			inner->rpc(1, dl, "_gn_ack", Array::make((int)client_last_seq));
+		}
+		return;
+	}
+	defer_streak = 0;
 
 	// Commit this frame to the client ring and ack it (newest wins, unreliable).
 	int slot = seq & (RING - 1);

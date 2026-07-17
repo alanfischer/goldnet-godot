@@ -144,6 +144,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool client_has = false;
 	bool warned_protocol_mismatch = false; // one-shot guard for the wire-version-mismatch warning
 
+	// Client: consecutive frames deferred because a KNOWN entity's node wasn't in the tree yet
+	// (recv-nodes warmup — see the defer block in _client_apply). Capped so a node that never
+	// resolves can't stall the stream forever; after the cap we accept the frame and move on.
+	uint32_t defer_streak = 0;
+	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
+
 	uint64_t last_send_ms = 0;                   // server send throttle
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
 	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
