@@ -19,13 +19,16 @@ extends RefCounted
 ##
 ## Units: times are floats in a single consistent unit (seconds recommended). push()
 ## and sample() must agree. Positions are Vector3; rotations are euler Vector3 (each
-## component lerped as an angle, so wrap is handled).
+## component lerped as an angle, so wrap is handled). Linear and angular velocity are
+## optional and only used to extrapolate (position and rotation respectively) when the
+## buffer runs dry; angular velocity is euler rad/s, applied per component.
 
-## Snapshot layout: [time, position: Vector3, rotation: Vector3, velocity: Vector3].
+## Snapshot layout: [time, position: Vector3, rotation: Vector3, velocity: Vector3, ang_velocity: Vector3].
 const _T := 0
 const _POS := 1
 const _ROT := 2
 const _VEL := 3
+const _ANGVEL := 4
 
 ## Max snapshots retained. Oldest are dropped once exceeded (~1 s at 60 Hz by default).
 var max_size := 64
@@ -55,13 +58,14 @@ func clear() -> void:
 
 ## Feed one authoritative snapshot. Silently drops out-of-order/duplicate times (unreliable
 ## transport reorders), and clears history on a teleport-sized jump so we don't lerp across it.
-## velocity is optional and only used to extrapolate when the buffer runs dry.
-func push(time: float, pos: Vector3, rot: Vector3, vel := Vector3.ZERO) -> void:
+## velocity / ang_velocity are optional and only used to extrapolate (position / rotation) when the
+## buffer runs dry. ang_velocity is euler rad/s, applied per component like rotation itself.
+func push(time: float, pos: Vector3, rot: Vector3, vel := Vector3.ZERO, ang_velocity := Vector3.ZERO) -> void:
 	if time <= last_time():
 		return
 	if not _buf.is_empty() and pos.distance_squared_to(_buf[_buf.size() - 1][_POS]) > teleport_dist_sq:
 		_buf.clear()
-	_buf.append([time, pos, rot, vel])
+	_buf.append([time, pos, rot, vel, ang_velocity])
 	if _buf.size() > max_size:
 		_buf.pop_front()
 
@@ -100,12 +104,13 @@ func sample(render_time: float) -> Dictionary:
 	if s0_idx >= _buf.size() - 1:
 		var last: Array = _buf[_buf.size() - 1]
 		var vel: Vector3 = last[_VEL] if last.size() > _VEL else Vector3.ZERO
+		var angvel: Vector3 = last[_ANGVEL] if last.size() > _ANGVEL else Vector3.ZERO
 		var dt_since: float = render_time - last[_T]
 		var overshoot := clampf(dt_since, 0.0, extrap_max)
 		return {
 			"valid": true,
 			"position": (last[_POS] as Vector3) + vel * overshoot,
-			"rotation": last[_ROT],
+			"rotation": (last[_ROT] as Vector3) + angvel * overshoot,
 			"holding": dt_since > extrap_max,
 		}
 
