@@ -17,6 +17,8 @@
 //   spawns into our stream), as do MultiplayerSpawners and all RPCs.
 //   This is "old netcode (ALWAYS full-state) on our path" — parity, not yet the delta.
 
+#include "goldnet_codec.h"
+
 #include <godot_cpp/classes/multiplayer_api.hpp>
 #include <godot_cpp/classes/multiplayer_api_extension.hpp>
 #include <godot_cpp/classes/multiplayer_peer.hpp>
@@ -144,6 +146,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool client_has = false;
 	bool warned_protocol_mismatch = false; // one-shot guard for the wire-version-mismatch warning
 
+	// Client: consecutive frames deferred because a KNOWN entity's node wasn't in the tree yet
+	// (recv-nodes warmup — see the defer block in _client_apply). Capped so a node that never
+	// resolves can't stall the stream forever; after the cap we accept the frame and move on.
+	uint32_t defer_streak = 0;
+	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
+
 	uint64_t last_send_ms = 0;                   // server send throttle
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
 	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
@@ -151,6 +159,14 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
 	int dbg_loss = 0;                            // GOLDNET_LOSS=<pct> → drop that % of snapshots
+	uint32_t sim_seed = 0;                       // GOLDNET_SIM_SEED=<n> → 0 = engine RNG (nondeterministic)
+	uint32_t _sim_rng = 0;                       // xorshift state; only advanced when sim_seed != 0
+	// Every random draw the sim makes goes through here, so one seed replays a whole
+	// session. Unseeded falls through to the engine RNG — behavior identical to before.
+	uint32_t _sim_rand();
+	int _sim_rand_range(int p_lo, int p_hi);
+	// One loss roll: true = drop this packet.
+	bool _loss_roll();
 
 	// --- Network-condition simulation (send-side) — see docs/netsim_plan.md ---
 	// Applied at the two send funnels goldnet owns: _rpc (every game @rpc) and the snapshot
@@ -219,8 +235,9 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
 	uint32_t _min_interval_ms() const;
-	static bool _seq_newer(uint16_t a, uint16_t b) { return (int16_t)(a - b) > 0; }
-	static bool _seq_le(uint16_t a, uint16_t b) { return !_seq_newer(a, b); }
+	// Defined in goldnet_codec.h so the standalone tests can pin the rollover behavior.
+	static bool _seq_newer(uint16_t a, uint16_t b) { return goldnet::seq_newer(a, b); }
+	static bool _seq_le(uint16_t a, uint16_t b) { return goldnet::seq_le(a, b); }
 
 	// Reliable-until-acked delivery shared by the spawn and despawn sections. `wait[net_id]`
 	// records the first seq of the current unacked run; _reliable_include returns whether to
@@ -258,6 +275,13 @@ public:
 	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
 	void set_loss_percent(int p_pct);
 	int get_loss_percent() const;
+	// Seed for the whole network-condition sim — loss rolls AND latency draws (also
+	// settable via GOLDNET_SIM_SEED=<n>). 0 = use the engine RNG, i.e. a different pattern
+	// every run. Any non-zero value makes the session reproducible, which is what a
+	// regression test needs. Setting it resets the generator, so seed before the session
+	// starts rather than mid-run.
+	void set_sim_seed(int p_seed);
+	int get_sim_seed() const;
 	// Send-side network-condition simulation (see docs/netsim_plan.md). Latency is the full
 	// per-leg delay applied at THIS endpoint's send funnels; the opposite leg is configured on
 	// its own endpoint. Also settable via GOLDNET_LATENCY / GOLDNET_SPIKE env vars (headless).

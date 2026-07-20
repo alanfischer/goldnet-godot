@@ -1,0 +1,16 @@
+; Godot project for goldnet's GDScript helper tests — InterpolationBuffer, PredictedBody
+; and ServerClock, the three client-side helpers the addon ships alongside the GDExtension.
+;
+; Separate from tests/integration because nothing here needs the extension, a peer, or a
+; second process: these classes are pure GDScript with no goldnet dependency, so the whole
+; suite runs in one headless process in well under a second. See run.sh.
+config_version=5
+
+[application]
+
+config/name="goldnet GDScript tests"
+run/main_scene="res://main.tscn"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"

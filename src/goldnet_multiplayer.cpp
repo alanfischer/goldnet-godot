@@ -26,6 +26,12 @@ using namespace godot;
 // Default snapshot cadence when a synchronizer reports no interval (30 Hz).
 static const uint32_t DEFAULT_INTERVAL_MS = 33;
 
+// Max PVS-leave markers per snapshot (4 bytes each on the wire). A fresh peer's relevance seed can
+// queue hundreds of leaves (every out-of-PVS entity on a big map); emitting them all in one frame
+// overruns the MTU, so it's dropped and never acked — and the same oversized frame resends forever.
+// Capping keeps each frame under MTU; leaves are reliable-until-acked, so they drain over a few ticks.
+static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
+
 // Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
 // collection, mask building, and the apply loop all key off this.
 static const int MAX_SYNC_SLOTS = 32;
@@ -93,43 +99,19 @@ enum GNValueTag : uint8_t {
 };
 // Sentinel for "no quantization hint on this slot — pick the tag from the runtime type".
 static const uint8_t GN_Q_AUTO = 255;
-static const float GN_TAU = 6.28318530717958647692f;
+static const float GN_TAU = goldnet::TAU;
 
-static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) {
-	uint64_t u = ((uint64_t)p_v << 1) ^ (uint64_t)(p_v >> 63); // zig-zag: small magnitudes → few bytes
-	while (u >= 0x80) {
-		buf->put_u8((uint8_t)u | 0x80);
-		u >>= 7;
-	}
-	buf->put_u8((uint8_t)u);
-}
-
-static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) {
-	uint64_t u = 0;
-	int shift = 0;
-	uint8_t b;
-	do {
-		b = buf->get_u8();
-		u |= (uint64_t)(b & 0x7F) << shift;
-		shift += 7;
-	} while (b & 0x80);
-	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
-}
+// The varint and angle16 codecs live in goldnet_codec.h so the standalone test suite can
+// reach them without a running engine; these are thin bindings to StreamPeerBuffer.
+static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) { goldnet::put_varint(buf, p_v); }
+static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_varint(buf); }
 
 // IEEE binary16 via StreamPeer's built-in half codec (round-to-nearest, handles subnormals).
 static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_half(f); }
 static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return buf->get_half(); }
 
-static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) {
-	float t = fmodf(radians, GN_TAU);
-	if (t < 0.0f) {
-		t += GN_TAU;
-	}
-	buf->put_u16((uint16_t)((t / GN_TAU) * 65536.0f)); // wraps: TAU and 0 both map to 0
-}
-static float gn_get_angle16(const Ref<StreamPeerBuffer> &buf) {
-	return ((float)buf->get_u16() / 65536.0f) * GN_TAU;
-}
+static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) { goldnet::put_angle16(buf, radians); }
+static float gn_get_angle16(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_angle16(buf); }
 
 // Map a "gn_quant" hint name to its tag, or GN_Q_AUTO if the name is unknown.
 static uint8_t gn_quant_from_name(const String &name) {
@@ -228,6 +210,10 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
 		dbg_loss = loss ? atoi(loss) : 0;
+		// GOLDNET_SIM_SEED=<n> makes the whole sim (loss rolls + latency draws) reproducible
+		// run-to-run; without it the sim stays nondeterministic (engine RNG), as before.
+		const char *seed = getenv("GOLDNET_SIM_SEED");
+		set_sim_seed(seed ? atoi(seed) : 0);
 	}
 	{
 		// GOLDNET_LATENCY=min,max (per-leg ms range) or a single fixed value; GOLDNET_SPIKE=ms,interval,duration.
@@ -281,6 +267,7 @@ void GoldNetMultiplayer::_reset_client_state() {
 	}
 	client_last_seq = 0;
 	client_has = false;
+	defer_streak = 0;
 	client_spawned.clear(); // spawner nodes are torn down with the session
 }
 
@@ -394,30 +381,12 @@ static void collect_syncs(Node *p_node, Vector<uint64_t> &r_out) {
 
 bool GoldNetMultiplayer::_reliable_include(HashMap<uint32_t, uint16_t> &p_wait, uint32_t p_net_id,
 		uint16_t p_seq, uint16_t p_last_acked, bool p_has_ack) {
-	uint16_t fs;
-	if (p_wait.has(p_net_id)) {
-		fs = p_wait[p_net_id];
-	} else {
-		fs = p_seq;
-		p_wait[p_net_id] = p_seq;
-	}
-	if (p_has_ack && _seq_le(fs, p_last_acked)) {
-		p_wait.erase(p_net_id);
-		return false; // delivered — stop resending
-	}
-	return true;
+	return goldnet::reliable_include(p_wait, p_net_id, p_seq, p_last_acked, p_has_ack);
 }
 
 void GoldNetMultiplayer::_retire_acked(HashMap<uint32_t, uint16_t> &p_wait, uint16_t p_last_acked,
 		Vector<uint32_t> &r_retired) {
-	for (const KeyValue<uint32_t, uint16_t> &kv : p_wait) {
-		if (_seq_le(kv.value, p_last_acked)) {
-			r_retired.push_back(kv.key);
-		}
-	}
-	for (int i = 0; i < r_retired.size(); i++) {
-		p_wait.erase(r_retired[i]);
-	}
+	goldnet::retire_acked(p_wait, p_last_acked, r_retired);
 }
 
 // --- Phase 3: spawn / despawn ---
@@ -655,6 +624,29 @@ void GoldNetMultiplayer::set_loss_percent(int p_pct) {
 int GoldNetMultiplayer::get_loss_percent() const {
 	return dbg_loss;
 }
+void GoldNetMultiplayer::set_sim_seed(int p_seed) {
+	sim_seed = (uint32_t)(p_seed < 0 ? 0 : p_seed);
+	_sim_rng = goldnet::sim_rng_seed(sim_seed); // restart the sequence
+}
+int GoldNetMultiplayer::get_sim_seed() const {
+	return (int)sim_seed;
+}
+uint32_t GoldNetMultiplayer::_sim_rand() {
+	// Unseeded keeps the previous behavior exactly: the engine RNG, freshly rolled.
+	return sim_seed == 0 ? (uint32_t)UtilityFunctions::randi() : goldnet::xorshift32(_sim_rng);
+}
+int GoldNetMultiplayer::_sim_rand_range(int p_lo, int p_hi) {
+	if (p_hi <= p_lo) {
+		return p_lo;
+	}
+	return p_lo + (int)(_sim_rand() % (uint32_t)(p_hi - p_lo + 1));
+}
+bool GoldNetMultiplayer::_loss_roll() {
+	if (dbg_loss <= 0) {
+		return false; // keep the disabled path free of any RNG work
+	}
+	return (int)(_sim_rand() % 100) < dbg_loss;
+}
 void GoldNetMultiplayer::set_relevance_events(bool p_enabled) {
 	relevance_events_enabled = p_enabled;
 }
@@ -741,7 +733,7 @@ int GoldNetMultiplayer::_sim_delay_ms() {
 	if (latency_max_ms <= 0) {
 		return 0;
 	}
-	return (int)UtilityFunctions::randi_range(latency_min_ms, latency_max_ms);
+	return _sim_rand_range(latency_min_ms, latency_max_ms);
 }
 
 // The shared tail of both send funnels (the snapshot send and _rpc, minus their own loss gates):
@@ -852,6 +844,9 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_loss_percent", "pct"), &GoldNetMultiplayer::set_loss_percent);
 	ClassDB::bind_method(D_METHOD("get_loss_percent"), &GoldNetMultiplayer::get_loss_percent);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "loss_percent"), "set_loss_percent", "get_loss_percent");
+	ClassDB::bind_method(D_METHOD("set_sim_seed", "seed"), &GoldNetMultiplayer::set_sim_seed);
+	ClassDB::bind_method(D_METHOD("get_sim_seed"), &GoldNetMultiplayer::get_sim_seed);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "sim_seed"), "set_sim_seed", "get_sim_seed");
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
@@ -1117,33 +1112,37 @@ void GoldNetMultiplayer::_server_tick() {
 		leave_body.instantiate();
 		uint16_t leave_ct = 0;
 		if (relevance_events_enabled && (pr.relevance_seeded || !frame.is_empty())) {
-			// Seed on first contact: treat "everything" as previously relevant so the first diff emits a
-			// leave for every out-of-PVS entity (clients default entities to present). Deferred until the
-			// frame is non-empty — a non-empty frame means the game's visibility predicate passed, which it
-			// only does once the peer is map-ready and has therefore registered the map's syncs. Seeding
-			// earlier would emit leaves for net_ids the client hasn't loaded yet; it would ack and drop them
-			// (they resolve to nothing), and the server would retire them — losing the hide permanently.
-			if (!pr.relevance_seeded) {
-				for (int i = 0; i < ents.size(); i++) {
-					pr.relevant.insert(ents[i].net_id);
-				}
-				pr.relevance_seeded = true;
-			}
+			// Seed on first contact with an EMPTY relevant-set: the client defaults each owned sync ABSENT
+			// (GoldSrc-faithful — see EntityBase._setup_mover_sync) and materializes it only when its state
+			// first arrives, so there is nothing to hide up front. This replaces the old "seed everything
+			// relevant, then leave every out-of-PVS entity" scheme, whose first diff emitted a leave per
+			// out-of-PVS entity — hundreds on a big map, overrunning the MTU so the snapshot was dropped and
+			// never acked (the backlog then resent forever). Now leaves only fire for genuine PVS exits of
+			// entities the client actually saw. The MAX_LEAVES_PER_SNAPSHOT cap remains as a backstop.
+			pr.relevance_seeded = true;
 			for (const uint32_t &rid : pr.relevant) {
 				if (!frame.has(rid) && !pr.leave_wait.has(rid)) {
-					pr.leave_wait[rid] = seq;
+					pr.leave_wait[rid] = 0; // 0 = queued, not yet sent (seq 0 is reserved elsewhere)
 				}
 			}
 			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
 				pr.leave_wait.erase(kv.key); // re-entered → cancel any pending leave
 			}
+			// Emit leaves bounded per snapshot: a fresh peer's seed can queue hundreds of leaves at once
+			// (every out-of-PVS entity on a big map), and dumping them all in one frame blows past the MTU,
+			// so the snapshot is dropped, never acked, and the same oversized frame resends forever —
+			// nothing is ever delivered. Cap the count so each frame fits; the rest ride the next frames.
+			// Stamp each SENT leave with the seq that actually carries it (not queue time), so a leave held
+			// back by the cap isn't retired by an ack for a frame it was never in. Reliable-until-acked, so
+			// spreading them out loses nothing — they drain over a few ticks.
 			Vector<uint32_t> retired_leaves;
-			for (const KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
-				if (pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
-					retired_leaves.push_back(kv.key); // delivered
-				} else {
+			for (KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
+				if (kv.value != 0 && pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
+					retired_leaves.push_back(kv.key); // sent and acked → delivered
+				} else if (leave_ct < MAX_LEAVES_PER_SNAPSHOT) {
 					leave_body->put_u32(kv.key);
 					leave_ct++;
+					kv.value = seq; // stamp with the seq we're sending it in
 				}
 			}
 			for (int ri = 0; ri < retired_leaves.size(); ri++) {
@@ -1180,7 +1179,7 @@ void GoldNetMultiplayer::_server_tick() {
 		// re-carries whatever changed since — no desync, no retransmit. Surviving snapshots
 		// route through the send-side sim (latency/spike) — this is one of goldnet's two send
 		// funnels (see netsim_plan §3.4); the snapshot stream is unreliable.
-		if (dbg_loss == 0 || (UtilityFunctions::randi() % 100) >= dbg_loss) {
+		if (!_loss_roll()) {
 			_sim_send(peer, l, "_gn_recv", Array::make(bytes));
 		}
 		dbg_bytes += bytes.size();
@@ -1280,6 +1279,12 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		frame = *base;
 	}
 
+	// Set if a KNOWN entity (registered net_id, live object) couldn't be applied because its node
+	// isn't in the tree yet — the recv-nodes warmup window. We must not ack this frame as delivered
+	// (see the defer block after the loop), or the server folds the entity into this peer's baseline
+	// and — for an idle mover whose state never changes again — never resends it, stranding it hidden.
+	bool defer_ack = false;
+
 	for (int i = 0; i < count; i++) {
 		uint32_t net_id = buf->get_u32();
 		uint32_t mask = buf->get_u32();
@@ -1289,6 +1294,11 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			MultiplayerSynchronizer *s = sync_from_objid(netid_to_objid[net_id]);
 			if (s && s->is_inside_tree()) {
 				sync = s;
+			} else if (s && mask != 0) {
+				// Registered and still alive, but not in the tree yet: a warmup miss we should retry
+				// rather than silently swallow. Freed/unknown ids fall through (s == null) — nothing
+				// to wait for — so they don't defer and can't stall the stream.
+				defer_ack = true;
 			}
 		}
 		Vector<NodePath> slots;
@@ -1370,6 +1380,23 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			}
 		}
 	}
+
+	// Warmup defer: a known entity's node wasn't in the tree yet, so we couldn't apply (reveal) it.
+	// Committing + acking this seq would advance the server's baseline past the entity; an idle mover
+	// that never changes again would then never be resent — stranded hidden. Instead re-ack our last
+	// good frame so the server keeps resending its full baseline against a frame we hold, and drop
+	// this one uncommitted; we'll apply it once the node finishes entering the tree (usually 1-2
+	// frames). Capped so a node that never resolves can't stall the stream forever. Needs a prior good
+	// frame to fall back to (client_has); on the very first frame we just accept it.
+	if (defer_ack && client_has && defer_streak < MAX_DEFER_STREAK) {
+		defer_streak++;
+		GoldNetLink *dl = _ensure_link();
+		if (dl) {
+			inner->rpc(1, dl, "_gn_ack", Array::make((int)client_last_seq));
+		}
+		return;
+	}
+	defer_streak = 0;
 
 	// Commit this frame to the client ring and ack it (newest wins, unreliable).
 	int slot = seq & (RING - 1);
@@ -1470,8 +1497,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
 	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
 	// (netsim_plan §4a). This is what lets /sim_loss exercise the input-command redundancy ring.
-	if (dbg_loss > 0 && _rpc_is_unreliable(p_object, p_method) &&
-			(int)((uint32_t)UtilityFunctions::randi() % 100) < dbg_loss) {
+	if (dbg_loss > 0 && _rpc_is_unreliable(p_object, p_method) && _loss_roll()) {
 		return OK; // simulated drop
 	}
 	return _sim_send(p_peer, p_object, p_method, p_args);
