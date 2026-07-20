@@ -10,8 +10,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# godot-cpp (git submodule at extern/godot-cpp; in this repo a symlink to the
-# shared checkout under extern/hop-godot so we don't vendor a second copy).
+# godot-cpp, a git submodule at extern/godot-cpp. Pinned to the same commit as
+# hop-godot and goldsrc-godot — keep the three in step when bumping it.
+#
+# This was a symlink to hop-godot's checkout, which kept a single shared copy but
+# made the repo unbuildable anywhere that sibling did not exist, CI included.
 add_subdirectory(extern/godot-cpp)
 
 # Our GDExtension library

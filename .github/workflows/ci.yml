@@ -65,14 +65,55 @@ jobs:
       - name: Run suites
         run: GODOT="$PWD/godot" ./tests/gdscript/run.sh
 
-  # NOTE: tests/integration is intentionally absent.
+  # The nine two-process cases: a real server and client talking over a real
+  # ENetMultiplayerPeer with a real GoldNetMultiplayer installed. Unlike the tiers above
+  # this needs the GDExtension built, hence the submodule checkout.
   #
-  # Those cases need the built GDExtension, which needs godot-cpp — and in this repo
-  # extern/godot-cpp is a symlink to ../../hop-godot/extern/godot-cpp, a sibling checkout
-  # inside the wizardwars tree. A standalone CI clone has no such sibling, so the
-  # extension cannot be built here at all. (goldsrc-godot vendors godot-cpp as a real
-  # submodule, which is why its CI can build.)
-  #
-  # Wiring the integration tier up means giving this repo a godot-cpp it can resolve on
-  # its own: convert the symlink to a submodule, or check out hop-godot alongside it.
-  # Until then those 9 cases run locally only, via tests/integration/run.sh.
+  # Compiling godot-cpp dominates the runtime here (several minutes). There is
+  # deliberately no build cache yet: caching a CMake build tree without its CMakeCache.txt
+  # tends to reconfigure and rebuild anyway, and a cache that quietly does nothing is
+  # worse than none. If this job gets annoying, ccache keyed on the godot-cpp revision is
+  # the thing to reach for.
+  integration-tests:
+    name: Integration cases
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1 libxcursor1 libxinerama1 libxi6 libxrandr2
+
+      # Debug, not Release. src/CMakeLists.txt maps that to the template_debug suffix,
+      # and the Godot binary fetched below is an editor build, so goldnet.gdextension
+      # resolves its linux.debug.x86_64 entry. Building Release here produces a
+      # template_release .so the engine never looks for, and every case then fails at
+      # "GoldNetMultiplayer missing".
+      - name: Build the extension
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j"$(nproc)"
+
+      - name: Fetch Godot ${{ env.GODOT_VERSION }}
+        run: |
+          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          curl -fsSL -o godot.zip "$url"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}_linux.x86_64" godot
+          chmod +x godot
+
+      - name: Run cases
+        run: GODOT="$PWD/godot" ./tests/integration/run.sh
+
+      # Each case writes a server and client log; they are the only way to tell what a
+      # failure actually did, and they vanish with the runner.
+      - name: Upload case logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: tests/integration/.logs/
