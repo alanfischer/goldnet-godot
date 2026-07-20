@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes an in-flight run redundant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.7-stable"
+
+jobs:
+  # The engine-agnostic half of goldnet: goldnet_codec.h and the sequence arithmetic.
+  # Deliberately free of godot-cpp, so this needs no engine and no submodules.
+  #
+  # tests/CMakeLists.txt turns on UBSan with -fno-sanitize-recover. That is load-bearing
+  # rather than hygiene — see the comment there — so a sanitizer abort is a real failure
+  # and must not be retried or downgraded.
+  cpp-tests:
+    name: C++ unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build tests/build
+
+      - name: Run
+        run: ctest --test-dir tests/build --output-on-failure
+
+  # InterpolationBuffer, PredictedBody and ServerClock — the client-side helpers the addon
+  # ships as plain GDScript. These need an engine but not the GDExtension, which is what
+  # makes them runnable here at all (see the note on the integration suite below).
+  gdscript-tests:
+    name: GDScript suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Godot's Linux builds link X11/font libraries even when run with --headless; the
+      # runner image does not carry all of them by default.
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1 libxcursor1 libxinerama1 libxi6 libxrandr2
+
+      - name: Fetch Godot ${{ env.GODOT_VERSION }}
+        run: |
+          url="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          curl -fsSL -o godot.zip "$url"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}_linux.x86_64" godot
+          chmod +x godot
+          ./godot --version
+
+      - name: Run suites
+        run: GODOT="$PWD/godot" ./tests/gdscript/run.sh
+
+  # NOTE: tests/integration is intentionally absent.
+  #
+  # Those cases need the built GDExtension, which needs godot-cpp — and in this repo
+  # extern/godot-cpp is a symlink to ../../hop-godot/extern/godot-cpp, a sibling checkout
+  # inside the wizardwars tree. A standalone CI clone has no such sibling, so the
+  # extension cannot be built here at all. (goldsrc-godot vendors godot-cpp as a real
+  # submodule, which is why its CI can build.)
+  #
+  # Wiring the integration tier up means giving this repo a godot-cpp it can resolve on
+  # its own: convert the symlink to a submodule, or check out hop-godot alongside it.
+  # Until then those 9 cases run locally only, via tests/integration/run.sh.
