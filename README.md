@@ -167,6 +167,89 @@ code.
 In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
 `extern/hop-godot` so we don't vendor a second copy.
 
+## Testing
+
+```bash
+cmake -S tests -B tests/build
+cmake --build tests/build
+ctest --test-dir tests/build --output-on-failure
+```
+
+Standalone — no godot-cpp, no engine, runs in under a second. The suite covers
+`src/goldnet_codec.h`: the zig-zag varint and angle16 codecs (round-trip, encoded
+widths, wraparound), uint16 sequence comparison across rollover, the
+reliable-until-acked bookkeeping, and the seeded loss PRNG.
+
+Scope is deliberate. godot-cpp's engine classes call through GDExtension function
+pointers that only exist inside a running Godot process, so anything touching
+`Variant` or `StreamPeerBuffer` can't be tested here — that's why the helpers in
+`goldnet_codec.h` are templated over their buffer and map types. The protocol itself
+is covered by the integration suite below.
+
+### Integration tests
+
+```bash
+./build.sh macos                 # the suite needs a built extension
+./tests/integration/run.sh       # all cases
+./tests/integration/run.sh ring_expiry
+```
+
+Each case runs a **server and client process pair** over a real `ENetMultiplayerPeer`
+with a real `GoldNetMultiplayer` installed, so it exercises the actual snapshot, ack,
+and spawn paths. The client holds the assertions and its exit code is the verdict; the
+server is a cooperative peer. Logs land in `tests/integration/.logs/`.
+
+The cases live in `tests/integration/cases/`, one file each, and every one opens with a
+docstring stating its timeline and — where it matters — the precise limits of what it
+covers, verified by mutation. Read those rather than a list here; a second copy of the
+scope caveats in this file would drift from the code, and a stale caveat is worse than
+none. `ls tests/integration/cases/` for the current set.
+
+Adding a case: drop `cases/case_<name>.gd` extending `test_case.gd`, override
+`server_step`/`client_step`, call `finish()` when the assertions are done. `run.sh`
+picks it up automatically. `test_case.gd` provides `spawn_once(t, n)` and
+`at(t, when, key)` so a case reads as its documented timeline rather than a pile of
+boolean latches.
+
+Cases needing more than one client declare it **twice**: `## @clients N` for run.sh to
+grep, and `required_clients = N` in `setup()`. The harness cross-checks them and fails if
+they disagree — without that, a missed grep silently runs a multi-client case with one
+client, where it passes while testing nothing.
+
+### GDScript helper tests
+
+```bash
+./tests/gdscript/run.sh                      # all suites
+./tests/gdscript/run.sh interpolation_buffer # just one
+```
+
+Covers the three client-side helpers the addon ships alongside the extension —
+`InterpolationBuffer`, `PredictedBody` and `ServerClock`. They're pure GDScript with no
+dependency on goldnet's wire protocol, so this needs no built extension, no peer and no
+second process; the whole thing runs in one headless process in well under a second.
+
+Suites live in `tests/gdscript/suites/suite_<name>.gd` extending `suite.gd`; override
+`run()` and call the assertions. The runner discovers them automatically and **fails any
+suite that reports zero checks**, so a file that's added but never wired up (a missing
+`run()` override, an early return) shows up as a failure rather than as green.
+
+`ServerClock` reads the wall clock directly, so its suite works around that rather than
+against it: assertions that can be made independent of it are (the correction tests assert
+on the *ratio* between successive steps), and the rest carry an explicit slop tolerance.
+
+### Mutation
+
+All three suites are worth running under mutation — break the thing a test claims to cover
+and confirm it goes red. A test that can't fail is worse than no test, because it reads
+like coverage.
+
+Where a mutation reveals that a test *doesn't* cover what it looks like it covers, say so
+in the test rather than deleting it or contorting it into passing. Several tests here carry
+a `SCOPE` note recording exactly that, usually because the code in question is defensive
+and unreachable through the public API. Those notes are load-bearing documentation: the
+next person to look will otherwise redo the analysis, or "fix" the test by asserting
+something false.
+
 ## Usage
 
 1. Symlink or copy `addons/goldnet/` into your project's `addons/`.
@@ -210,3 +293,8 @@ In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
   `spawn` / `despawn` / `changed` counts and byte size on the client).
 - `GOLDNET_LOSS=<pct>` — drop that percentage of outbound snapshots server-side, to
   exercise the ack-stall self-heal without a real lossy network.
+- `GOLDNET_SIM_SEED=<n>` — make the whole sim reproducible: both the loss rolls and the
+  latency draws come from one seeded generator. Unset (or `0`) uses the engine RNG, so
+  every run drops different packets and draws different delays — fine for poking at
+  self-heal, useless for a regression test you need to re-run or bisect. Also exposed as
+  the `sim_seed` property.

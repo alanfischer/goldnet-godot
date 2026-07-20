@@ -1,0 +1,13 @@
+; Godot project for goldnet's in-engine integration tests. Separate from example/ so the
+; demo stays a minimal readable reference and the harness can grow without cluttering it.
+; See tests/integration/run.sh.
+config_version=5
+
+[application]
+
+config/name="goldnet integration tests"
+run/main_scene="res://main.tscn"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
