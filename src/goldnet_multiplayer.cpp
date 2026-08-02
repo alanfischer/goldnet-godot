@@ -297,7 +297,18 @@ void GoldNetMultiplayer::_relay_server_disconnected() {
 	emit_signal("server_disconnected");
 }
 
-// We own every synchronizer that carries at least one sync (per-tick) property. Since
+// A property we replicate: Godot's ALWAYS (sync) and ON_CHANGE (watch) both describe
+// per-tick state, and the snapshot serves both the same way — a slot equal to the peer's
+// acked baseline is skipped, which is exactly what ON_CHANGE asks for. Reading only the
+// sync flag made ON_CHANGE properties invisible in a MIXED config: _should_intercept saw
+// the ALWAYS property and claimed the synchronizer, then the slot walk dropped the
+// ON_CHANGE ones — so neither goldnet nor the inner replicated them, silently. (Both
+// flags are false for NEVER, which is spawn-only and stays out.)
+static bool is_replicated_slot(const Ref<SceneReplicationConfig> &p_cfg, const NodePath &p_path) {
+	return p_cfg->property_get_sync(p_path) || p_cfg->property_get_watch(p_path);
+}
+
+// We own every synchronizer that carries at least one per-tick property. Since
 // Phase 3 also owns the MultiplayerSpawners, there is no longer a map-static vs.
 // spawner-managed split — movers, projectiles, and players all stream their state
 // through the same delta path. (Spawn-only configs, if any, carry no per-tick state
@@ -309,7 +320,7 @@ bool GoldNetMultiplayer::_should_intercept(MultiplayerSynchronizer *p_sync) cons
 	}
 	TypedArray<NodePath> props = cfg->get_properties();
 	for (int i = 0; i < props.size(); i++) {
-		if (cfg->property_get_sync(props[i])) {
+		if (is_replicated_slot(cfg, props[i])) {
 			return true;
 		}
 	}
@@ -888,7 +899,7 @@ static void get_sync_slots(MultiplayerSynchronizer *p_sync, Vector<NodePath> &r_
 	TypedArray<NodePath> props = cfg->get_properties();
 	for (int i = 0; i < props.size() && r_paths.size() < MAX_SYNC_SLOTS; i++) {
 		NodePath p = props[i];
-		if (cfg->property_get_sync(p)) {
+		if (is_replicated_slot(cfg, p)) {
 			r_paths.push_back(p);
 		}
 	}

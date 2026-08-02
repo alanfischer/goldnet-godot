@@ -40,9 +40,20 @@ entity-agnostic; players, bots, projectiles, and map movers all flow through one
 pipeline. A node lands in:
 
 - **`owned_syncs`** when its `MultiplayerSynchronizer` enters the tree with at
-  least one sync-marked property (`_object_configuration_add`). This is the
+  least one per-tick property (`_object_configuration_add`). This is the
   per-tick delta stream, and it covers *both* map-static movers and spawned
   entities.
+
+  Per-tick means **`ALWAYS` or `ON_CHANGE`** — Godot exposes them as separate flags
+  (`property_get_sync` / `property_get_watch`), but the snapshot serves both the same
+  way, since a slot equal to the peer's acked baseline is skipped anyway. That *is*
+  `ON_CHANGE`'s intent, so it needs no separate path. `NEVER` carries no per-tick
+  state and stays out (its value still rides the spawn payload).
+
+  One semantic difference to know: stock sends each `ON_CHANGE` write reliably, so
+  every transition is observed. goldnet converges instead — if a property goes
+  A→B→A between two acked frames, the peer sees only the final A. That holds for
+  every slot; goldnet carries *state*, not events. Put events on `@rpc`.
 - **`spawn_records`** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
   Map-static entities load with the map (both peers already have them) so they need
   no spawn record; runtime entities do, because the client has no other way to know
