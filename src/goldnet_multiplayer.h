@@ -135,6 +135,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// defaults entities to present, so without this seed the initially-out-of-PVS ones would render
 		// through walls until they first entered+left. Mirrors the game's old first-pass "all present".
 		bool relevance_seeded = false;
+		// Per-peer snapshot cadence (GoldSrc cl_updaterate). 0 = serve this peer every server
+		// tick; otherwise serve it at most once per interval_ms. Throttling costs nothing on the
+		// wire: the next frame this peer does get simply deltas against its older acked baseline,
+		// which the ring already supports (it is the same path a lost snapshot takes).
+		uint32_t interval_ms = 0;
+		uint32_t last_sent_ms = 0;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
 
@@ -268,6 +274,8 @@ public:
 	// replication_interval (min across owned syncs). Set >0 to pin one global tick rate.
 	void set_snapshot_interval_ms(int p_ms);
 	int get_snapshot_interval_ms() const;
+	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
+	int get_peer_snapshot_interval_ms(int p_peer) const;
 	// Periodic per-peer snapshot stats to stdout (also enabled by GOLDNET_DEBUG=1).
 	void set_debug_enabled(bool p_enabled);
 	bool is_debug_enabled() const;

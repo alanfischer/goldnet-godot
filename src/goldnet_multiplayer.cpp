@@ -623,6 +623,20 @@ void GoldNetMultiplayer::set_snapshot_interval_ms(int p_ms) {
 int GoldNetMultiplayer::get_snapshot_interval_ms() const {
 	return snapshot_interval_override;
 }
+
+// Per-peer cadence (GoldSrc cl_updaterate): let one client be served slower than the server ticks,
+// without slowing anyone else down. The server keeps ticking at the fastest replication_interval;
+// this only subsamples which peers a given tick serves. ms <= 0 restores "every tick".
+// Dropped with the ring on disconnect, so a reconnecting client must ask again.
+void GoldNetMultiplayer::set_peer_snapshot_interval_ms(int p_peer, int p_ms) {
+	PeerRing &pr = peer_rings[p_peer]; // default-constructs: a rate may be set before the first tick
+	pr.interval_ms = p_ms > 0 ? (uint32_t)p_ms : 0;
+}
+
+int GoldNetMultiplayer::get_peer_snapshot_interval_ms(int p_peer) const {
+	const PeerRing *pr = peer_rings.getptr(p_peer);
+	return pr ? (int)pr->interval_ms : 0;
+}
 void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
 	dbg = p_enabled;
 }
@@ -848,6 +862,8 @@ bool GoldNetMultiplayer::_rpc_is_unreliable(Object *p_object, const StringName &
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
+	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
+	ClassDB::bind_method(D_METHOD("get_peer_snapshot_interval_ms", "peer"), &GoldNetMultiplayer::get_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
 	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
 	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
@@ -963,6 +979,22 @@ void GoldNetMultiplayer::_server_tick() {
 	PackedInt32Array peers = inner->get_peers();
 	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 
+	// Resolve which peers are due BEFORE the per-entity state read below: on a tick where every
+	// peer is throttled (all of them on a slower cadence than the server's) this costs nothing.
+	// last_sent_ms == 0 always sends — a peer's first snapshot must not wait out an interval,
+	// and it keeps the arithmetic honest before the clock has passed interval_ms.
+	Vector<int> due;
+	for (int pi = 0; pi < peers.size(); pi++) {
+		PeerRing &pr = peer_rings[peers[pi]]; // default-constructs on first use
+		if (pr.interval_ms > 0 && pr.last_sent_ms != 0 && now - pr.last_sent_ms < pr.interval_ms) {
+			continue;
+		}
+		due.push_back(peers[pi]);
+	}
+	if (due.is_empty()) {
+		return;
+	}
+
 	// Read every owned entity's current state ONCE per tick — the values are the server's
 	// authoritative state, identical for all peers. Only the delta mask (vs. each peer's
 	// baseline) and the visibility filter below are peer-specific, so those stay in the
@@ -994,9 +1026,10 @@ void GoldNetMultiplayer::_server_tick() {
 		ents.push_back(e);
 	}
 
-	for (int pi = 0; pi < peers.size(); pi++) {
-		int peer = peers[pi];
-		PeerRing &pr = peer_rings[peer]; // default-constructs on first use
+	for (int pi = 0; pi < due.size(); pi++) {
+		int peer = due[pi];
+		PeerRing &pr = peer_rings[peer]; // present: the due-pass above created it
+		pr.last_sent_ms = now;
 
 		// Baseline = the frame this peer last acked, if we still hold it. Otherwise
 		// send a full frame (baseline seq 0) — first send, or an ack aged out of the
