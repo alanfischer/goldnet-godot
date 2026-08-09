@@ -52,6 +52,35 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// empty means all-auto.
 		Vector<uint8_t> quant;
 		bool quant_read = false;
+		// Change tracking, stamped ONCE per snapshot tick (see _server_tick). The values an entity
+		// holds are the same for every peer, so "did slot s change" must be answered once here
+		// rather than re-derived per peer — that comparison was O(peers x entities x slots) and
+		// ~94% of it ran on entities that had not changed at all.
+		//
+		// last_vals is the previous tick's values; slot_ctr[s] is the monotonic snapshot counter
+		// at which slot s last changed. A peer needs slot s iff slot_ctr[s] > its baseline's
+		// counter, which is a plain integer compare no matter how many peers there are.
+		Vector<Variant> last_vals;
+		Vector<uint32_t> slot_ctr;
+		// Resolved read plan, built once (see _cache_slots). Reading a slot used to re-parse the
+		// replication config, allocate a TypedArray, and walk each property path back to its node
+		// — building Strings and NodePaths — every tick, for every entity, forever. None of that
+		// varies: the config and the node layout are fixed once the entity is in the tree, so all
+		// that has to happen per tick is the get_indexed itself.
+		//
+		// Cached lazily on first read, matching how `quant` is already handled: by then the game
+		// has finished setting the entity up. A config swapped out at runtime would not be picked
+		// up, which is the same assumption `quant_read` already makes.
+		Vector<uint64_t> slot_target_id; // object id owning each slot's property
+		Vector<NodePath> slot_prop;      // property path to read on that object
+		bool slots_cached = false;
+		// Push-based change notification (see mark_dirty). Reading an entity's slots is the only
+		// way to discover it changed, so with ~390 entities and ~25 of them actually moving, the
+		// read loop spent almost all of its time confirming that nothing happened. A game that
+		// already knows when it wrote state can say so instead. Starts true so an entity is read
+		// once when it registers — that first read is what gives last_vals its contents, which
+		// every later full-state send (a new peer, a PVS re-entry) is served from.
+		bool dirty = true;
 	};
 	HashMap<uint64_t, SyncEntry> owned_syncs;    // ObjectID -> entry
 	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id   -> ObjectID (client apply lookup)
@@ -108,8 +137,18 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// a lost ack self-heal (we keep diffing against the same acked frame). Slots are
 	// indexed by seq & (RING-1); frame_seq[] guards against a stale (aged-out) slot.
 	struct PeerRing {
-		FrameData frames[RING];
+		// What the peer HAD at each frame, as net_ids only. This used to hold every visible
+		// entity's values (FrameData), one full copy per peer per frame — 32 copies live per
+		// peer. The values were identical across peers and only ever used to answer "did this
+		// change since the peer's baseline", which SyncEntry::slot_ctr now answers directly.
+		// All this has to remember is WHICH entities the peer had, so a re-entering entity
+		// still gets a full state rather than a delta against something it never received.
+		HashSet<uint32_t> frames[RING];
 		uint16_t frame_seq[RING] = {}; // 0 = empty
+		// The monotonic snapshot counter each frame was sent at. The wire seq stays per-peer
+		// (16-bit, its own space, unchanged), while change tracking needs a counter that never
+		// aliases: a slot untouched for 32768 ticks would otherwise compare as newly changed.
+		uint32_t frame_ctr[RING] = {};
 		uint16_t next_seq = 1;         // 0 is reserved for "no baseline / full state"
 		uint16_t last_acked = 0;
 		bool has_ack = false;
@@ -143,6 +182,26 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		uint32_t last_sent_ms = 0;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
+	// Monotonic snapshot counter, bumped once per _server_tick that sends anything. Purely
+	// internal: it stamps SyncEntry::slot_ctr and PeerRing::frame_ctr so change tests are a
+	// single integer compare. Unlike the 16-bit wire seq it never wraps in any realistic
+	// session (2^32 ticks at 60 Hz is ~2 years), so a long-static entity can't alias as changed.
+	uint32_t snapshot_ctr = 0;
+
+	// mark_dirty() accepts either a synchronizer or the node whose state it replicates, since a
+	// game thinks in entities, not synchronizers. Resolving node -> sync means scanning children,
+	// so the answer is memoized here on first use. Keyed by node ObjectID.
+	HashMap<uint64_t, uint64_t> dirty_route;
+	// Push mode. OFF by default: goldnet polls every entity every tick, which is correct without
+	// any cooperation from the game. A game that marks its writes (mark_dirty) opts in and pays
+	// only for entities that actually changed. Defaulting this on would silently stale every
+	// consumer that has not been taught to mark.
+	bool push_dirty = false;
+	// Audit mode: read every entity as if it were dirty and report any that changed WITHOUT being
+	// marked. A missed mark_dirty is otherwise invisible — the entity just silently stops updating
+	// for everyone — so this exists to turn that into a loud, testable failure. Off by default;
+	// intended for dev builds and the integration suite, not production.
+	bool dirty_audit = false;
 
 	// Client receive history — mirror ring so a delta can be reconstructed against any
 	// recent baseline the server might diff against.
@@ -238,6 +297,19 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // has streamable sync props
 	// Build the per-slot quantization tags from a synchronizer's "gn_quant" meta (see gn_put_value).
 	static void _read_quant(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_quant);
+	static bool _read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr);
+
+public:
+	/// Tell goldnet an entity's replicated state has changed, so the next snapshot reads it.
+	/// Accepts the MultiplayerSynchronizer or the node it replicates. Cheap (one hash lookup
+	/// after the first call) and safe to call off-server or with no session — it no-ops.
+	void mark_dirty(Object *p_obj);
+	void set_dirty_audit(bool p_enabled);
+	bool get_dirty_audit() const;
+	void set_push_dirty(bool p_enabled);
+	bool get_push_dirty() const;
+
+private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
 	uint32_t _min_interval_ms() const;
