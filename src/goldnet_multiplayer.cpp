@@ -859,7 +859,76 @@ bool GoldNetMultiplayer::_rpc_is_unreliable(Object *p_object, const StringName &
 	return unreliable;
 }
 
+void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
+	if (!p_obj) {
+		return;
+	}
+	uint64_t id = (uint64_t)p_obj->get_instance_id();
+	// Passed the synchronizer itself — the direct case.
+	if (owned_syncs.has(id)) {
+		owned_syncs[id].dirty = true;
+		return;
+	}
+	// Passed the node whose state is replicated. Games think in entities, so this is the call
+	// site that actually reads well; the node -> sync answer is memoized because finding it
+	// means scanning children.
+	if (const uint64_t *routed = dirty_route.getptr(id)) {
+		if (SyncEntry *e = owned_syncs.getptr(*routed)) {
+			e->dirty = true;
+		}
+		return; // a stale route just means the sync is gone; nothing to mark
+	}
+	Node *node = Object::cast_to<Node>(p_obj);
+	if (!node) {
+		return;
+	}
+	for (int i = 0; i < node->get_child_count(); i++) {
+		MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(node->get_child(i));
+		if (!sync) {
+			continue;
+		}
+		uint64_t sid = (uint64_t)sync->get_instance_id();
+		if (owned_syncs.has(sid)) {
+			dirty_route[id] = sid;
+			owned_syncs[sid].dirty = true;
+			return;
+		}
+	}
+	// No owned synchronizer under this node. Remember that too, so a game that marks a node we
+	// do not own does not re-scan its children on every call.
+	dirty_route[id] = 0;
+}
+
+void GoldNetMultiplayer::set_push_dirty(bool p_enabled) {
+	push_dirty = p_enabled;
+	if (!p_enabled) {
+		// Back to polling: nothing is trusted to be up to date, so read everything next tick.
+		for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
+			kv.value.dirty = true;
+		}
+	}
+}
+
+bool GoldNetMultiplayer::get_push_dirty() const {
+	return push_dirty;
+}
+
+void GoldNetMultiplayer::set_dirty_audit(bool p_enabled) {
+	dirty_audit = p_enabled;
+}
+
+bool GoldNetMultiplayer::get_dirty_audit() const {
+	return dirty_audit;
+}
+
 void GoldNetMultiplayer::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("mark_dirty", "object"), &GoldNetMultiplayer::mark_dirty);
+	ClassDB::bind_method(D_METHOD("set_push_dirty", "enabled"), &GoldNetMultiplayer::set_push_dirty);
+	ClassDB::bind_method(D_METHOD("get_push_dirty"), &GoldNetMultiplayer::get_push_dirty);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_dirty"), "set_push_dirty", "get_push_dirty");
+	ClassDB::bind_method(D_METHOD("set_dirty_audit", "enabled"), &GoldNetMultiplayer::set_dirty_audit);
+	ClassDB::bind_method(D_METHOD("get_dirty_audit"), &GoldNetMultiplayer::get_dirty_audit);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dirty_audit"), "set_dirty_audit", "get_dirty_audit");
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
@@ -919,6 +988,66 @@ static void get_sync_slots(MultiplayerSynchronizer *p_sync, Vector<NodePath> &r_
 			r_paths.push_back(p);
 		}
 	}
+}
+
+// Resolve a synchronizer's replicated slots down to (object id, property path) pairs, so the
+// per-tick read is nothing but get_indexed. Everything resolved here — the replication config,
+// which properties are replicated, and which node owns each one — is fixed for the life of the
+// entity, but used to be recomputed for every entity on every tick: at ~390 entities and 60 Hz
+// that was the single largest fixed cost in the server tick, and none of it varied.
+static void cache_slot_plan(MultiplayerSynchronizer *p_sync, Vector<uint64_t> &r_target_ids,
+		Vector<NodePath> &r_props) {
+	r_target_ids.clear();
+	r_props.clear();
+	Vector<NodePath> slots;
+	get_sync_slots(p_sync, slots);
+	Node *root = p_sync->get_node_or_null(p_sync->get_root_path());
+	for (int s = 0; s < slots.size(); s++) {
+		NodePath prop;
+		Node *target = root ? resolve_property(root, slots[s], prop) : nullptr;
+		// An unresolved slot is kept as a hole (id 0) rather than dropped: the slot INDEX is the
+		// wire position, so skipping one would silently shift every later slot's meaning.
+		r_target_ids.push_back(target ? (uint64_t)target->get_instance_id() : 0);
+		r_props.push_back(prop);
+	}
+}
+
+// Read every slot through the cached plan, comparing and stamping in the same pass.
+//
+// The read writes straight into last_vals and stamps slot_ctr where a value actually moved, so
+// there is no temporary vector and no second comparison pass: last_vals is both the thing we
+// diff against and the buffer we read into. Returns true if anything changed, which audit mode
+// uses to catch an entity that changed without being marked.
+//
+// A target that has since been freed reads as nil, exactly as an unresolved one did before.
+bool GoldNetMultiplayer::_read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr) {
+	const int n = p_entry.slot_prop.size();
+	if (p_entry.last_vals.size() != n) {
+		p_entry.last_vals.resize(n);
+		p_entry.slot_ctr.resize(n);
+		for (int s = 0; s < n; s++) {
+			p_entry.slot_ctr.write[s] = p_ctr;
+		}
+	}
+	// An entity's slots nearly always live on one object (its own node), so resolving the id
+	// once and reusing it across the run turns N lookups per entity into one.
+	uint64_t last_id = 0;
+	Object *last_obj = nullptr;
+	bool changed = false;
+	for (int s = 0; s < n; s++) {
+		uint64_t id = p_entry.slot_target_id[s];
+		if (id != last_id) {
+			last_id = id;
+			last_obj = id ? UtilityFunctions::instance_from_id(id) : nullptr;
+		}
+		Variant v = last_obj ? last_obj->get_indexed(p_entry.slot_prop[s]) : Variant();
+		if (v != p_entry.last_vals[s]) {
+			p_entry.last_vals.write[s] = v;
+			p_entry.slot_ctr.write[s] = p_ctr;
+			changed = true;
+		}
+	}
+	return changed;
 }
 
 // Read the current value of every slot of a synchronizer into r_vals (sized to the
@@ -999,11 +1128,16 @@ void GoldNetMultiplayer::_server_tick() {
 	// authoritative state, identical for all peers. Only the delta mask (vs. each peer's
 	// baseline) and the visibility filter below are peer-specific, so those stay in the
 	// per-peer loop; the expensive get_indexed / path resolution does not.
+	// One counter per tick that actually sends. Stamped into the change tracking below and into
+	// each peer's frame_ctr, so "changed since your baseline" is an integer compare per peer.
+	snapshot_ctr++;
+
 	struct TickEnt {
 		MultiplayerSynchronizer *sync;
 		uint32_t net_id;
-		Vector<Variant> vals;
+		const Vector<Variant> *vals;   // points at SyncEntry::last_vals — never copied
 		const Vector<uint8_t> *quant; // per-slot quantization tags (may be empty = all-auto)
+		const Vector<uint32_t> *slot_ctr; // when each slot last changed (SyncEntry::slot_ctr)
 	};
 	Vector<TickEnt> ents;
 	for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
@@ -1016,13 +1150,31 @@ void GoldNetMultiplayer::_server_tick() {
 			_read_quant(sync, kv.value.quant);
 			kv.value.quant_read = true;
 		}
-		Vector<NodePath> slots;
-		get_sync_slots(sync, slots);
+		if (!kv.value.slots_cached) {
+			cache_slot_plan(sync, kv.value.slot_target_id, kv.value.slot_prop);
+			kv.value.slots_cached = true;
+			kv.value.dirty = true; // first sight: last_vals has nothing in it yet
+		}
+		// Only entities the game told us about get read (see mark_dirty). A clean one keeps the
+		// values and stamps it already has, which is all any peer — including one being sent a
+		// full baseline — needs from it.
+		if (kv.value.dirty || !push_dirty) {
+			_read_and_stamp(kv.value, snapshot_ctr);
+			kv.value.dirty = false;
+		} else if (dirty_audit) {
+			// Audit: read it anyway and shout if it moved without being marked. Left applied
+			// rather than discarded so a dev build limps on correctly while reporting the bug.
+			if (_read_and_stamp(kv.value, snapshot_ctr)) {
+				UtilityFunctions::push_error("[goldnet] dirty_audit: '", sync->get_path(),
+						"' changed without mark_dirty() — it would have gone stale for every peer.");
+			}
+		}
 		TickEnt e;
 		e.sync = sync;
 		e.net_id = kv.value.net_id;
 		e.quant = &kv.value.quant;
-		read_slot_values(sync, slots, e.vals);
+		e.vals = &kv.value.last_vals;
+		e.slot_ctr = &kv.value.slot_ctr;
 		ents.push_back(e);
 	}
 
@@ -1035,12 +1187,14 @@ void GoldNetMultiplayer::_server_tick() {
 		// send a full frame (baseline seq 0) — first send, or an ack aged out of the
 		// ring under heavy loss.
 		uint16_t base_seq = 0;
-		FrameData *base = nullptr;
+		HashSet<uint32_t> *base = nullptr;
+		uint32_t base_ctr = 0;
 		if (pr.has_ack) {
 			int bslot = pr.last_acked & (RING - 1);
 			if (pr.frame_seq[bslot] == pr.last_acked && pr.last_acked != 0) {
 				base_seq = pr.last_acked;
 				base = &pr.frames[bslot];
+				base_ctr = pr.frame_ctr[bslot];
 			}
 		}
 
@@ -1102,7 +1256,7 @@ void GoldNetMultiplayer::_server_tick() {
 
 		// Per-peer entity delta: filter the pre-read entities by visibility, store the
 		// visible subset as this peer's next baseline, and emit only the changed slots.
-		FrameData frame;
+		HashSet<uint32_t> frame;
 		Ref<StreamPeerBuffer> body;
 		body.instantiate();
 		uint16_t changed = 0;
@@ -1116,16 +1270,23 @@ void GoldNetMultiplayer::_server_tick() {
 				continue;
 			}
 			uint32_t net_id = ents[i].net_id;
-			const Vector<Variant> &vals = ents[i].vals;
-			frame[net_id] = vals;
+			const Vector<Variant> &vals = *ents[i].vals;
+			frame.insert(net_id);
 
-			const Vector<Variant> *bvals = base ? base->getptr(net_id) : nullptr;
+			// Did this peer hold this entity at its baseline? If not (first sight, or it left
+			// and re-entered the peer's PVS) it needs every slot — the peer has nothing to
+			// apply a delta to. Otherwise the answer is per-slot and already computed: the slot
+			// changed iff it was stamped after the baseline's counter. No value comparison here,
+			// which is what took this loop from O(peers x entities x slots) to O(peers x entities)
+			// of integer work — and ~94% of entities exit at mask == 0 having touched nothing.
+			const Vector<uint32_t> &slot_ctr = *ents[i].slot_ctr;
 			uint32_t mask = 0;
-			if (!bvals || bvals->size() != vals.size()) {
+			if (!base || !base->has(net_id)) {
 				mask = vals.size() >= MAX_SYNC_SLOTS ? 0xFFFFFFFFu : ((1u << vals.size()) - 1u); // new → all slots
 			} else {
-				for (int s = 0; s < vals.size(); s++) {
-					if (vals[s] != (*bvals)[s]) {
+				int n_slots = MIN(vals.size(), slot_ctr.size());
+				for (int s = 0; s < n_slots; s++) {
+					if (slot_ctr[s] > base_ctr) {
 						mask |= (1u << s);
 					}
 				}
@@ -1169,8 +1330,8 @@ void GoldNetMultiplayer::_server_tick() {
 					pr.leave_wait[rid] = 0; // 0 = queued, not yet sent (seq 0 is reserved elsewhere)
 				}
 			}
-			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
-				pr.leave_wait.erase(kv.key); // re-entered → cancel any pending leave
+			for (const uint32_t &fid : frame) {
+				pr.leave_wait.erase(fid); // re-entered → cancel any pending leave
 			}
 			// Emit leaves bounded per snapshot: a fresh peer's seed can queue hundreds of leaves at once
 			// (every out-of-PVS entity on a big map), and dumping them all in one frame blows past the MTU,
@@ -1192,15 +1353,15 @@ void GoldNetMultiplayer::_server_tick() {
 			for (int ri = 0; ri < retired_leaves.size(); ri++) {
 				pr.leave_wait.erase(retired_leaves[ri]);
 			}
-			pr.relevant.clear();
-			for (const KeyValue<uint32_t, Vector<Variant>> &kv : frame) {
-				pr.relevant.insert(kv.key);
-			}
+			// `relevant` IS this frame's visible set — the diff above has already consumed the
+			// previous one, so assign rather than clear-and-reinsert every id one at a time.
+			pr.relevant = frame;
 		}
 
 		int slot = seq & (RING - 1);
 		pr.frames[slot] = frame;
 		pr.frame_seq[slot] = seq;
+		pr.frame_ctr[slot] = snapshot_ctr;
 
 		Ref<StreamPeerBuffer> buf;
 		buf.instantiate();
@@ -1503,6 +1664,14 @@ Error GoldNetMultiplayer::_poll() {
 	// Pump the send-side sim every poll on BOTH ends: a client delays its input RPCs here (the
 	// client→server leg), a server its snapshots + RPCs (server→client). Also advances the spike timer.
 	_sim_pump(now);
+	// A peerless MultiplayerAPI has no unique id to report, and asking for one logs an error.
+	// That is a normal state, not a broken one — the API sits peerless before the first session
+	// and again after one ends (including a join the server refused because it was full) — and
+	// because this runs every poll, one error becomes a continuous stream for as long as the
+	// game is open. Nothing below applies without a peer: the server branch needs one anyway.
+	if (inner->get_multiplayer_peer().is_null()) {
+		return e;
+	}
 	if (inner->get_unique_id() == 1) {
 		_drain_pending_spawns(); // every poll — pick up spawns promptly
 		_detect_despawns();

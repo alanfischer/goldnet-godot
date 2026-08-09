@@ -161,6 +161,64 @@ reliable-ordered replication for real-time state on adverse networks.
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
 
+## What we wish Godot had
+
+Every item here is a workaround in this repo, not a wishlist. They're recorded so the next
+person hitting one knows it's the engine, not the design — and so they can be deleted if
+upstream ever closes the gap.
+
+**1. A change notification for replicated properties.** There is no way to learn that a
+property was written: no `NOTIFICATION_PROPERTY_CHANGED`, no per-property signal, and no way
+to install a write barrier on another object's property from GDExtension (`_set`/setters only
+fire for the script that declares them). So the only way to discover what changed is to read
+everything and compare. Godot's own `property_get_watch` works the same way — it re-reads at
+`replication_interval` — so this isn't a mechanism being withheld, it doesn't exist.
+
+*Forces:* the `push_dirty` mode and its `mark_dirty()` API, where the game promises to announce
+its own writes. On a 390-entity map that turned a 2.8 ms/tick poll into 0.21 ms, but it makes a
+missed call a silent staleness bug, which is why `dirty_audit` exists to hunt for them.
+*Would fix it:* a `property_changed` notification an object can opt into, or a synchronizer mode
+where the setter marks the sync dirty instead of a poll discovering it — what Unreal's property
+dirtying and Source's `SendProp` change flags do.
+
+**2. `MultiplayerSynchronizer::is_visible_to()` bound to GDExtension.** The engine already has
+per-peer visibility with filter callbacks, but the query isn't exposed, so an extension can't ask
+"is this sync visible to peer N" through the engine's own filter chain.
+
+*Forces:* goldnet reads `is_visibility_public()` / `get_visibility_for()` directly, which means
+the game must push per-peer visibility itself every net tick (WizardWars does this in
+`NetworkManager.push_pvs_visibility`) rather than registering a filter and letting the engine
+answer. Visibility *filters* are effectively unusable from an extension.
+
+**3. A spawner you can see before its first spawn.** `MultiplayerSpawner` is only revealed to a
+MultiplayerAPI via `object_configuration_add` — which fires on the first spawn, by which point
+the spawn data is already gone.
+
+*Forces:* `_wrap_spawner` hooks `SceneTree.node_added` plus a one-time scan of the existing tree,
+and replaces the spawner's `spawn_function` with a trampoline purely to capture reconstruction
+data. A `spawner_registered` hook, or spawn data available on the configuration callback, would
+delete all of it.
+
+**4. Runtime-added synchronizers that actually pair.** A `MultiplayerSynchronizer` created in
+code gets no replication-ID handshake and never pairs with its remote counterpart — it has to be
+baked into the `.tscn`.
+
+*Forces:* consumers must ship scenes with synchronizers pre-baked (see WizardWars'
+`remote_player.tscn`), so anything assembled at runtime needs a scene file it would not otherwise
+need. Only the parts that can't live in a scene — a per-peer visibility `Callable`, receive hooks
+— get wired in code.
+
+**5. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
+metadata, so an extension that wants a hint per slot (goldnet's quantization tags: `angle16`,
+`half`, `vec3_half`) has nowhere in the config to put it.
+
+*Forces:* the hints ride a node `meta` dictionary (`gn_quant`) keyed by property leaf name, which
+is a second source of truth that has to be kept aligned with the config by hand.
+
+**Not a gap, just the floor:** `get_indexed` across the GDExtension boundary costs ~0.8 µs per
+slot, and after caching the resolved read plan that's essentially all the read loop is. Reading
+fewer properties is the only way past it — hence (1).
+
 ## Building
 
 ```bash
