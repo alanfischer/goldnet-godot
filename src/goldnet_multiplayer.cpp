@@ -36,11 +36,15 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 // collection, mask building, and the apply loop all key off this.
 static const int MAX_SYNC_SLOTS = 32;
 
-// Snapshot wire-protocol magic + version, written as the first u32 of every snapshot. Bump the low
-// byte on any wire-format change so a client talking to a mismatched build fails loudly (one clear
-// warning + dropped snapshot) instead of misparsing every packet into a flood of decode errors.
-// 'G''N''S' + version. Old builds (no magic) start with a small seq value, which never matches.
-static const uint32_t GN_SNAPSHOT_MAGIC = 0x474E5302u; // "GNS" + v2 (v2 added spawn-lazy + leave section)
+// Snapshot wire-protocol version, written as the first byte of every snapshot. Bump on any
+// wire-format change so a client talking to a mismatched build fails loudly (one clear warning +
+// dropped snapshot) instead of misparsing every packet into a flood of decode errors. A single
+// byte is plenty — this only has to distinguish "same build" from "not", not identify goldnet's
+// framing (the packet already arrives via the "_gn_recv" RPC, which is identification enough).
+// v3: changed-field mask is a uvarint (was a fixed u32); magic shrank from a 4-byte "GNS"+version
+// tag to this 1-byte version; empty snapshots (nothing changed/spawned/despawned/left) are no
+// longer sent at all.
+static const uint8_t GN_SNAPSHOT_VERSION = 3;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -105,6 +109,8 @@ static const float GN_TAU = goldnet::TAU;
 // reach them without a running engine; these are thin bindings to StreamPeerBuffer.
 static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) { goldnet::put_varint(buf, p_v); }
 static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_varint(buf); }
+static void gn_put_uvarint(const Ref<StreamPeerBuffer> &buf, uint32_t p_v) { goldnet::put_uvarint(buf, p_v); }
+static uint32_t gn_get_uvarint(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_uvarint(buf); }
 
 // IEEE binary16 via StreamPeer's built-in half codec (round-to-nearest, handles subnormals).
 static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_half(f); }
@@ -1295,7 +1301,7 @@ void GoldNetMultiplayer::_server_tick() {
 				continue; // unchanged since the acked baseline — costs nothing
 			}
 			body->put_u32(net_id);
-			body->put_u32(mask);
+			gn_put_uvarint(body, mask); // most entities set only the low few bits — 1 byte, not 4
 			const Vector<uint8_t> &q = *ents[i].quant;
 			for (int s = 0; s < vals.size(); s++) {
 				if (mask & (1u << s)) {
@@ -1358,6 +1364,15 @@ void GoldNetMultiplayer::_server_tick() {
 			pr.relevant = frame;
 		}
 
+		// Nothing to report: no changed entity, no spawn/despawn/leave owed to this peer. Sending
+		// would cost a header-only packet (magic/seq/timestamp/counts) for zero content — a real,
+		// always-on floor while the world (or this peer's slice of it) is fully static. `seq` is
+		// simply left unused; nothing above stamped a wait-map with it (that only happens when one
+		// of these counts is nonzero), so skipping costs nothing to reconcile later.
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0) {
+			continue;
+		}
+
 		int slot = seq & (RING - 1);
 		pr.frames[slot] = frame;
 		pr.frame_seq[slot] = seq;
@@ -1365,7 +1380,7 @@ void GoldNetMultiplayer::_server_tick() {
 
 		Ref<StreamPeerBuffer> buf;
 		buf.instantiate();
-		buf->put_u32(GN_SNAPSHOT_MAGIC);
+		buf->put_u8(GN_SNAPSHOT_VERSION);
 		buf->put_u16(seq);
 		buf->put_u16(base_seq);
 		buf->put_u32(now);
@@ -1407,7 +1422,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 
 	// Protocol guard: a mismatched goldnet build (different wire format) would misparse every field.
 	// Fail loudly once and drop, rather than flooding the log with decode errors.
-	if (buf->get_u32() != GN_SNAPSHOT_MAGIC) {
+	if (buf->get_u8() != GN_SNAPSHOT_VERSION) {
 		if (!warned_protocol_mismatch) {
 			warned_protocol_mismatch = true;
 			UtilityFunctions::push_error("goldnet: snapshot protocol mismatch — the server and client are "
@@ -1492,7 +1507,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 
 	for (int i = 0; i < count; i++) {
 		uint32_t net_id = buf->get_u32();
-		uint32_t mask = buf->get_u32();
+		uint32_t mask = gn_get_uvarint(buf);
 
 		MultiplayerSynchronizer *sync = nullptr;
 		if (netid_to_objid.has(net_id)) {

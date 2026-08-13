@@ -87,6 +87,46 @@ static void test_varint_stream() {
 	printf("  varint stream framing: ok\n");
 }
 
+// --- unsigned varint (bitmask encoding) ---
+
+static void test_uvarint_roundtrip() {
+	const uint32_t values[] = {
+		0, 1, 2, 63, 64, 127, 128, 8191, 8192, 16383, 16384,
+		0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu,
+	};
+	for (uint32_t v : values) {
+		FakeBuf buf;
+		put_uvarint(&buf, v);
+		buf.rewind();
+		uint32_t got = get_uvarint(&buf);
+		CHECK(got == v);
+		CHECK(buf.read_pos == buf.size());
+	}
+	printf("  uvarint roundtrip: ok\n");
+}
+
+static void test_uvarint_widths() {
+	struct Case {
+		uint32_t value;
+		size_t bytes;
+	};
+	// This is what backs the changed-field bitmask on the wire: a handful of low bits
+	// set (the common case — few sync properties per entity) must cost one byte, not
+	// the fixed 4 bytes a plain u32 write would always cost.
+	const Case cases[] = {
+		{ 0, 1 }, { 1, 1 }, { 0x7F, 1 },       // fits in 7 bits: one byte
+		{ 0x80, 2 }, { 0xFF, 2 }, { 0x3FFF, 2 },
+		{ 0x4000, 3 },
+		{ 0xFFFFFFFFu, 5 },                     // full 32-bit mask: worst case, still ok
+	};
+	for (const Case &c : cases) {
+		FakeBuf buf;
+		put_uvarint(&buf, c.value);
+		CHECK(buf.size() == c.bytes);
+	}
+	printf("  uvarint widths: ok\n");
+}
+
 // --- angle16 ---
 
 static void test_angle16_roundtrip() {
@@ -269,6 +309,8 @@ int main() {
 	test_varint_roundtrip();
 	test_varint_widths();
 	test_varint_stream();
+	test_uvarint_roundtrip();
+	test_uvarint_widths();
 	test_angle16_roundtrip();
 	test_angle16_wrap();
 	test_angle16_unbounded_input();

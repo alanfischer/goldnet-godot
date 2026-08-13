@@ -56,6 +56,35 @@ int64_t get_varint(const B &buf) {
 	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
 }
 
+// --- unsigned varint (no zig-zag) ---
+//
+// For values that are never negative — bitmasks, counts — zig-zag's doubling only
+// costs range for nothing in return, so this is the same 7-bits-at-a-time encoding
+// without it.
+
+template <typename B>
+void put_uvarint(const B &buf, uint32_t p_v) {
+	uint32_t u = p_v;
+	while (u >= 0x80) {
+		buf->put_u8((uint8_t)u | 0x80);
+		u >>= 7;
+	}
+	buf->put_u8((uint8_t)u);
+}
+
+template <typename B>
+uint32_t get_uvarint(const B &buf) {
+	uint32_t u = 0;
+	int shift = 0;
+	uint8_t b;
+	do {
+		b = buf->get_u8();
+		u |= (uint32_t)(b & 0x7F) << shift;
+		shift += 7;
+	} while (b & 0x80);
+	return u;
+}
+
 // --- angle quantization ---
 //
 // A full turn folded onto a u16: ~0.0055° steps, 2 bytes instead of 4. The fold is
