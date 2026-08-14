@@ -164,12 +164,10 @@ Measured in WizardWars (ww_2fort + 4 bots, stationary headless clients, server�
 egress at the ENet socket), goldnet vs the **stock `MultiplayerSynchronizer`** path
 on the same build with the same PVS:
 
-> **Stale as of the wire-format v4 work** (uvarint mask, empty-snapshot skip, entity
-> budget, the `angle8`/`time_delta` tags). Those move per-snapshot bytes down and have
-> not been re-measured here — the numbers below predate them, so read them as goldnet's
-> floor rather than its current cost. Re-run the same WizardWars comparison before
-> quoting them again; the shape of the result (parity on bandwidth, divergence under
-> loss) is what the table is really for, and that part is unaffected.
+> **The table predates the wire-format v4 work** (uvarint mask, empty-snapshot skip,
+> entity budget, `angle8`/`time_delta`), so read it as goldnet's floor rather than its
+> current cost. What that work bought is measured separately below — the shape this
+> table is really for (parity on bandwidth, divergence under loss) is unaffected.
 
 | Condition | goldnet | stock |
 | --- | --- | --- |
@@ -188,6 +186,42 @@ reliable-ordered replication for real-time state on adverse networks.
 > Bandwidth wins over a *hand-rolled* RPC baseline are a separate story: goldnet
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
+
+### What the v4 wire work bought
+
+Same WizardWars scenario (ww_2fort, 4 AI bots, 4 stationary headless clients, 190 s
+runs), comparing this build against the pre-v4 one with the *game* held constant. The
+figure below is the **snapshot stream alone** — goldnet's own `dbg_bytes` under
+`GOLDNET_DEBUG=1`, not the ENet socket total. That distinction matters: snapshots are
+only about half of server egress here, the rest being ENet acks and the game's own
+`@rpc` traffic, so measuring at the socket dilutes the effect by roughly half.
+
+| | snapshot stream | total socket egress | over-MTU sends |
+| --- | --- | --- | --- |
+| pre-v4 | 12.4 KB/s (11.3–13.2) | 26.9 KB/s | 7 of 7 runs |
+| v4 | 6.2 KB/s (1.8–10.5) | ~21.8 KB/s | 0 of 14 runs |
+
+n=5 runs pre-v4, n=10 v4, averaged over each run's steady-state tail. **Roughly half
+the snapshot bytes**, and every v4 run came in below every pre-v4 run (10.5 < 11.3).
+
+Read the spread, not just the mean. Pre-v4 is tight because it pays a floor: a snapshot
+per peer per tick whether or not anything changed. v4's cost tracks actual change, so it
+ranges from near the pre-v4 figure when a peer's PVS is busy down to **0.2–0.3 KB/s when
+it is idle** — which is the clock keepalive and nothing else (17 B header x 4 Hz x 4
+peers = 272 B/s, and that is what the log shows). Most of the win is that floor
+disappearing; the rest is the uvarint mask. A busy server should expect the low end of
+the improvement, an idle or lightly-populated one the high end.
+
+Two caveats worth keeping. Adopting the *game-side* quantization hints on top
+(`vec3_half`/`angle8`/`time_delta` — the consumer's own change, not goldnet's) did not
+separate from goldnet's schema-agnostic wins at this sample size: 6.2 vs 6.1 KB/s, well
+inside the run-to-run spread. And this ran on a 4-core container with server, bots, and
+clients on one box, so the absolute numbers are not comparable to the table above —
+only the paired comparison is.
+
+The over-MTU column is the entity budget doing its job, and it is the least ambiguous
+result here: pre-v4 emitted `Sending 1991 bytes unreliably which is above the MTU (1392)`
+on a joining client's first full baseline in **every** run. With the budget, never.
 
 ## What we wish Godot had
 
