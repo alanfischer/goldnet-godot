@@ -43,6 +43,14 @@ void put_varint(const B &buf, int64_t p_v) {
 	buf->put_u8((uint8_t)u);
 }
 
+// The shift guard is not hygiene: a snapshot is unreliable UDP whose bytes are attacker- or
+// corruption-reachable, and a run of continuation bytes (0x80..0xFF) longer than the encoding can
+// produce would shift past the width of `u` — undefined behaviour, which the test suite's
+// -fno-sanitize-recover UBSan turns into an abort. Stop consuming payload bits once the type is
+// full; the loop still drains the continuation run so the stream stays framed for whatever follows.
+static const int VARINT_MAX_SHIFT_64 = 63;
+static const int VARINT_MAX_SHIFT_32 = 28;
+
 template <typename B>
 int64_t get_varint(const B &buf) {
 	uint64_t u = 0;
@@ -50,8 +58,10 @@ int64_t get_varint(const B &buf) {
 	uint8_t b;
 	do {
 		b = buf->get_u8();
-		u |= (uint64_t)(b & 0x7F) << shift;
-		shift += 7;
+		if (shift <= VARINT_MAX_SHIFT_64) {
+			u |= (uint64_t)(b & 0x7F) << shift;
+			shift += 7;
+		}
 	} while (b & 0x80);
 	return (int64_t)(u >> 1) ^ -(int64_t)(u & 1); // un-zig-zag
 }
@@ -72,6 +82,8 @@ void put_uvarint(const B &buf, uint32_t p_v) {
 	buf->put_u8((uint8_t)u);
 }
 
+// Same shift guard as get_varint, and it matters more here: at 32 bits a malformed stream runs out
+// of width after five bytes rather than ten, so it is that much easier to reach.
 template <typename B>
 uint32_t get_uvarint(const B &buf) {
 	uint32_t u = 0;
@@ -79,8 +91,10 @@ uint32_t get_uvarint(const B &buf) {
 	uint8_t b;
 	do {
 		b = buf->get_u8();
-		u |= (uint32_t)(b & 0x7F) << shift;
-		shift += 7;
+		if (shift <= VARINT_MAX_SHIFT_32) {
+			u |= (uint32_t)(b & 0x7F) << shift;
+			shift += 7;
+		}
 	} while (b & 0x80);
 	return u;
 }

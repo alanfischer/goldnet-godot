@@ -53,9 +53,16 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		Vector<uint8_t> quant;
 		bool quant_read = false;
 		// Peer-invariant importance weight for priority-ordered overflow (see PeerRing::stale_since
-		// and MAX_ENTITY_BODY_BYTES), from the "gn_priority" meta (a float; default 1.0 if unset).
+		// and SAFE_PACKET_BYTES), from the "gn_priority" meta (a float; default 1.0 if unset).
 		// Read and cached the same lazy way as quant — by the first tick, the game has had the
 		// chance to set it.
+		//
+		// Read ONCE, like quant: changing the meta after the entity's first tick has no effect.
+		// That is a sharper limit here than it is for quant, because importance is the more
+		// plausible thing to want to vary at runtime ("this corpse stopped mattering"). Games
+		// needing that today should express it through visibility (set_visibility_for) instead,
+		// which is consulted every tick. Re-reading per tick is a get_meta across the GDExtension
+		// boundary per entity, which is the cost the cached read plan exists to avoid.
 		float priority = 1.0f;
 		bool priority_read = false;
 		// Change tracking, stamped ONCE per snapshot tick (see _server_tick). The values an entity
@@ -186,6 +193,11 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// which the ring already supports (it is the same path a lost snapshot takes).
 		uint32_t interval_ms = 0;
 		uint32_t last_sent_ms = 0;
+		// When a snapshot was last actually EMITTED to this peer. Distinct from last_sent_ms, which
+		// stamps the send-cadence check and advances even on a tick that decides to send nothing:
+		// this one gates the clock keepalive (see GN_CLOCK_KEEPALIVE_MS), which has to know how long
+		// the peer has really been without a header, not how long since it was last considered.
+		uint32_t last_packet_ms = 0;
 		// Priority-ordered overflow (see MAX_ENTITY_BODY_BYTES in _server_tick). net_id -> the
 		// snapshot_ctr this entity FIRST had an unsent pending change for THIS peer; cleared once
 		// it's actually written. The gap between that and the current snapshot_ctr is how many

@@ -127,6 +127,64 @@ static void test_uvarint_widths() {
 	printf("  uvarint widths: ok\n");
 }
 
+// --- malformed varint streams ---
+//
+// A snapshot is unreliable UDP: its bytes are reachable by corruption on the wire and by
+// anyone who can send this port a packet. A decoder that only behaves on well-formed input
+// is therefore not enough. A continuation run longer than the encoding can actually produce
+// (every byte with the high bit set) used to shift past the width of the accumulator, which
+// is undefined behaviour — and since tests/CMakeLists.txt runs UBSan with
+// -fno-sanitize-recover, the shift itself is what these cases catch. Remove the guard in
+// goldnet_codec.h and they abort rather than merely returning something odd.
+//
+// The contract asserted here is deliberately weak on the VALUE — a malformed stream has no
+// right answer — and strict on everything else: terminate, consume the whole run so the next
+// field starts where the sender put it, and don't invoke UB getting there.
+
+static void test_uvarint_overlong_terminates() {
+	FakeBuf buf;
+	for (int i = 0; i < 9; i++) {
+		buf.put_u8(0xFF); // continuation bit set, payload bits all 1
+	}
+	buf.put_u8(0x00); // final byte, clears the run
+	buf.rewind();
+	(void)get_uvarint(&buf);
+	CHECK(buf.read_pos == buf.size()); // drained the whole run — stream stays framed
+	printf("  uvarint overlong run terminates and stays framed: ok\n");
+}
+
+static void test_varint_overlong_terminates() {
+	FakeBuf buf;
+	for (int i = 0; i < 14; i++) {
+		buf.put_u8(0xFF);
+	}
+	buf.put_u8(0x00);
+	buf.rewind();
+	(void)get_varint(&buf);
+	CHECK(buf.read_pos == buf.size());
+	printf("  varint overlong run terminates and stays framed: ok\n");
+}
+
+static void test_uvarint_max_width_still_exact() {
+	// The guard must not clip a LEGAL encoding: 0xFFFFFFFF is five bytes with 28 as the
+	// final shift, exactly the boundary the guard tests against.
+	FakeBuf buf;
+	put_uvarint(&buf, 0xFFFFFFFFu);
+	CHECK(buf.size() == 5);
+	buf.rewind();
+	CHECK(get_uvarint(&buf) == 0xFFFFFFFFu);
+	printf("  uvarint max-width value survives the shift guard: ok\n");
+}
+
+static void test_varint_max_width_still_exact() {
+	FakeBuf buf;
+	put_varint(&buf, INT64_MIN);
+	CHECK(buf.size() == 10);
+	buf.rewind();
+	CHECK(get_varint(&buf) == INT64_MIN);
+	printf("  varint max-width value survives the shift guard: ok\n");
+}
+
 // --- angle16 ---
 
 static void test_angle16_roundtrip() {
@@ -368,6 +426,10 @@ int main() {
 	test_varint_stream();
 	test_uvarint_roundtrip();
 	test_uvarint_widths();
+	test_uvarint_overlong_terminates();
+	test_varint_overlong_terminates();
+	test_uvarint_max_width_still_exact();
+	test_varint_max_width_still_exact();
 	test_angle16_roundtrip();
 	test_angle16_wrap();
 	test_angle16_unbounded_input();

@@ -32,18 +32,31 @@ static const uint32_t DEFAULT_INTERVAL_MS = 33;
 // Capping keeps each frame under MTU; leaves are reliable-until-acked, so they drain over a few ticks.
 static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 
-// Hard MTU-safety ceiling for the per-peer entity-delta body, the same MTU hazard as the leave cap
-// above but on the higher-stakes path: a peer's first full baseline (every owned sync at once) or
-// a burst of simultaneous changes (an explosion, a big fight) has no cap today, so it can overrun
-// the MTU, get dropped, and — because the peer never acks it — resend in full every tick forever.
-// Budgeted under a conservative safe-UDP-payload size (1200 B), leaving room for the header and
-// the spawn/despawn/leave sections built earlier in the same packet. A configured bandwidth_bps
-// (see PeerRing::bandwidth_bps) can only tighten this further, never relax it — this is the one
-// number that must never be exceeded regardless of rate config. An entity that doesn't fit isn't
-// lost: it's simply left out of `included` (see below) so the acked-baseline compare still sees it
-// as changed, and its overflow priority (PeerRing::stale_since) only goes up — it outranks
-// everything that fit this tick on the next one, the same self-heal the leave cap relies on.
-static const int MAX_ENTITY_BODY_BYTES = 1100;
+// Conservative safe-UDP-payload ceiling for a WHOLE snapshot, the same MTU hazard as the leave cap
+// above but across the packet rather than one section of it: a peer's first full baseline (every
+// owned sync at once) or a burst of simultaneous changes (an explosion, a big fight) can overrun
+// the MTU, fragment, and — since a dropped fragment costs the whole packet, and an unacked packet
+// is resent — thrash. The entity-delta body gets whatever is left of this after the header and the
+// spawn/despawn/leave sections, all of which are built BEFORE it and measured rather than
+// estimated. A configured bandwidth_bps (see PeerRing::bandwidth_bps) can only tighten the
+// remainder further, never relax it. An entity that doesn't fit isn't lost: it's simply left out of
+// `included` (see below) so the acked-baseline compare still sees it as changed, and its overflow
+// priority (PeerRing::stale_since) only goes up — it outranks everything that fit this tick on the
+// next one, the same self-heal the leave cap relies on.
+static const int SAFE_PACKET_BYTES = 1200;
+
+// Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, and the four
+// section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when
+// sizing the entity-delta budget, so the budget describes the packet rather than one section.
+static const int GN_SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2;
+
+// Longest a peer may go with no snapshot at all. Every snapshot header carries the server's
+// send-time, which the client re-emits as `server_time_received` to drive ServerClock — an
+// always-on clock feed independent of entity traffic. Skipping empty snapshots (see _server_tick)
+// would silence that feed exactly when the world is idle, leaving the client's clock free-running
+// on local time, so an otherwise-empty snapshot still goes out this often to keep it fed. Cheap:
+// a header-only packet at 4 Hz is ~68 B/s, against the ~450 B/s the skip saves at a 30 Hz tick.
+static const uint32_t GN_CLOCK_KEEPALIVE_MS = 250;
 
 // Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
 // collection, mask building, and the apply loop all key off this.
@@ -203,6 +216,13 @@ static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uin
 			return;
 		}
 		case GN_T_TIME_DELTA:
+			// Only meaningful for an integer ms stamp. The decoder reconstructs an INT, so applying
+			// this to a float slot would silently truncate the value AND change its type on the
+			// client — a hint doing damage rather than saving bytes. Fall through to the type-based
+			// encoding instead, the same way an unknown hint name does.
+			if (v.get_type() != Variant::INT) {
+				break;
+			}
 			buf->put_u8(GN_T_TIME_DELTA);
 			// Zigzag varint of the signed gap to THIS packet's own send time. A stamp from the same
 			// tick (the overwhelmingly common case — an entity publishes its shadow state and the
@@ -1383,6 +1403,10 @@ void GoldNetMultiplayer::_server_tick() {
 			float score;
 		};
 		Vector<EntCandidate> candidates;
+		// Set when any candidate's score departs from the flat 1.0 default — a pending wait or a
+		// game-supplied weight. While it stays false every score is identical and sorting is a
+		// no-op, so pass 2 skips it (see there).
+		bool needs_sort = false;
 		int n_ents = ents.size();
 		for (int idx = 0; idx < n_ents; idx++) {
 			MultiplayerSynchronizer *sync = ents[idx].sync;
@@ -1430,58 +1454,17 @@ void GoldNetMultiplayer::_server_tick() {
 			c.net_id = net_id;
 			c.mask = mask;
 			c.score = (float)(wait_ticks + 1) * ents[idx].priority;
+			if (c.score != 1.0f) {
+				needs_sort = true;
+			}
 			candidates.push_back(c);
 		}
 
-		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
-		// A plain round-robin only guaranteed everyone an equal turn; this guarantees the actual
-		// most-starved entity is the one that gets it, and lets a game say "players matter more
-		// than corpses" (gn_priority) without goldnet knowing what either of those are.
-		struct EntCandidateGreater {
-			bool operator()(const EntCandidate &a, const EntCandidate &b) const { return a.score > b.score; }
-		};
-		candidates.sort_custom<EntCandidateGreater>();
-
-		// MTU-safety ceiling always applies; a configured bandwidth budget only ever tightens it
-		// further, converted to a per-packet budget via this peer's own send interval (falling
-		// back to the server's cadence for an unthrottled peer, which sends every tick). Per-peer
-		// (set_peer_bandwidth_bps) wins if set; otherwise the global default (set_bandwidth_bps)
-		// applies to everyone, unlike interval_ms/replication cadence, which has no such global
-		// fallback — bandwidth caps are commonly configured once for the whole server in practice.
-		int peer_budget = MAX_ENTITY_BODY_BYTES;
-		uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default;
-		if (effective_bps > 0) {
-			uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : cached_min_interval_ms;
-			int rate_budget = (int)(((uint64_t)effective_bps * iv) / 1000);
-			peer_budget = MIN(peer_budget, rate_budget);
-		}
-
-		for (int ci = 0; ci < candidates.size(); ci++) {
-			const EntCandidate &c = candidates[ci];
-			// A peer's first full baseline, or many entities changing in the same tick (an
-			// explosion, a big fight), could otherwise grow this body past a safe UDP payload, get
-			// dropped, and — since it's never acked — resend in full forever. Past budget, leave
-			// this entity out (see the `included` comment above for why that's safe) and mark it
-			// waiting so it outranks everything else next tick if it's still unlucky then.
-			if (body->get_size() >= peer_budget) {
-				if (!pr.stale_since.has(c.net_id)) {
-					pr.stale_since[c.net_id] = snapshot_ctr;
-				}
-				continue;
-			}
-			body->put_u32(c.net_id);
-			gn_put_uvarint(body, c.mask); // most entities set only the low few bits — 1 byte, not 4
-			const Vector<uint8_t> &q = *ents[c.idx].quant;
-			const Vector<Variant> &vals = *ents[c.idx].vals;
-			for (int s = 0; s < vals.size(); s++) {
-				if (c.mask & (1u << s)) {
-					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO, now);
-				}
-			}
-			included.insert(c.net_id);
-			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
-			changed++;
-		}
+		// Pass 2 (writing the winners) does NOT run here — it runs after the leave section below,
+		// because the entity budget is whatever the packet has left once every other section is
+		// built, and the leave section is the last of them. Only `frame` is needed to diff leaves,
+		// and pass 1 has already produced it. Wire order is unchanged: the buffer is assembled at
+		// the end of the peer loop in header/spawn/despawn/leave/changed order regardless.
 
 		// Relevance leaves (OPT-IN — off unless the consumer game enables relevance_events): owned_syncs
 		// that were in this peer's PVS last tick but aren't in `frame` now, delivered reliable-until-acked
@@ -1536,14 +1519,89 @@ void GoldNetMultiplayer::_server_tick() {
 			pr.relevant = frame;
 		}
 
+		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
+		// A plain round-robin only guaranteed everyone an equal turn; this guarantees the actual
+		// most-starved entity is the one that gets it, and lets a game say "players matter more
+		// than corpses" (gn_priority) without goldnet knowing what either of those are.
+		//
+		// Skip the sort when every score is 1.0 — no entity is carrying a wait (pass 1 saw an empty
+		// stale_since for all of them) and no game has weighted anything. That is the steady state
+		// on a server that never overflows its budget, and it keeps this off the hot path the
+		// per-tick read loop was tuned around.
+		if (needs_sort) {
+			struct EntCandidateGreater {
+				bool operator()(const EntCandidate &a, const EntCandidate &b) const { return a.score > b.score; }
+			};
+			candidates.sort_custom<EntCandidateGreater>();
+		}
+
+		// What's left of a safe UDP payload after the header and every section already built. Those
+		// are measured, not estimated: the spawn section in particular carries put_var game data of
+		// no fixed size, so a guessed reservation is exactly the kind of arithmetic that silently
+		// stops holding. A configured bandwidth budget only ever tightens the remainder further,
+		// converted to a per-packet allowance via this peer's own send interval (falling back to the
+		// server's cadence for an unthrottled peer, which sends every tick). Per-peer
+		// (set_peer_bandwidth_bps) wins if set; otherwise the global default (set_bandwidth_bps)
+		// applies to everyone, unlike interval_ms/replication cadence, which has no such global
+		// fallback — bandwidth caps are commonly configured once for the whole server in practice.
+		int peer_budget = SAFE_PACKET_BYTES - GN_SNAPSHOT_HEADER_BYTES
+				- (int)spawn_body->get_size() - (int)despawn_body->get_size() - (int)leave_body->get_size();
+		uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default;
+		if (effective_bps > 0) {
+			uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : cached_min_interval_ms;
+			int rate_budget = (int)(((uint64_t)effective_bps * iv) / 1000);
+			peer_budget = MIN(peer_budget, rate_budget);
+		}
+
+		for (int ci = 0; ci < candidates.size(); ci++) {
+			const EntCandidate &c = candidates[ci];
+			// Past budget, leave this entity out (see the `included` comment above for why that's
+			// safe) and mark it waiting so it outranks everything else next tick if it's still
+			// unlucky then.
+			//
+			// `ci > 0` makes the highest-scoring candidate unconditional, which is what guarantees
+			// forward progress. Without it a budget of zero or less starves replication completely
+			// and silently — reachable two ways: a bandwidth_bps low enough that bps*interval/1000
+			// truncates to 0 (e.g. 30 B/s at a 33 ms tick), or a packet whose spawn section has
+			// already spent the whole MTU. Both are states the stream must drain out of, and it can
+			// only drain by sending something. One entity of overrun beats a permanent stall, and
+			// it is self-limiting: the sections that crowded the budget out are reliable-until-
+			// acked, so they retire and the budget reopens.
+			if (ci > 0 && body->get_size() >= peer_budget) {
+				if (!pr.stale_since.has(c.net_id)) {
+					pr.stale_since[c.net_id] = snapshot_ctr;
+				}
+				continue;
+			}
+			body->put_u32(c.net_id);
+			gn_put_uvarint(body, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			const Vector<uint8_t> &q = *ents[c.idx].quant;
+			const Vector<Variant> &vals = *ents[c.idx].vals;
+			for (int s = 0; s < vals.size(); s++) {
+				if (c.mask & (1u << s)) {
+					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO, now);
+				}
+			}
+			included.insert(c.net_id);
+			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
+			changed++;
+		}
+
 		// Nothing to report: no changed entity, no spawn/despawn/leave owed to this peer. Sending
-		// would cost a header-only packet (magic/seq/timestamp/counts) for zero content — a real,
-		// always-on floor while the world (or this peer's slice of it) is fully static. `seq` is
-		// simply left unused; nothing above stamped a wait-map with it (that only happens when one
-		// of these counts is nonzero), so skipping costs nothing to reconcile later.
-		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0) {
+		// would cost a header-only packet for zero content — a real, always-on floor while the
+		// world (or this peer's slice of it) is fully static. `seq` is simply left unused; nothing
+		// above stamped a wait-map with it (that only happens when one of these counts is nonzero),
+		// so skipping costs nothing to reconcile later.
+		//
+		// Except that the header is not purely overhead: it carries server_time, the client's only
+		// clock feed (see GN_CLOCK_KEEPALIVE_MS). So "nothing to report" only earns a skip while
+		// that feed is still fresh. last_packet_ms == 0 is a peer that has never been sent
+		// anything — its first snapshot must go out regardless, or the clock never starts.
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0
+				&& pr.last_packet_ms != 0 && now - pr.last_packet_ms < GN_CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
+		pr.last_packet_ms = now;
 
 		int slot = seq & (RING - 1);
 		pr.frames[slot] = included;
@@ -1613,8 +1671,10 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	}
 
 	// Surface the header clock: every snapshot the server ticks out carries its send-time, so this is an
-	// always-on server-time feed (independent of entity traffic) a client can drive a clock estimator from
-	// — no separate beacon RPC needed on the goldnet path. Emitted after the stale-seq drop (a reordered
+	// always-on server-time feed a client can drive a clock estimator from — no separate beacon RPC needed
+	// on the goldnet path. "Always-on" is a guarantee the SERVER maintains rather than a side effect of
+	// entity traffic: it skips snapshots with nothing to report, but only until the feed would go stale,
+	// then sends a header-only one anyway (see GN_CLOCK_KEEPALIVE_MS). Emitted after the stale-seq drop (a reordered
 	// snapshot's time is <= one we've already fed, so ServerClock would reject it — no point dispatching)
 	// but before the baseline-resolution drop below, so a forward snapshot we can't reconstruct for state
 	// still contributes its valid clock sample. See ServerClock.
