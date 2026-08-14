@@ -112,6 +112,28 @@ float get_angle16(const B &buf) {
 	return ((float)buf->get_u16() / 65536.0f) * TAU;
 }
 
+// A full turn folded onto a u8: ~1.4° steps (256 positions) — matching classic GoldSrc/Quake angle
+// precision, half the cost of angle16. Same fold/NaN/wrap handling, at 8 bits instead of 16: safe
+// for a remote avatar's rendered orientation, where sub-degree precision rarely matters.
+
+template <typename B>
+void put_angle8(const B &buf, float radians) {
+	float t = fmodf(radians, TAU);
+	if (std::isnan(t)) {
+		t = 0.0f;
+	} else if (t < 0.0f) {
+		t += TAU;
+	}
+	// [0,TAU) → [0,256); cast through uint32 then mask to 8 bits so the 256 boundary wraps to 0,
+	// same reasoning as angle16's 65536 boundary above.
+	buf->put_u8((uint8_t)((uint32_t)((t / TAU) * 256.0f) & 0xFFu));
+}
+
+template <typename B>
+float get_angle8(const B &buf) {
+	return ((float)buf->get_u8() / 256.0f) * TAU;
+}
+
 // --- sequence comparison ---
 //
 // Frame sequences are uint16 and roll over roughly every 36 minutes at 30 Hz, so they

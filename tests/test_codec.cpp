@@ -249,6 +249,63 @@ static void test_angle16_output_range() {
 	printf("  angle16 output range (all 65536): ok\n");
 }
 
+// --- angle8 (classic GoldSrc-precision angle, half the cost of angle16) ---
+
+static const float STEP8 = TAU / 256.0f;
+
+static void test_angle8_roundtrip() {
+	const float angles[] = {
+		0.0f, 0.1f, 1.0f, 1.5707963f /*PI/2*/, 3.1415926f /*PI*/,
+		4.712389f /*3PI/2*/, 6.2831f /*just under TAU*/,
+	};
+	for (float a : angles) {
+		FakeBuf buf;
+		put_angle8(&buf, a);
+		buf.rewind();
+		CHECK(approx(get_angle8(&buf), a, STEP8 * 2.0f));
+		CHECK(buf.size() == 1); // the entire point: 1 byte, not 2 or 4
+	}
+	printf("  angle8 roundtrip: ok\n");
+}
+
+static void test_angle8_wrap() {
+	FakeBuf zero, tau;
+	put_angle8(&zero, 0.0f);
+	put_angle8(&tau, TAU);
+	CHECK(zero.bytes == tau.bytes);
+
+	FakeBuf neg;
+	put_angle8(&neg, -0.1f);
+	neg.rewind();
+	CHECK(approx(get_angle8(&neg), TAU - 0.1f, STEP8 * 2.0f));
+	printf("  angle8 wrap: ok\n");
+}
+
+static void test_angle8_nonfinite() {
+	// Same UB hazard put_angle16 guards against (NaN/inf through fmodf), at the 8-bit width.
+	const float bad[] = { NAN, -NAN, INFINITY, -INFINITY };
+	for (float a : bad) {
+		FakeBuf buf;
+		put_angle8(&buf, a);
+		CHECK(buf.size() == 1);
+		buf.rewind();
+		CHECK(get_angle8(&buf) == 0.0f);
+	}
+	printf("  angle8 non-finite input sanitizes to 0: ok\n");
+}
+
+static void test_angle8_output_range() {
+	// Exhaustive — only 256 values, cheap to sweep completely.
+	for (int i = 0; i < 256; i++) {
+		FakeBuf buf;
+		buf.put_u8((uint8_t)i);
+		buf.rewind();
+		float a = get_angle8(&buf);
+		CHECK(a >= 0.0f && a < TAU);
+	}
+	printf("  angle8 output range (all 256): ok\n");
+}
+
 // --- network-condition sim PRNG ---
 
 static void test_rng_reproducible() {
@@ -317,6 +374,10 @@ int main() {
 	test_angle16_nonfinite();
 	test_angle16_upper_boundary();
 	test_angle16_output_range();
+	test_angle8_roundtrip();
+	test_angle8_wrap();
+	test_angle8_nonfinite();
+	test_angle8_output_range();
 	test_rng_reproducible();
 	test_rng_seeds_differ();
 	test_rng_never_latches();
