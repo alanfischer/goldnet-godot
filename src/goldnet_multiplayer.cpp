@@ -32,14 +32,17 @@ static const uint32_t DEFAULT_INTERVAL_MS = 33;
 // Capping keeps each frame under MTU; leaves are reliable-until-acked, so they drain over a few ticks.
 static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 
-// Byte budget for the per-peer entity-delta body, the same MTU hazard as the leave cap above but
-// on the higher-stakes path: a peer's first full baseline (every owned sync at once) or a burst of
-// simultaneous changes (an explosion, a big fight) has no cap today, so it can overrun the MTU,
-// get dropped, and — because the peer never acks it — resend in full every tick forever. Budgeted
-// under a conservative safe-UDP-payload size (1200 B), leaving room for the header and the
-// spawn/despawn/leave sections built earlier in the same packet. An entity that doesn't fit isn't
+// Hard MTU-safety ceiling for the per-peer entity-delta body, the same MTU hazard as the leave cap
+// above but on the higher-stakes path: a peer's first full baseline (every owned sync at once) or
+// a burst of simultaneous changes (an explosion, a big fight) has no cap today, so it can overrun
+// the MTU, get dropped, and — because the peer never acks it — resend in full every tick forever.
+// Budgeted under a conservative safe-UDP-payload size (1200 B), leaving room for the header and
+// the spawn/despawn/leave sections built earlier in the same packet. A configured bandwidth_bps
+// (see PeerRing::bandwidth_bps) can only tighten this further, never relax it — this is the one
+// number that must never be exceeded regardless of rate config. An entity that doesn't fit isn't
 // lost: it's simply left out of `included` (see below) so the acked-baseline compare still sees it
-// as changed and retries it next tick — the same self-heal the leave cap relies on.
+// as changed, and its overflow priority (PeerRing::stale_since) only goes up — it outranks
+// everything that fit this tick on the next one, the same self-heal the leave cap relies on.
 static const int MAX_ENTITY_BODY_BYTES = 1100;
 
 // Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
@@ -154,6 +157,24 @@ static uint8_t gn_quant_from_name(const String &name) {
 		return GN_T_TIME_DELTA;
 	}
 	return GN_Q_AUTO;
+}
+
+// Read an entity's priority-ordered-overflow weight from its synchronizer's "gn_priority" meta —
+// a plain float (or int), not a per-slot dict like gn_quant, since importance is a property of the
+// whole entity, not one of its fields. Unset, non-numeric, or non-positive all fall back to 1.0 (a
+// non-positive weight would invert the staleness sort instead of just weighting it, which is never
+// what's intended).
+static float gn_read_priority(MultiplayerSynchronizer *p_sync) {
+	const StringName meta_key("gn_priority");
+	if (!p_sync->has_meta(meta_key)) {
+		return 1.0f;
+	}
+	Variant mv = p_sync->get_meta(meta_key);
+	if (mv.get_type() != Variant::FLOAT && mv.get_type() != Variant::INT) {
+		return 1.0f;
+	}
+	float v = (float)(double)mv;
+	return v > 0.0f ? v : 1.0f;
 }
 
 // p_now_ms is the CURRENT packet's own header timestamp — the reference GN_T_TIME_DELTA encodes
@@ -586,6 +607,7 @@ void GoldNetMultiplayer::_detect_despawns() {
 			}
 			pr.value.spawn_wait.erase(net_id);  // stop resending the (now void) spawn
 			pr.value.spawn_acked.erase(net_id); // and forget delivery, so a reused id re-spawns cleanly
+			pr.value.stale_since.erase(net_id); // and stop tracking overflow-priority for a dead entity
 		}
 		if (!needers.is_empty()) {
 			despawn_pending[net_id] = needers;
@@ -689,6 +711,22 @@ int GoldNetMultiplayer::get_peer_snapshot_interval_ms(int p_peer) const {
 	const PeerRing *pr = peer_rings.getptr(p_peer);
 	return pr ? (int)pr->interval_ms : 0;
 }
+
+void GoldNetMultiplayer::set_bandwidth_bps(int p_bps) {
+	bandwidth_bps_default = p_bps > 0 ? (uint32_t)p_bps : 0;
+}
+int GoldNetMultiplayer::get_bandwidth_bps() const {
+	return (int)bandwidth_bps_default;
+}
+void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
+	PeerRing &pr = peer_rings[p_peer]; // default-constructs: a budget may be set before the first tick
+	pr.bandwidth_bps = p_bps > 0 ? (uint32_t)p_bps : 0;
+}
+int GoldNetMultiplayer::get_peer_bandwidth_bps(int p_peer) const {
+	const PeerRing *pr = peer_rings.getptr(p_peer);
+	return pr ? (int)pr->bandwidth_bps : 0;
+}
+
 void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
 	dbg = p_enabled;
 }
@@ -986,6 +1024,11 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_peer_snapshot_interval_ms", "peer"), &GoldNetMultiplayer::get_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
+	ClassDB::bind_method(D_METHOD("set_bandwidth_bps", "bps"), &GoldNetMultiplayer::set_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("get_peer_bandwidth_bps", "peer"), &GoldNetMultiplayer::get_peer_bandwidth_bps);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
 	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
 	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
@@ -1190,6 +1233,7 @@ void GoldNetMultiplayer::_server_tick() {
 		const Vector<Variant> *vals;   // points at SyncEntry::last_vals — never copied
 		const Vector<uint8_t> *quant; // per-slot quantization tags (may be empty = all-auto)
 		const Vector<uint32_t> *slot_ctr; // when each slot last changed (SyncEntry::slot_ctr)
+		float priority; // gn_priority weight, default 1.0 — see PeerRing::stale_since
 	};
 	Vector<TickEnt> ents;
 	for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
@@ -1201,6 +1245,10 @@ void GoldNetMultiplayer::_server_tick() {
 		if (!kv.value.quant_read) {
 			_read_quant(sync, kv.value.quant);
 			kv.value.quant_read = true;
+		}
+		if (!kv.value.priority_read) {
+			kv.value.priority = gn_read_priority(sync);
+			kv.value.priority_read = true;
 		}
 		if (!kv.value.slots_cached) {
 			cache_slot_plan(sync, kv.value.slot_target_id, kv.value.slot_prop);
@@ -1227,14 +1275,9 @@ void GoldNetMultiplayer::_server_tick() {
 		e.quant = &kv.value.quant;
 		e.vals = &kv.value.last_vals;
 		e.slot_ctr = &kv.value.slot_ctr;
+		e.priority = kv.value.priority;
 		ents.push_back(e);
 	}
-
-	// Rotating start point for the entity loop below, shared by every peer this tick. Under
-	// sustained budget pressure (more changed entities than fit in one packet, tick after tick) a
-	// fixed iteration order would starve whatever sorts last forever; starting from a different
-	// offset each tick spreads the overflow so everyone's turn comes around within a few ticks.
-	int ent_rotate = ents.is_empty() ? 0 : (int)(snapshot_ctr % (uint32_t)ents.size());
 
 	for (int pi = 0; pi < due.size(); pi++) {
 		int peer = due[pi];
@@ -1329,9 +1372,19 @@ void GoldNetMultiplayer::_server_tick() {
 		Ref<StreamPeerBuffer> body;
 		body.instantiate();
 		uint16_t changed = 0;
+
+		// Pass 1: visibility + mask for every entity. Unchanged (mask == 0) entities are settled
+		// immediately; changed ones become overflow candidates, scored for pass 2 below rather than
+		// written in encounter order.
+		struct EntCandidate {
+			int idx;
+			uint32_t net_id;
+			uint32_t mask;
+			float score;
+		};
+		Vector<EntCandidate> candidates;
 		int n_ents = ents.size();
-		for (int i = 0; i < n_ents; i++) {
-			int idx = n_ents > 0 ? (i + ent_rotate) % n_ents : i;
+		for (int idx = 0; idx < n_ents; idx++) {
 			MultiplayerSynchronizer *sync = ents[idx].sync;
 			// Per-peer PVS. The game drives each synchronizer's peer_visibility via set_visibility_for
 			// once per net tick (NetworkManager.push_pvs_visibility), so this native read is the whole
@@ -1364,25 +1417,69 @@ void GoldNetMultiplayer::_server_tick() {
 			}
 			if (mask == 0) {
 				included.insert(net_id); // peer's existing value is already correct
+				pr.stale_since.erase(net_id); // no longer owed anything — clear any old overflow mark
 				continue; // unchanged since the acked baseline — costs nothing
 			}
-			// MTU guard: a peer's first full baseline, or many entities changing in the same tick
-			// (an explosion, a big fight), could otherwise grow this body past a safe UDP payload,
-			// get dropped, and — since it's never acked — resend in full forever. Past budget,
-			// leave this entity out (see the `included` comment above for why that's safe) and let
-			// the rotating start point give it priority on a future tick.
-			if (body->get_size() >= MAX_ENTITY_BODY_BYTES) {
+			// Score = how many ticks this entity has been waiting for THIS peer (0 if this is the
+			// first tick it's shown up changed) weighted by its gn_priority. Only read, never write,
+			// here — pass 2 below is what actually commits a wait-start or clears one.
+			const uint32_t *waited_since = pr.stale_since.getptr(net_id);
+			uint32_t wait_ticks = waited_since ? (snapshot_ctr - *waited_since) : 0;
+			EntCandidate c;
+			c.idx = idx;
+			c.net_id = net_id;
+			c.mask = mask;
+			c.score = (float)(wait_ticks + 1) * ents[idx].priority;
+			candidates.push_back(c);
+		}
+
+		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
+		// A plain round-robin only guaranteed everyone an equal turn; this guarantees the actual
+		// most-starved entity is the one that gets it, and lets a game say "players matter more
+		// than corpses" (gn_priority) without goldnet knowing what either of those are.
+		struct EntCandidateGreater {
+			bool operator()(const EntCandidate &a, const EntCandidate &b) const { return a.score > b.score; }
+		};
+		candidates.sort_custom<EntCandidateGreater>();
+
+		// MTU-safety ceiling always applies; a configured bandwidth budget only ever tightens it
+		// further, converted to a per-packet budget via this peer's own send interval (falling
+		// back to the server's cadence for an unthrottled peer, which sends every tick). Per-peer
+		// (set_peer_bandwidth_bps) wins if set; otherwise the global default (set_bandwidth_bps)
+		// applies to everyone, unlike interval_ms/replication cadence, which has no such global
+		// fallback — bandwidth caps are commonly configured once for the whole server in practice.
+		int peer_budget = MAX_ENTITY_BODY_BYTES;
+		uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default;
+		if (effective_bps > 0) {
+			uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : cached_min_interval_ms;
+			int rate_budget = (int)(((uint64_t)effective_bps * iv) / 1000);
+			peer_budget = MIN(peer_budget, rate_budget);
+		}
+
+		for (int ci = 0; ci < candidates.size(); ci++) {
+			const EntCandidate &c = candidates[ci];
+			// A peer's first full baseline, or many entities changing in the same tick (an
+			// explosion, a big fight), could otherwise grow this body past a safe UDP payload, get
+			// dropped, and — since it's never acked — resend in full forever. Past budget, leave
+			// this entity out (see the `included` comment above for why that's safe) and mark it
+			// waiting so it outranks everything else next tick if it's still unlucky then.
+			if (body->get_size() >= peer_budget) {
+				if (!pr.stale_since.has(c.net_id)) {
+					pr.stale_since[c.net_id] = snapshot_ctr;
+				}
 				continue;
 			}
-			body->put_u32(net_id);
-			gn_put_uvarint(body, mask); // most entities set only the low few bits — 1 byte, not 4
-			const Vector<uint8_t> &q = *ents[idx].quant;
+			body->put_u32(c.net_id);
+			gn_put_uvarint(body, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			const Vector<uint8_t> &q = *ents[c.idx].quant;
+			const Vector<Variant> &vals = *ents[c.idx].vals;
 			for (int s = 0; s < vals.size(); s++) {
-				if (mask & (1u << s)) {
+				if (c.mask & (1u << s)) {
 					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO, now);
 				}
 			}
-			included.insert(net_id);
+			included.insert(c.net_id);
+			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
 			changed++;
 		}
 
