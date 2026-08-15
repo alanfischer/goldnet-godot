@@ -87,6 +87,104 @@ static void test_varint_stream() {
 	printf("  varint stream framing: ok\n");
 }
 
+// --- unsigned varint (bitmask encoding) ---
+
+static void test_uvarint_roundtrip() {
+	const uint32_t values[] = {
+		0, 1, 2, 63, 64, 127, 128, 8191, 8192, 16383, 16384,
+		0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu,
+	};
+	for (uint32_t v : values) {
+		FakeBuf buf;
+		put_uvarint(&buf, v);
+		buf.rewind();
+		uint32_t got = get_uvarint(&buf);
+		CHECK(got == v);
+		CHECK(buf.read_pos == buf.size());
+	}
+	printf("  uvarint roundtrip: ok\n");
+}
+
+static void test_uvarint_widths() {
+	struct Case {
+		uint32_t value;
+		size_t bytes;
+	};
+	// This is what backs the changed-field bitmask on the wire: a handful of low bits
+	// set (the common case — few sync properties per entity) must cost one byte, not
+	// the fixed 4 bytes a plain u32 write would always cost.
+	const Case cases[] = {
+		{ 0, 1 }, { 1, 1 }, { 0x7F, 1 },       // fits in 7 bits: one byte
+		{ 0x80, 2 }, { 0xFF, 2 }, { 0x3FFF, 2 },
+		{ 0x4000, 3 },
+		{ 0xFFFFFFFFu, 5 },                     // full 32-bit mask: worst case, still ok
+	};
+	for (const Case &c : cases) {
+		FakeBuf buf;
+		put_uvarint(&buf, c.value);
+		CHECK(buf.size() == c.bytes);
+	}
+	printf("  uvarint widths: ok\n");
+}
+
+// --- malformed varint streams ---
+//
+// A snapshot is unreliable UDP: its bytes are reachable by corruption on the wire and by
+// anyone who can send this port a packet. A decoder that only behaves on well-formed input
+// is therefore not enough. A continuation run longer than the encoding can actually produce
+// (every byte with the high bit set) used to shift past the width of the accumulator, which
+// is undefined behaviour — and since tests/CMakeLists.txt runs UBSan with
+// -fno-sanitize-recover, the shift itself is what these cases catch. Remove the guard in
+// goldnet_codec.h and they abort rather than merely returning something odd.
+//
+// The contract asserted here is deliberately weak on the VALUE — a malformed stream has no
+// right answer — and strict on everything else: terminate, consume the whole run so the next
+// field starts where the sender put it, and don't invoke UB getting there.
+
+static void test_uvarint_overlong_terminates() {
+	FakeBuf buf;
+	for (int i = 0; i < 9; i++) {
+		buf.put_u8(0xFF); // continuation bit set, payload bits all 1
+	}
+	buf.put_u8(0x00); // final byte, clears the run
+	buf.rewind();
+	(void)get_uvarint(&buf);
+	CHECK(buf.read_pos == buf.size()); // drained the whole run — stream stays framed
+	printf("  uvarint overlong run terminates and stays framed: ok\n");
+}
+
+static void test_varint_overlong_terminates() {
+	FakeBuf buf;
+	for (int i = 0; i < 14; i++) {
+		buf.put_u8(0xFF);
+	}
+	buf.put_u8(0x00);
+	buf.rewind();
+	(void)get_varint(&buf);
+	CHECK(buf.read_pos == buf.size());
+	printf("  varint overlong run terminates and stays framed: ok\n");
+}
+
+static void test_uvarint_max_width_still_exact() {
+	// The guard must not clip a LEGAL encoding: 0xFFFFFFFF is five bytes with 28 as the
+	// final shift, exactly the boundary the guard tests against.
+	FakeBuf buf;
+	put_uvarint(&buf, 0xFFFFFFFFu);
+	CHECK(buf.size() == 5);
+	buf.rewind();
+	CHECK(get_uvarint(&buf) == 0xFFFFFFFFu);
+	printf("  uvarint max-width value survives the shift guard: ok\n");
+}
+
+static void test_varint_max_width_still_exact() {
+	FakeBuf buf;
+	put_varint(&buf, INT64_MIN);
+	CHECK(buf.size() == 10);
+	buf.rewind();
+	CHECK(get_varint(&buf) == INT64_MIN);
+	printf("  varint max-width value survives the shift guard: ok\n");
+}
+
 // --- angle16 ---
 
 static void test_angle16_roundtrip() {
@@ -209,6 +307,63 @@ static void test_angle16_output_range() {
 	printf("  angle16 output range (all 65536): ok\n");
 }
 
+// --- angle8 (classic GoldSrc-precision angle, half the cost of angle16) ---
+
+static const float STEP8 = TAU / 256.0f;
+
+static void test_angle8_roundtrip() {
+	const float angles[] = {
+		0.0f, 0.1f, 1.0f, 1.5707963f /*PI/2*/, 3.1415926f /*PI*/,
+		4.712389f /*3PI/2*/, 6.2831f /*just under TAU*/,
+	};
+	for (float a : angles) {
+		FakeBuf buf;
+		put_angle8(&buf, a);
+		buf.rewind();
+		CHECK(approx(get_angle8(&buf), a, STEP8 * 2.0f));
+		CHECK(buf.size() == 1); // the entire point: 1 byte, not 2 or 4
+	}
+	printf("  angle8 roundtrip: ok\n");
+}
+
+static void test_angle8_wrap() {
+	FakeBuf zero, tau;
+	put_angle8(&zero, 0.0f);
+	put_angle8(&tau, TAU);
+	CHECK(zero.bytes == tau.bytes);
+
+	FakeBuf neg;
+	put_angle8(&neg, -0.1f);
+	neg.rewind();
+	CHECK(approx(get_angle8(&neg), TAU - 0.1f, STEP8 * 2.0f));
+	printf("  angle8 wrap: ok\n");
+}
+
+static void test_angle8_nonfinite() {
+	// Same UB hazard put_angle16 guards against (NaN/inf through fmodf), at the 8-bit width.
+	const float bad[] = { NAN, -NAN, INFINITY, -INFINITY };
+	for (float a : bad) {
+		FakeBuf buf;
+		put_angle8(&buf, a);
+		CHECK(buf.size() == 1);
+		buf.rewind();
+		CHECK(get_angle8(&buf) == 0.0f);
+	}
+	printf("  angle8 non-finite input sanitizes to 0: ok\n");
+}
+
+static void test_angle8_output_range() {
+	// Exhaustive — only 256 values, cheap to sweep completely.
+	for (int i = 0; i < 256; i++) {
+		FakeBuf buf;
+		buf.put_u8((uint8_t)i);
+		buf.rewind();
+		float a = get_angle8(&buf);
+		CHECK(a >= 0.0f && a < TAU);
+	}
+	printf("  angle8 output range (all 256): ok\n");
+}
+
 // --- network-condition sim PRNG ---
 
 static void test_rng_reproducible() {
@@ -269,12 +424,22 @@ int main() {
 	test_varint_roundtrip();
 	test_varint_widths();
 	test_varint_stream();
+	test_uvarint_roundtrip();
+	test_uvarint_widths();
+	test_uvarint_overlong_terminates();
+	test_varint_overlong_terminates();
+	test_uvarint_max_width_still_exact();
+	test_varint_max_width_still_exact();
 	test_angle16_roundtrip();
 	test_angle16_wrap();
 	test_angle16_unbounded_input();
 	test_angle16_nonfinite();
 	test_angle16_upper_boundary();
 	test_angle16_output_range();
+	test_angle8_roundtrip();
+	test_angle8_wrap();
+	test_angle8_nonfinite();
+	test_angle8_output_range();
 	test_rng_reproducible();
 	test_rng_seeds_differ();
 	test_rng_never_latches();

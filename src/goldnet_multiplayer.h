@@ -52,6 +52,19 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// empty means all-auto.
 		Vector<uint8_t> quant;
 		bool quant_read = false;
+		// Peer-invariant importance weight for priority-ordered overflow (see PeerRing::stale_since
+		// and SAFE_PACKET_BYTES), from the "gn_priority" meta (a float; default 1.0 if unset).
+		// Read and cached the same lazy way as quant — by the first tick, the game has had the
+		// chance to set it.
+		//
+		// Read ONCE, like quant: changing the meta after the entity's first tick has no effect.
+		// That is a sharper limit here than it is for quant, because importance is the more
+		// plausible thing to want to vary at runtime ("this corpse stopped mattering"). Games
+		// needing that today should express it through visibility (set_visibility_for) instead,
+		// which is consulted every tick. Re-reading per tick is a get_meta across the GDExtension
+		// boundary per entity, which is the cost the cached read plan exists to avoid.
+		float priority = 1.0f;
+		bool priority_read = false;
 		// Change tracking, stamped ONCE per snapshot tick (see _server_tick). The values an entity
 		// holds are the same for every peer, so "did slot s change" must be answered once here
 		// rather than re-derived per peer — that comparison was O(peers x entities x slots) and
@@ -180,6 +193,23 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// which the ring already supports (it is the same path a lost snapshot takes).
 		uint32_t interval_ms = 0;
 		uint32_t last_sent_ms = 0;
+		// When a snapshot was last actually EMITTED to this peer. Distinct from last_sent_ms, which
+		// stamps the send-cadence check and advances even on a tick that decides to send nothing:
+		// this one gates the clock keepalive (see GN_CLOCK_KEEPALIVE_MS), which has to know how long
+		// the peer has really been without a header, not how long since it was last considered.
+		uint32_t last_packet_ms = 0;
+		// Priority-ordered overflow (see MAX_ENTITY_BODY_BYTES in _server_tick). net_id -> the
+		// snapshot_ctr this entity FIRST had an unsent pending change for THIS peer; cleared once
+		// it's actually written. The gap between that and the current snapshot_ctr is how many
+		// ticks it's been waiting, multiplied by SyncEntry::priority to score entities when more
+		// changed this tick than fit in the budget — the most-overdue, highest-weighted entity
+		// goes first. Mirrors spawn_wait/despawn_wait's "first-seq" bookkeeping for the same
+		// reason: only a successful write resets it, not merely a later tick touching it again.
+		HashMap<uint32_t, uint32_t> stale_since;
+		// Per-peer bandwidth budget in bytes/sec for the entity-delta body (0 = unset — use the
+		// flat MAX_ENTITY_BODY_BYTES ceiling only). Converted to a per-packet budget via
+		// interval_ms in _server_tick; never relaxes the hard MTU-safety ceiling, only tightens it.
+		uint32_t bandwidth_bps = 0;
 	};
 	HashMap<int32_t, PeerRing> peer_rings;       // server: peer_id -> ring
 	// Monotonic snapshot counter, bumped once per _server_tick that sends anything. Purely
@@ -220,6 +250,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint64_t last_send_ms = 0;                   // server send throttle
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
 	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
+	uint32_t bandwidth_bps_default = 0;          // config: >0 sets the default per-peer bandwidth budget (bytes/sec)
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
@@ -348,6 +379,16 @@ public:
 	int get_snapshot_interval_ms() const;
 	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
 	int get_peer_snapshot_interval_ms(int p_peer) const;
+	// Entity-delta bandwidth budget in bytes/sec, converted to a per-packet budget via each peer's
+	// snapshot interval. 0 (default) means no rate budget — only the flat MTU-safety ceiling
+	// applies, today's behavior. A rate budget only ever tightens that ceiling, never relaxes it.
+	// Unlike snapshot_interval_ms above (a server-wide send-cadence setting, unrelated to any
+	// per-peer default), this one IS a genuine global default: set_bandwidth_bps applies to every
+	// peer that hasn't been given its own via set_peer_bandwidth_bps, which wins when set.
+	void set_bandwidth_bps(int p_bps);
+	int get_bandwidth_bps() const;
+	void set_peer_bandwidth_bps(int p_peer, int p_bps);
+	int get_peer_bandwidth_bps(int p_peer) const;
 	// Periodic per-peer snapshot stats to stdout (also enabled by GOLDNET_DEBUG=1).
 	void set_debug_enabled(bool p_enabled);
 	bool is_debug_enabled() const;

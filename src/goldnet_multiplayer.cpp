@@ -32,15 +32,48 @@ static const uint32_t DEFAULT_INTERVAL_MS = 33;
 // Capping keeps each frame under MTU; leaves are reliable-until-acked, so they drain over a few ticks.
 static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 
+// Conservative safe-UDP-payload ceiling for a WHOLE snapshot, the same MTU hazard as the leave cap
+// above but across the packet rather than one section of it: a peer's first full baseline (every
+// owned sync at once) or a burst of simultaneous changes (an explosion, a big fight) can overrun
+// the MTU, fragment, and — since a dropped fragment costs the whole packet, and an unacked packet
+// is resent — thrash. The entity-delta body gets whatever is left of this after the header and the
+// spawn/despawn/leave sections, all of which are built BEFORE it and measured rather than
+// estimated. A configured bandwidth_bps (see PeerRing::bandwidth_bps) can only tighten the
+// remainder further, never relax it. An entity that doesn't fit isn't lost: it's simply left out of
+// `included` (see below) so the acked-baseline compare still sees it as changed, and its overflow
+// priority (PeerRing::stale_since) only goes up — it outranks everything that fit this tick on the
+// next one, the same self-heal the leave cap relies on.
+static const int SAFE_PACKET_BYTES = 1200;
+
+// Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, and the four
+// section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when
+// sizing the entity-delta budget, so the budget describes the packet rather than one section.
+static const int GN_SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2;
+
+// Longest a peer may go with no snapshot at all. Every snapshot header carries the server's
+// send-time, which the client re-emits as `server_time_received` to drive ServerClock — an
+// always-on clock feed independent of entity traffic. Skipping empty snapshots (see _server_tick)
+// would silence that feed exactly when the world is idle, leaving the client's clock free-running
+// on local time, so an otherwise-empty snapshot still goes out this often to keep it fed. Cheap:
+// a header-only packet at 4 Hz is ~68 B/s, against the ~450 B/s the skip saves at a 30 Hz tick.
+static const uint32_t GN_CLOCK_KEEPALIVE_MS = 250;
+
 // Max sync properties per entity — the width of the u32 changed-field bitmask. Slot
 // collection, mask building, and the apply loop all key off this.
 static const int MAX_SYNC_SLOTS = 32;
 
-// Snapshot wire-protocol magic + version, written as the first u32 of every snapshot. Bump the low
-// byte on any wire-format change so a client talking to a mismatched build fails loudly (one clear
-// warning + dropped snapshot) instead of misparsing every packet into a flood of decode errors.
-// 'G''N''S' + version. Old builds (no magic) start with a small seq value, which never matches.
-static const uint32_t GN_SNAPSHOT_MAGIC = 0x474E5302u; // "GNS" + v2 (v2 added spawn-lazy + leave section)
+// Snapshot wire-protocol version, written as the first byte of every snapshot. Bump on any
+// wire-format change so a client talking to a mismatched build fails loudly (one clear warning +
+// dropped snapshot) instead of misparsing every packet into a flood of decode errors. A single
+// byte is plenty — this only has to distinguish "same build" from "not", not identify goldnet's
+// framing (the packet already arrives via the "_gn_recv" RPC, which is identification enough).
+// v3: changed-field mask is a uvarint (was a fixed u32); magic shrank from a 4-byte "GNS"+version
+// tag to this 1-byte version; empty snapshots (nothing changed/spawned/despawned/left) are no
+// longer sent at all.
+// v4: two new self-describing value tags, GN_T_ANGLE8 and GN_T_TIME_DELTA — an old decoder seeing
+// either would fall through to the Variant-var default and misparse the stream, so this must bump
+// even though nothing about the existing tags changed.
+static const uint8_t GN_SNAPSHOT_VERSION = 4;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -93,9 +126,11 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 // consults the hint. A moving player's yaw+pitch drop 10→6 B, net_pos (if hinted) 13→7 B.
 enum GNValueTag : uint8_t {
 	GN_T_VAR = 0, GN_T_FLOAT = 1, GN_T_INT = 2, GN_T_VEC3 = 3, GN_T_BOOL = 4,
-	GN_T_ANGLE16 = 5,   // float radians -> u16 over [0, TAU)
-	GN_T_HALF = 6,      // float -> IEEE binary16
-	GN_T_VEC3_HALF = 7, // Vector3 -> 3x binary16
+	GN_T_ANGLE16 = 5,     // float radians -> u16 over [0, TAU)
+	GN_T_HALF = 6,        // float -> IEEE binary16
+	GN_T_VEC3_HALF = 7,   // Vector3 -> 3x binary16
+	GN_T_ANGLE8 = 8,      // float radians -> u8 over [0, TAU) — GoldSrc-classic angle precision
+	GN_T_TIME_DELTA = 9,  // int ms timestamp -> zigzag varint of (value - this packet's header time)
 };
 // Sentinel for "no quantization hint on this slot — pick the tag from the runtime type".
 static const uint8_t GN_Q_AUTO = 255;
@@ -105,6 +140,8 @@ static const float GN_TAU = goldnet::TAU;
 // reach them without a running engine; these are thin bindings to StreamPeerBuffer.
 static void gn_put_varint(const Ref<StreamPeerBuffer> &buf, int64_t p_v) { goldnet::put_varint(buf, p_v); }
 static int64_t gn_get_varint(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_varint(buf); }
+static void gn_put_uvarint(const Ref<StreamPeerBuffer> &buf, uint32_t p_v) { goldnet::put_uvarint(buf, p_v); }
+static uint32_t gn_get_uvarint(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_uvarint(buf); }
 
 // IEEE binary16 via StreamPeer's built-in half codec (round-to-nearest, handles subnormals).
 static void gn_put_half(const Ref<StreamPeerBuffer> &buf, float f) { buf->put_half(f); }
@@ -112,11 +149,16 @@ static float gn_get_half(const Ref<StreamPeerBuffer> &buf) { return buf->get_hal
 
 static void gn_put_angle16(const Ref<StreamPeerBuffer> &buf, float radians) { goldnet::put_angle16(buf, radians); }
 static float gn_get_angle16(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_angle16(buf); }
+static void gn_put_angle8(const Ref<StreamPeerBuffer> &buf, float radians) { goldnet::put_angle8(buf, radians); }
+static float gn_get_angle8(const Ref<StreamPeerBuffer> &buf) { return goldnet::get_angle8(buf); }
 
 // Map a "gn_quant" hint name to its tag, or GN_Q_AUTO if the name is unknown.
 static uint8_t gn_quant_from_name(const String &name) {
 	if (name == "angle16") {
 		return GN_T_ANGLE16;
+	}
+	if (name == "angle8") {
+		return GN_T_ANGLE8;
 	}
 	if (name == "half") {
 		return GN_T_HALF;
@@ -124,14 +166,42 @@ static uint8_t gn_quant_from_name(const String &name) {
 	if (name == "vec3_half") {
 		return GN_T_VEC3_HALF;
 	}
+	if (name == "time_delta") {
+		return GN_T_TIME_DELTA;
+	}
 	return GN_Q_AUTO;
 }
 
-static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uint8_t quant = GN_Q_AUTO) {
+// Read an entity's priority-ordered-overflow weight from its synchronizer's "gn_priority" meta —
+// a plain float (or int), not a per-slot dict like gn_quant, since importance is a property of the
+// whole entity, not one of its fields. Unset, non-numeric, or non-positive all fall back to 1.0 (a
+// non-positive weight would invert the staleness sort instead of just weighting it, which is never
+// what's intended).
+static float gn_read_priority(MultiplayerSynchronizer *p_sync) {
+	const StringName meta_key("gn_priority");
+	if (!p_sync->has_meta(meta_key)) {
+		return 1.0f;
+	}
+	Variant mv = p_sync->get_meta(meta_key);
+	if (mv.get_type() != Variant::FLOAT && mv.get_type() != Variant::INT) {
+		return 1.0f;
+	}
+	float v = (float)(double)mv;
+	return v > 0.0f ? v : 1.0f;
+}
+
+// p_now_ms is the CURRENT packet's own header timestamp — the reference GN_T_TIME_DELTA encodes
+// against. Every call site has one on hand (it's already in every snapshot header), so this needs
+// no extra per-game config: the tag stays exactly as self-contained as angle16/half/vec3_half.
+static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uint8_t quant, uint32_t p_now_ms) {
 	switch (quant) {
 		case GN_T_ANGLE16:
 			buf->put_u8(GN_T_ANGLE16);
 			gn_put_angle16(buf, (float)(double)v);
+			return;
+		case GN_T_ANGLE8:
+			buf->put_u8(GN_T_ANGLE8);
+			gn_put_angle8(buf, (float)(double)v);
 			return;
 		case GN_T_HALF:
 			buf->put_u8(GN_T_HALF);
@@ -145,6 +215,21 @@ static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uin
 			gn_put_half(buf, vv.z);
 			return;
 		}
+		case GN_T_TIME_DELTA:
+			// Only meaningful for an integer ms stamp. The decoder reconstructs an INT, so applying
+			// this to a float slot would silently truncate the value AND change its type on the
+			// client — a hint doing damage rather than saving bytes. Fall through to the type-based
+			// encoding instead, the same way an unknown hint name does.
+			if (v.get_type() != Variant::INT) {
+				break;
+			}
+			buf->put_u8(GN_T_TIME_DELTA);
+			// Zigzag varint of the signed gap to THIS packet's own send time. A stamp from the same
+			// tick (the overwhelmingly common case — an entity publishes its shadow state and the
+			// snapshot the instant after) encodes as ~0, one byte, forever — independent of how long
+			// the server has been up, unlike the raw absolute ms value this replaces.
+			gn_put_varint(buf, (int64_t)v - (int64_t)p_now_ms);
+			return;
 		default:
 			break; // GN_Q_AUTO (or a hint that can't apply) → type-based encoding below
 	}
@@ -175,7 +260,11 @@ static void gn_put_value(const Ref<StreamPeerBuffer> &buf, const Variant &v, uin
 	}
 }
 
-static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf) {
+// p_ref_time_ms is the CURRENT packet's header timestamp (already parsed before the entity loop
+// reaches this call), the same value the sender's p_now_ms was — GN_T_TIME_DELTA reconstructs the
+// absolute stamp by adding the wire delta back to it. No per-game config: the tag carries the same
+// self-contained "read the byte, know what it means" guarantee every other tag here has.
+static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf, uint32_t p_ref_time_ms) {
 	uint8_t t = buf->get_u8();
 	switch (t) {
 		case GN_T_FLOAT:
@@ -192,6 +281,8 @@ static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf) {
 			return buf->get_u8() != 0;
 		case GN_T_ANGLE16:
 			return (double)gn_get_angle16(buf);
+		case GN_T_ANGLE8:
+			return (double)gn_get_angle8(buf);
 		case GN_T_HALF:
 			return (double)gn_get_half(buf);
 		case GN_T_VEC3_HALF: {
@@ -200,6 +291,8 @@ static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf) {
 			float z = gn_get_half(buf);
 			return Vector3(x, y, z);
 		}
+		case GN_T_TIME_DELTA:
+			return (int64_t)p_ref_time_ms + gn_get_varint(buf);
 		default:
 			return buf->get_var();
 	}
@@ -534,6 +627,7 @@ void GoldNetMultiplayer::_detect_despawns() {
 			}
 			pr.value.spawn_wait.erase(net_id);  // stop resending the (now void) spawn
 			pr.value.spawn_acked.erase(net_id); // and forget delivery, so a reused id re-spawns cleanly
+			pr.value.stale_since.erase(net_id); // and stop tracking overflow-priority for a dead entity
 		}
 		if (!needers.is_empty()) {
 			despawn_pending[net_id] = needers;
@@ -637,6 +731,22 @@ int GoldNetMultiplayer::get_peer_snapshot_interval_ms(int p_peer) const {
 	const PeerRing *pr = peer_rings.getptr(p_peer);
 	return pr ? (int)pr->interval_ms : 0;
 }
+
+void GoldNetMultiplayer::set_bandwidth_bps(int p_bps) {
+	bandwidth_bps_default = p_bps > 0 ? (uint32_t)p_bps : 0;
+}
+int GoldNetMultiplayer::get_bandwidth_bps() const {
+	return (int)bandwidth_bps_default;
+}
+void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
+	PeerRing &pr = peer_rings[p_peer]; // default-constructs: a budget may be set before the first tick
+	pr.bandwidth_bps = p_bps > 0 ? (uint32_t)p_bps : 0;
+}
+int GoldNetMultiplayer::get_peer_bandwidth_bps(int p_peer) const {
+	const PeerRing *pr = peer_rings.getptr(p_peer);
+	return pr ? (int)pr->bandwidth_bps : 0;
+}
+
 void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
 	dbg = p_enabled;
 }
@@ -934,6 +1044,11 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_peer_snapshot_interval_ms", "peer"), &GoldNetMultiplayer::get_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
+	ClassDB::bind_method(D_METHOD("set_bandwidth_bps", "bps"), &GoldNetMultiplayer::set_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("get_peer_bandwidth_bps", "peer"), &GoldNetMultiplayer::get_peer_bandwidth_bps);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
 	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
 	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
@@ -1138,6 +1253,7 @@ void GoldNetMultiplayer::_server_tick() {
 		const Vector<Variant> *vals;   // points at SyncEntry::last_vals — never copied
 		const Vector<uint8_t> *quant; // per-slot quantization tags (may be empty = all-auto)
 		const Vector<uint32_t> *slot_ctr; // when each slot last changed (SyncEntry::slot_ctr)
+		float priority; // gn_priority weight, default 1.0 — see PeerRing::stale_since
 	};
 	Vector<TickEnt> ents;
 	for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
@@ -1149,6 +1265,10 @@ void GoldNetMultiplayer::_server_tick() {
 		if (!kv.value.quant_read) {
 			_read_quant(sync, kv.value.quant);
 			kv.value.quant_read = true;
+		}
+		if (!kv.value.priority_read) {
+			kv.value.priority = gn_read_priority(sync);
+			kv.value.priority_read = true;
 		}
 		if (!kv.value.slots_cached) {
 			cache_slot_plan(sync, kv.value.slot_target_id, kv.value.slot_prop);
@@ -1175,6 +1295,7 @@ void GoldNetMultiplayer::_server_tick() {
 		e.quant = &kv.value.quant;
 		e.vals = &kv.value.last_vals;
 		e.slot_ctr = &kv.value.slot_ctr;
+		e.priority = kv.value.priority;
 		ents.push_back(e);
 	}
 
@@ -1256,12 +1377,39 @@ void GoldNetMultiplayer::_server_tick() {
 
 		// Per-peer entity delta: filter the pre-read entities by visibility, store the
 		// visible subset as this peer's next baseline, and emit only the changed slots.
+		//
+		// Two sets, not one. `frame` is visibility this tick — every entity the peer can currently
+		// see, used below for PVS-leave detection, regardless of whether its bytes fit on the wire.
+		// `included` is the peer's actual reconstructed state after this packet — only entities
+		// whose current value the peer truly has (unchanged-so-nothing-to-send, or successfully
+		// written this tick). It becomes pr.frames[slot], the baseline future deltas compare
+		// against, so a changed entity left out by the byte budget below must NOT land in it: if it
+		// did, an ack of this seq would push base_ctr past that entity's slot_ctr and the change
+		// would never be resent. Left out of `included`, the same slot_ctr > base_ctr compare that
+		// caught it this tick catches it again next tick — free retry, no extra state.
 		HashSet<uint32_t> frame;
+		HashSet<uint32_t> included;
 		Ref<StreamPeerBuffer> body;
 		body.instantiate();
 		uint16_t changed = 0;
-		for (int i = 0; i < ents.size(); i++) {
-			MultiplayerSynchronizer *sync = ents[i].sync;
+
+		// Pass 1: visibility + mask for every entity. Unchanged (mask == 0) entities are settled
+		// immediately; changed ones become overflow candidates, scored for pass 2 below rather than
+		// written in encounter order.
+		struct EntCandidate {
+			int idx;
+			uint32_t net_id;
+			uint32_t mask;
+			float score;
+		};
+		Vector<EntCandidate> candidates;
+		// Set when any candidate's score departs from the flat 1.0 default — a pending wait or a
+		// game-supplied weight. While it stays false every score is identical and sorting is a
+		// no-op, so pass 2 skips it (see there).
+		bool needs_sort = false;
+		int n_ents = ents.size();
+		for (int idx = 0; idx < n_ents; idx++) {
+			MultiplayerSynchronizer *sync = ents[idx].sync;
 			// Per-peer PVS. The game drives each synchronizer's peer_visibility via set_visibility_for
 			// once per net tick (NetworkManager.push_pvs_visibility), so this native read is the whole
 			// gate — public_visibility for map-static "visible to all" entities, else the per-peer bit.
@@ -1269,8 +1417,8 @@ void GoldNetMultiplayer::_server_tick() {
 			if (!(sync->is_visibility_public() || sync->get_visibility_for(peer))) {
 				continue;
 			}
-			uint32_t net_id = ents[i].net_id;
-			const Vector<Variant> &vals = *ents[i].vals;
+			uint32_t net_id = ents[idx].net_id;
+			const Vector<Variant> &vals = *ents[idx].vals;
 			frame.insert(net_id);
 
 			// Did this peer hold this entity at its baseline? If not (first sight, or it left
@@ -1279,7 +1427,7 @@ void GoldNetMultiplayer::_server_tick() {
 			// changed iff it was stamped after the baseline's counter. No value comparison here,
 			// which is what took this loop from O(peers x entities x slots) to O(peers x entities)
 			// of integer work — and ~94% of entities exit at mask == 0 having touched nothing.
-			const Vector<uint32_t> &slot_ctr = *ents[i].slot_ctr;
+			const Vector<uint32_t> &slot_ctr = *ents[idx].slot_ctr;
 			uint32_t mask = 0;
 			if (!base || !base->has(net_id)) {
 				mask = vals.size() >= MAX_SYNC_SLOTS ? 0xFFFFFFFFu : ((1u << vals.size()) - 1u); // new → all slots
@@ -1292,18 +1440,31 @@ void GoldNetMultiplayer::_server_tick() {
 				}
 			}
 			if (mask == 0) {
+				included.insert(net_id); // peer's existing value is already correct
+				pr.stale_since.erase(net_id); // no longer owed anything — clear any old overflow mark
 				continue; // unchanged since the acked baseline — costs nothing
 			}
-			body->put_u32(net_id);
-			body->put_u32(mask);
-			const Vector<uint8_t> &q = *ents[i].quant;
-			for (int s = 0; s < vals.size(); s++) {
-				if (mask & (1u << s)) {
-					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO);
-				}
+			// Score = how many ticks this entity has been waiting for THIS peer (0 if this is the
+			// first tick it's shown up changed) weighted by its gn_priority. Only read, never write,
+			// here — pass 2 below is what actually commits a wait-start or clears one.
+			const uint32_t *waited_since = pr.stale_since.getptr(net_id);
+			uint32_t wait_ticks = waited_since ? (snapshot_ctr - *waited_since) : 0;
+			EntCandidate c;
+			c.idx = idx;
+			c.net_id = net_id;
+			c.mask = mask;
+			c.score = (float)(wait_ticks + 1) * ents[idx].priority;
+			if (c.score != 1.0f) {
+				needs_sort = true;
 			}
-			changed++;
+			candidates.push_back(c);
 		}
+
+		// Pass 2 (writing the winners) does NOT run here — it runs after the leave section below,
+		// because the entity budget is whatever the packet has left once every other section is
+		// built, and the leave section is the last of them. Only `frame` is needed to diff leaves,
+		// and pass 1 has already produced it. Wire order is unchanged: the buffer is assembled at
+		// the end of the peer loop in header/spawn/despawn/leave/changed order regardless.
 
 		// Relevance leaves (OPT-IN — off unless the consumer game enables relevance_events): owned_syncs
 		// that were in this peer's PVS last tick but aren't in `frame` now, delivered reliable-until-acked
@@ -1358,14 +1519,98 @@ void GoldNetMultiplayer::_server_tick() {
 			pr.relevant = frame;
 		}
 
+		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
+		// A plain round-robin only guaranteed everyone an equal turn; this guarantees the actual
+		// most-starved entity is the one that gets it, and lets a game say "players matter more
+		// than corpses" (gn_priority) without goldnet knowing what either of those are.
+		//
+		// Skip the sort when every score is 1.0 — no entity is carrying a wait (pass 1 saw an empty
+		// stale_since for all of them) and no game has weighted anything. That is the steady state
+		// on a server that never overflows its budget, and it keeps this off the hot path the
+		// per-tick read loop was tuned around.
+		if (needs_sort) {
+			struct EntCandidateGreater {
+				bool operator()(const EntCandidate &a, const EntCandidate &b) const { return a.score > b.score; }
+			};
+			candidates.sort_custom<EntCandidateGreater>();
+		}
+
+		// What's left of a safe UDP payload after the header and every section already built. Those
+		// are measured, not estimated: the spawn section in particular carries put_var game data of
+		// no fixed size, so a guessed reservation is exactly the kind of arithmetic that silently
+		// stops holding. A configured bandwidth budget only ever tightens the remainder further,
+		// converted to a per-packet allowance via this peer's own send interval (falling back to the
+		// server's cadence for an unthrottled peer, which sends every tick). Per-peer
+		// (set_peer_bandwidth_bps) wins if set; otherwise the global default (set_bandwidth_bps)
+		// applies to everyone, unlike interval_ms/replication cadence, which has no such global
+		// fallback — bandwidth caps are commonly configured once for the whole server in practice.
+		int peer_budget = SAFE_PACKET_BYTES - GN_SNAPSHOT_HEADER_BYTES
+				- (int)spawn_body->get_size() - (int)despawn_body->get_size() - (int)leave_body->get_size();
+		uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default;
+		if (effective_bps > 0) {
+			uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : cached_min_interval_ms;
+			int rate_budget = (int)(((uint64_t)effective_bps * iv) / 1000);
+			peer_budget = MIN(peer_budget, rate_budget);
+		}
+
+		for (int ci = 0; ci < candidates.size(); ci++) {
+			const EntCandidate &c = candidates[ci];
+			// Past budget, leave this entity out (see the `included` comment above for why that's
+			// safe) and mark it waiting so it outranks everything else next tick if it's still
+			// unlucky then.
+			//
+			// `ci > 0` makes the highest-scoring candidate unconditional, which is what guarantees
+			// forward progress. Without it a budget of zero or less starves replication completely
+			// and silently — reachable two ways: a bandwidth_bps low enough that bps*interval/1000
+			// truncates to 0 (e.g. 30 B/s at a 33 ms tick), or a packet whose spawn section has
+			// already spent the whole MTU. Both are states the stream must drain out of, and it can
+			// only drain by sending something. One entity of overrun beats a permanent stall, and
+			// it is self-limiting: the sections that crowded the budget out are reliable-until-
+			// acked, so they retire and the budget reopens.
+			if (ci > 0 && body->get_size() >= peer_budget) {
+				if (!pr.stale_since.has(c.net_id)) {
+					pr.stale_since[c.net_id] = snapshot_ctr;
+				}
+				continue;
+			}
+			body->put_u32(c.net_id);
+			gn_put_uvarint(body, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			const Vector<uint8_t> &q = *ents[c.idx].quant;
+			const Vector<Variant> &vals = *ents[c.idx].vals;
+			for (int s = 0; s < vals.size(); s++) {
+				if (c.mask & (1u << s)) {
+					gn_put_value(body, vals[s], s < q.size() ? q[s] : GN_Q_AUTO, now);
+				}
+			}
+			included.insert(c.net_id);
+			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
+			changed++;
+		}
+
+		// Nothing to report: no changed entity, no spawn/despawn/leave owed to this peer. Sending
+		// would cost a header-only packet for zero content — a real, always-on floor while the
+		// world (or this peer's slice of it) is fully static. `seq` is simply left unused; nothing
+		// above stamped a wait-map with it (that only happens when one of these counts is nonzero),
+		// so skipping costs nothing to reconcile later.
+		//
+		// Except that the header is not purely overhead: it carries server_time, the client's only
+		// clock feed (see GN_CLOCK_KEEPALIVE_MS). So "nothing to report" only earns a skip while
+		// that feed is still fresh. last_packet_ms == 0 is a peer that has never been sent
+		// anything — its first snapshot must go out regardless, or the clock never starts.
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0
+				&& pr.last_packet_ms != 0 && now - pr.last_packet_ms < GN_CLOCK_KEEPALIVE_MS) {
+			continue;
+		}
+		pr.last_packet_ms = now;
+
 		int slot = seq & (RING - 1);
-		pr.frames[slot] = frame;
+		pr.frames[slot] = included;
 		pr.frame_seq[slot] = seq;
 		pr.frame_ctr[slot] = snapshot_ctr;
 
 		Ref<StreamPeerBuffer> buf;
 		buf.instantiate();
-		buf->put_u32(GN_SNAPSHOT_MAGIC);
+		buf->put_u8(GN_SNAPSHOT_VERSION);
 		buf->put_u16(seq);
 		buf->put_u16(base_seq);
 		buf->put_u32(now);
@@ -1407,7 +1652,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 
 	// Protocol guard: a mismatched goldnet build (different wire format) would misparse every field.
 	// Fail loudly once and drop, rather than flooding the log with decode errors.
-	if (buf->get_u32() != GN_SNAPSHOT_MAGIC) {
+	if (buf->get_u8() != GN_SNAPSHOT_VERSION) {
 		if (!warned_protocol_mismatch) {
 			warned_protocol_mismatch = true;
 			UtilityFunctions::push_error("goldnet: snapshot protocol mismatch — the server and client are "
@@ -1426,8 +1671,10 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	}
 
 	// Surface the header clock: every snapshot the server ticks out carries its send-time, so this is an
-	// always-on server-time feed (independent of entity traffic) a client can drive a clock estimator from
-	// — no separate beacon RPC needed on the goldnet path. Emitted after the stale-seq drop (a reordered
+	// always-on server-time feed a client can drive a clock estimator from — no separate beacon RPC needed
+	// on the goldnet path. "Always-on" is a guarantee the SERVER maintains rather than a side effect of
+	// entity traffic: it skips snapshots with nothing to report, but only until the feed would go stale,
+	// then sends a header-only one anyway (see GN_CLOCK_KEEPALIVE_MS). Emitted after the stale-seq drop (a reordered
 	// snapshot's time is <= one we've already fed, so ServerClock would reject it — no point dispatching)
 	// but before the baseline-resolution drop below, so a forward snapshot we can't reconstruct for state
 	// still contributes its valid clock sample. See ServerClock.
@@ -1492,7 +1739,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 
 	for (int i = 0; i < count; i++) {
 		uint32_t net_id = buf->get_u32();
-		uint32_t mask = buf->get_u32();
+		uint32_t mask = gn_get_uvarint(buf);
 
 		MultiplayerSynchronizer *sync = nullptr;
 		if (netid_to_objid.has(net_id)) {
@@ -1529,7 +1776,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			if (!(mask & (1u << s))) {
 				continue;
 			}
-			Variant v = gn_get_value(buf); // self-delimiting — always consume
+			Variant v = gn_get_value(buf, server_time); // self-delimiting — always consume
 			if (s < vals.size()) {
 				vals.write[s] = v;
 			}

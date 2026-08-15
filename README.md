@@ -63,12 +63,12 @@ pipeline. A node lands in:
 server emits one unreliable snapshot:
 
 ```
-[u32 magic]      "GNS" + wire version — a mismatched build is dropped, not misparsed
+[u8 version]     wire version — a mismatched build is dropped, not misparsed
 [u16 seq][u16 base_seq][u32 server_time]
 [u16 spawn_ct]   { [u32 net_id][u32 spawner_net_id][var data] } *   (reliable-until-acked)
 [u16 despawn_ct] { [u32 net_id] } *                                 (reliable-until-acked)
 [u16 leave_ct]   { [u32 net_id] } *                                 (reliable-until-acked, opt-in — see PVS below)
-[u16 changed]    { [u32 net_id][u32 changed_mask]{ value } per set bit } *
+[u16 changed]    { [u32 net_id][uvarint changed_mask]{ value } per set bit } *
 ```
 
 - `base_seq` is the frame this peer last acked (0 = full state). The server keeps a
@@ -79,7 +79,20 @@ server emits one unreliable snapshot:
   server falls back to a full frame.
 - `changed_mask` indexes the config's sync-property "slots"; an entity whose every
   slot equals the baseline is **skipped entirely** (idle movers/entities cost zero
-  bytes — provided the game doesn't rewrite a field every tick).
+  bytes — provided the game doesn't rewrite a field every tick). The mask is a
+  uvarint, so the usual handful of low bits costs one byte rather than four.
+- The entity section is **budgeted**: it gets whatever a safe UDP payload (1200 B)
+  has left after the header and the spawn/despawn/leave sections, so a first full
+  baseline or a burst of simultaneous changes can't silently overrun the MTU. What
+  doesn't fit is simply left out of the peer's next baseline, so the ordinary
+  changed-since-baseline compare re-offers it next tick — no retransmit bookkeeping.
+  Which entities win the budget is ordered by how long each has been waiting for
+  *this* peer, times an optional per-entity `gn_priority` weight (see **Usage**), so
+  the most-overdue entity goes first and nothing starves. `bandwidth_bps` tightens
+  the budget further; it never relaxes the MTU ceiling.
+- A snapshot with nothing to report — no changed entity, no spawn, despawn, or leave
+  — **isn't sent at all**, so a fully static world costs nothing per tick. The one
+  exception is the clock feed below.
 - Spawns/despawns are **reliable-until-acked**: re-sent each frame until the peer
   acks a frame carrying them, then retired. A spawn's source record outlives
   delivery, so each peer keeps a durable `spawn_acked` set — a spawn is delivered
@@ -89,11 +102,15 @@ server emits one unreliable snapshot:
   peer's PVS since last tick, delivered reliable-until-acked so the client can hide
   them. Re-entry needs no event — the entity simply reappears in `changed` with a
   full baseline. See **Per-peer visibility** below.
-- `server_time` is the server's send-time (ms). Since a snapshot goes to every peer
-  every tick regardless of entity traffic, it's an **always-on server-clock feed** —
-  the client re-emits it as the `server_time_received(server_time_ms)` signal, which
-  you feed to the `ServerClock` helper for interpolation timing. No separate
-  server-time beacon RPC is needed on the goldnet path.
+- `server_time` is the server's send-time (ms), carried by every snapshot, making it
+  an **always-on server-clock feed** — the client re-emits it as the
+  `server_time_received(server_time_ms)` signal, which you feed to the `ServerClock`
+  helper for interpolation timing. No separate server-time beacon RPC is needed on
+  the goldnet path. "Always-on" is maintained deliberately rather than falling out of
+  entity traffic: the empty-snapshot skip above is bounded at 250 ms, past which a
+  header-only snapshot goes out anyway. Otherwise the feed would go quiet exactly when
+  the world is idle, and `ServerClock` would free-run on local time — a drift with no
+  error message attached.
 
 **Compact value encoding.** Each changed slot is written with a 1-byte type tag
 plus a tight payload — `f32` for floats, zig-zag varint for ints, 3×`f32` for
@@ -101,7 +118,11 @@ plus a tight payload — `f32` for floats, zig-zag varint for ints, 3×`f32` for
 the stream self-delimiting (any `Variant` still round-trips) while roughly halving
 per-entity bytes versus stock `put_var` (which tags every value with a 4-byte type
 header and stores floats/ints at 64-bit width): a moving player's ~8 props drop
-from ~112 B to ~48 B.
+from ~112 B to ~48 B. Opt-in lossy tags (`gn_quant`, see **Usage**) go further:
+`angle16`/`angle8` fold a radian onto 2 or 1 bytes, `half`/`vec3_half` drop floats
+to binary16, and `time_delta` encodes an int ms stamp as a varint offset from the
+packet's own header time, so a same-tick stamp stays ~1 byte however long the server
+has been up. Every tag is self-describing, so the decoder needs no matching config.
 
 **Per-peer visibility (PVS).** goldnet honors the synchronizer's *native*
 visibility — an entity is sent to a peer when `is_visibility_public()` or
@@ -143,6 +164,11 @@ Measured in WizardWars (ww_2fort + 4 bots, stationary headless clients, server�
 egress at the ENet socket), goldnet vs the **stock `MultiplayerSynchronizer`** path
 on the same build with the same PVS:
 
+> **The table predates the wire-format v4 work** (uvarint mask, empty-snapshot skip,
+> entity budget, `angle8`/`time_delta`), so read it as goldnet's floor rather than its
+> current cost. What that work bought is measured separately below — the shape this
+> table is really for (parity on bandwidth, divergence under loss) is unaffected.
+
 | Condition | goldnet | stock |
 | --- | --- | --- |
 | 1 / 4 / 8 clients, no loss (per-client) | ~26–29 KB/s | ~27–29 KB/s |
@@ -160,6 +186,42 @@ reliable-ordered replication for real-time state on adverse networks.
 > Bandwidth wins over a *hand-rolled* RPC baseline are a separate story: goldnet
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
+
+### What the v4 wire work bought
+
+Same WizardWars scenario (ww_2fort, 4 AI bots, 4 stationary headless clients, 190 s
+runs), comparing this build against the pre-v4 one with the *game* held constant. The
+figure below is the **snapshot stream alone** — goldnet's own `dbg_bytes` under
+`GOLDNET_DEBUG=1`, not the ENet socket total. That distinction matters: snapshots are
+only about half of server egress here, the rest being ENet acks and the game's own
+`@rpc` traffic, so measuring at the socket dilutes the effect by roughly half.
+
+| | snapshot stream | total socket egress | over-MTU sends |
+| --- | --- | --- | --- |
+| pre-v4 | 12.4 KB/s (11.3–13.2) | 26.9 KB/s | 7 of 7 runs |
+| v4 | 6.2 KB/s (1.8–10.5) | ~21.8 KB/s | 0 of 14 runs |
+
+n=5 runs pre-v4, n=10 v4, averaged over each run's steady-state tail. **Roughly half
+the snapshot bytes**, and every v4 run came in below every pre-v4 run (10.5 < 11.3).
+
+Read the spread, not just the mean. Pre-v4 is tight because it pays a floor: a snapshot
+per peer per tick whether or not anything changed. v4's cost tracks actual change, so it
+ranges from near the pre-v4 figure when a peer's PVS is busy down to **0.2–0.3 KB/s when
+it is idle** — which is the clock keepalive and nothing else (17 B header x 4 Hz x 4
+peers = 272 B/s, and that is what the log shows). Most of the win is that floor
+disappearing; the rest is the uvarint mask. A busy server should expect the low end of
+the improvement, an idle or lightly-populated one the high end.
+
+Two caveats worth keeping. Adopting the *game-side* quantization hints on top
+(`vec3_half`/`angle8`/`time_delta` — the consumer's own change, not goldnet's) did not
+separate from goldnet's schema-agnostic wins at this sample size: 6.2 vs 6.1 KB/s, well
+inside the run-to-run spread. And this ran on a 4-core container with server, bots, and
+clients on one box, so the absolute numbers are not comparable to the table above —
+only the paired comparison is.
+
+The over-MTU column is the entity budget doing its job, and it is the least ambiguous
+result here: pre-v4 emitted `Sending 1991 bytes unreliably which is above the MTU (1392)`
+on a joining client's first full baseline in **every** run. With the budget, never.
 
 ## What we wish Godot had
 
@@ -245,9 +307,11 @@ ctest --test-dir tests/build --output-on-failure
 ```
 
 Standalone — no godot-cpp, no engine, runs in under a second. The suite covers
-`src/goldnet_codec.h`: the zig-zag varint and angle16 codecs (round-trip, encoded
-widths, wraparound), uint16 sequence comparison across rollover, the
-reliable-until-acked bookkeeping, and the seeded loss PRNG.
+`src/goldnet_codec.h`: the zig-zag and unsigned varint codecs (round-trip, encoded
+widths, and malformed over-long streams, which are reachable from the wire), the
+angle16/angle8 quantizers (round-trip, wraparound, non-finite input), uint16 sequence
+comparison across rollover, the reliable-until-acked bookkeeping, and the seeded loss
+PRNG.
 
 Scope is deliberate. godot-cpp's engine classes call through GDExtension function
 pointers that only exist inside a running Godot process, so anything touching
@@ -342,9 +406,37 @@ something false.
    get_tree().set_multiplayer(gn)
 
    # Per property, keyed by the sync property's leaf name. Set before the sync enters
-   # the tree. Recognized hints: "angle16" (radians→u16), "half", "vec3_half".
+   # the tree. Recognized hints:
+   #   "angle16"    radians → u16   (~0.0055° steps, 2 B)
+   #   "angle8"     radians → u8    (~1.4° steps, 1 B — classic GoldSrc precision)
+   #   "half"       float   → binary16
+   #   "vec3_half"  Vector3 → 3x binary16
+   #   "time_delta" int ms stamp → varint offset from the packet's header time. For
+   #                absolute ms timestamps only; ignored on non-int slots, since
+   #                truncating a float here would corrupt it rather than shrink it.
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
    ```
+6. (Optional) Weight an entity for the snapshot's entity budget. When more entities
+   change in a tick than fit in one packet, candidates are ordered by ticks-waited x
+   this weight, so a heavier entity wins the budget more often — without goldnet
+   knowing what any of them are. Default 1.0; read **once**, on the entity's first
+   tick, so set it before the sync enters the tree. Ticks-waited keeps rising for
+   whatever loses, so a weight biases the order without starving anything.
+   ```gdscript
+   sync.set_meta("gn_priority", 4.0)   # players over debris
+   ```
+7. (Optional) Cap per-peer entity-delta bandwidth in bytes/sec, converted to a
+   per-packet allowance via that peer's snapshot interval. Only ever tightens the
+   built-in MTU ceiling. 0 (default) leaves the MTU ceiling as the only limit.
+   ```gdscript
+   gn.bandwidth_bps = 32000              # every peer
+   gn.set_peer_bandwidth_bps(peer, 8000) # or per peer, which wins where set
+   ```
+   Note this budgets the entity-delta section only — the header and the
+   spawn/despawn/leave sections are accounted against the MTU ceiling but are not
+   rate-limited, and `@rpc` traffic goes through the inner `SceneMultiplayer`
+   untouched. It is a replication throttle, not a link-wide one.
+
    `debug_enabled` / `loss_percent` are also settable (mirror `GOLDNET_DEBUG` /
    `GOLDNET_LOSS`). To receive PVS leave events, `set_relevance_events(true)` and
    connect the `entity_relevance_lost(sync)` signal (see **How it works → Per-peer
