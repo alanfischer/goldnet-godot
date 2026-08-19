@@ -250,8 +250,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint32_t defer_streak = 0;
 	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
 
-	uint64_t last_send_ms = 0;                   // server send throttle
+	uint64_t last_send_us = 0;                   // server send deadline (microseconds — see _poll)
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
+	// The same cadence in microseconds. The gate runs off this rather than the millisecond value
+	// because a millisecond cannot express the tick rates games actually use: 60 Hz is 16.667 ms,
+	// and rounding that to 17 costs 1.2% of the rate before any jitter is counted.
+	uint64_t cached_min_interval_us = 33000;
 	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
 	uint32_t bandwidth_bps_default = 0;          // config: >0 sets the default per-peer bandwidth budget (bytes/sec)
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
@@ -347,6 +351,7 @@ private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
 	uint32_t _min_interval_ms() const;
+	uint64_t _min_interval_us() const;
 	// Defined in goldnet_codec.h so the standalone tests can pin the rollover behavior.
 	static bool _seq_newer(uint16_t a, uint16_t b) { return goldnet::seq_newer(a, b); }
 	static bool _seq_le(uint16_t a, uint16_t b) { return goldnet::seq_le(a, b); }

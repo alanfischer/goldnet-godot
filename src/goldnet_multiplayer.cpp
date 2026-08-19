@@ -686,26 +686,38 @@ void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
 	node->queue_free();
 }
 
-uint32_t GoldNetMultiplayer::_min_interval_ms() const {
+// The send cadence in MICROSECONDS. Derived here rather than from _min_interval_ms() so the
+// synchronizers' interval (a double, in seconds) survives at full precision: truncating 1/60 s to
+// whole milliseconds gave 16 ms, and rounding gives 17 — a 60 Hz game got 62.5 or 58.8 Hz before
+// any jitter. Only the explicit override, which the config surface takes in whole ms, is coarse.
+uint64_t GoldNetMultiplayer::_min_interval_us() const {
 	if (snapshot_interval_override > 0) {
-		return (uint32_t)snapshot_interval_override; // config override pins one global cadence
+		return (uint64_t)snapshot_interval_override * 1000ULL;
 	}
-	uint32_t best = 0;
+	uint64_t best = 0;
 	for (const KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
 		MultiplayerSynchronizer *s = sync_from_objid(kv.key);
 		if (!s) {
 			continue;
 		}
 		double sec = s->get_replication_interval();
-		uint32_t ms = sec > 0.0 ? (uint32_t)(sec * 1000.0) : DEFAULT_INTERVAL_MS;
-		if (ms == 0) {
-			ms = 1;
+		uint64_t us = sec > 0.0 ? (uint64_t)(sec * 1000000.0 + 0.5) : (uint64_t)DEFAULT_INTERVAL_MS * 1000ULL;
+		if (us == 0) {
+			us = 1;
 		}
-		if (best == 0 || ms < best) {
-			best = ms;
+		if (best == 0 || us < best) {
+			best = us;
 		}
 	}
-	return best == 0 ? DEFAULT_INTERVAL_MS : best;
+	return best == 0 ? (uint64_t)DEFAULT_INTERVAL_MS * 1000ULL : best;
+}
+
+uint32_t GoldNetMultiplayer::_min_interval_ms() const {
+	// Millisecond view of the same cadence, for the byte-budget conversion (which is per-packet and
+	// coarse). Rounds rather than truncates so it can't claim a faster rate than we actually send at.
+	uint64_t us = _min_interval_us();
+	uint32_t ms = (uint32_t)((us + 500ULL) / 1000ULL);
+	return ms == 0 ? 1 : ms;
 }
 
 // --- Config surface (Phase 5) ---
@@ -713,6 +725,7 @@ uint32_t GoldNetMultiplayer::_min_interval_ms() const {
 void GoldNetMultiplayer::set_snapshot_interval_ms(int p_ms) {
 	snapshot_interval_override = p_ms > 0 ? p_ms : 0;
 	cached_min_interval_ms = _min_interval_ms();
+	cached_min_interval_us = _min_interval_us();
 }
 int GoldNetMultiplayer::get_snapshot_interval_ms() const {
 	return snapshot_interval_override;
@@ -1917,8 +1930,24 @@ Error GoldNetMultiplayer::_poll() {
 		_drain_pending_spawns(); // every poll — pick up spawns promptly
 		_detect_despawns();
 		if (inner->get_peers().size() > 0) {
-			if (now - last_send_ms >= cached_min_interval_ms) {
-				last_send_ms = now;
+			// Advance the deadline by the interval rather than resetting it to the clock we happened
+			// to read. `last = now` makes every period the interval rounded UP to the next poll, so
+			// the cadence inherits the poll granularity and loses the remainder every time: a server
+			// polling at ~160 Hz sent a nominal 60 Hz stream at ~50 Hz, with gaps spread 12-36 ms
+			// instead of a steady 16.7. Clients size their interpolation buffer from the nominal
+			// rate, so that spread is what pushes an entity's buffer dry between updates.
+			uint64_t now_us = Time::get_singleton()->get_ticks_usec();
+			uint64_t iv_us = cached_min_interval_us > 0 ? cached_min_interval_us : 1ULL;
+			if (last_send_us == 0) {
+				last_send_us = now_us;
+			}
+			if (now_us - last_send_us >= iv_us) {
+				last_send_us += iv_us;
+				// More than a whole interval behind means a real stall (a load hitch, a debugger
+				// break), not poll granularity. Resync instead of bursting to catch up.
+				if (now_us - last_send_us >= iv_us) {
+					last_send_us = now_us;
+				}
 				_server_tick();
 			}
 		}
@@ -1977,7 +2006,8 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 		entry.net_id = net_id_for(sync);
 		owned_syncs[objid] = entry;
 		netid_to_objid[entry.net_id] = objid;
-		cached_min_interval_ms = _min_interval_ms(); // intervals are set before the sync enters the tree
+		cached_min_interval_ms = _min_interval_ms();
+	cached_min_interval_us = _min_interval_us(); // intervals are set before the sync enters the tree
 		return OK; // we own it — do not forward to the inner
 	}
 	return inner->object_configuration_add(p_object, p_config);
@@ -1997,6 +2027,7 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 			netid_to_objid.erase(owned_syncs[objid].net_id);
 			owned_syncs.erase(objid);
 			cached_min_interval_ms = _min_interval_ms();
+	cached_min_interval_us = _min_interval_us();
 			return OK;
 		}
 	}
