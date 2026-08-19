@@ -130,6 +130,75 @@ static void test_reliable_include_independent_records() {
 	printf("  reliable_include independent records: ok\n");
 }
 
+// --- derive_leaves ---
+
+static void test_derive_leaves_is_baseline_minus_visible() {
+	FakeSet held;   // what the peer's acked frame says it holds
+	FakeSet visible; // what it can see this tick
+	for (uint32_t id = 1; id <= 4; id++) {
+		held.insert(id);
+	}
+	visible.insert(2);
+	visible.insert(4);
+	visible.insert(9); // newly visible — an enter, which rides the entity data, not this diff
+
+	std::vector<uint32_t> send, carry;
+	derive_leaves(held, visible, 32, send, carry);
+	CHECK(send.size() == 2);
+	CHECK(send[0] == 1);
+	CHECK(send[1] == 3);
+	CHECK(carry.empty());
+	printf("  derive_leaves is baseline minus visible: ok\n");
+}
+
+static void test_derive_leaves_recomputes_until_acked() {
+	// The property the old queue needed bookkeeping for, and this gets for free: while the peer
+	// hasn't acked, `held` doesn't move, so every tick derives the identical removal.
+	FakeSet held, visible;
+	held.insert(7);
+	for (int tick = 0; tick < 5; tick++) {
+		std::vector<uint32_t> send, carry;
+		derive_leaves(held, visible, 32, send, carry);
+		CHECK(send.size() == 1);
+		CHECK(send[0] == 7);
+	}
+	// The ack replaces `held` with the frame that excluded it — and the removal stops.
+	FakeSet acked; // the frame we sent, which no longer lists 7
+	std::vector<uint32_t> send, carry;
+	derive_leaves(acked, visible, 32, send, carry);
+	CHECK(send.empty());
+	printf("  derive_leaves recomputes until the baseline moves: ok\n");
+}
+
+static void test_derive_leaves_carries_what_the_cap_held_back() {
+	// A removal the cap couldn't fit must be reported as carried, so the caller keeps it in the
+	// baseline. Dropping it there instead loses the evidence the next diff needs, and the entity
+	// stays drawn on the client forever — the failure the queued design shipped with.
+	FakeSet held, visible;
+	for (uint32_t id = 1; id <= 5; id++) {
+		held.insert(id);
+	}
+	std::vector<uint32_t> send, carry;
+	derive_leaves(held, visible, 2, send, carry);
+	CHECK(send.size() == 2);
+	CHECK(carry.size() == 3);
+	CHECK(carry[0] == 3);
+	CHECK(carry[2] == 5);
+	printf("  derive_leaves carries what the cap held back: ok\n");
+}
+
+static void test_derive_leaves_empty_baseline_owes_nothing() {
+	// A joining peer holds nothing, so it is owed no removals — no seeding, no join-time burst.
+	FakeSet held, visible;
+	visible.insert(1);
+	visible.insert(2);
+	std::vector<uint32_t> send, carry;
+	derive_leaves(held, visible, 32, send, carry);
+	CHECK(send.empty());
+	CHECK(carry.empty());
+	printf("  derive_leaves owes a fresh peer nothing: ok\n");
+}
+
 // --- retire_acked ---
 
 static void test_retire_acked() {
@@ -189,6 +258,10 @@ int main() {
 	test_reliable_include_no_ack_flag();
 	test_reliable_include_rollover();
 	test_reliable_include_independent_records();
+	test_derive_leaves_is_baseline_minus_visible();
+	test_derive_leaves_recomputes_until_acked();
+	test_derive_leaves_carries_what_the_cap_held_back();
+	test_derive_leaves_empty_baseline_owes_nothing();
 	test_retire_acked();
 	test_retire_acked_none();
 	test_retire_acked_rollover();

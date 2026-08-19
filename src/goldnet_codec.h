@@ -218,6 +218,31 @@ bool reliable_include(M &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_l
 	return true;
 }
 
+// --- PVS removal derivation (GoldSrc) ---
+//
+// The removals a snapshot owes this peer: everything its acked baseline holds that it can no
+// longer see. Derived, never queued — if the snapshot carrying them is lost the peer doesn't
+// ack it, the baseline doesn't move, and the identical set is recomputed next tick. That is
+// what makes leaves self-correcting without any reliable-until-acked bookkeeping.
+//
+// Bounded by p_cap so one frame can't overrun the MTU. Whatever doesn't fit is reported through
+// r_carry: the caller must keep those ids in THIS frame's baseline, because the peer still holds
+// them — we simply haven't told it otherwise yet. Dropping them from the baseline instead would
+// erase the very evidence the next diff needs, and the entity would stay drawn forever.
+template <typename S, typename V>
+void derive_leaves(const S &p_held, const S &p_visible, int p_cap, V &r_send, V &r_carry) {
+	for (const uint32_t &id : p_held) {
+		if (p_visible.has(id)) {
+			continue; // still in view
+		}
+		if ((int)r_send.size() < p_cap) {
+			r_send.push_back(id);
+		} else {
+			r_carry.push_back(id);
+		}
+	}
+}
+
 // Drops the records an ack confirms delivered, reporting them through r_retired.
 template <typename M, typename V>
 void retire_acked(M &p_wait, uint16_t p_last_acked, V &r_retired) {
