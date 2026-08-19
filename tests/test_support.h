@@ -102,4 +102,7 @@ struct FakeMap {
 	size_t size() const { return entries.size(); }
 	std::vector<Entry>::const_iterator begin() const { return entries.begin(); }
 	std::vector<Entry>::const_iterator end() const { return entries.end(); }
+	// Mutable iteration too: emit_leaves() stamps entries in place as it walks them.
+	std::vector<Entry>::iterator begin() { return entries.begin(); }
+	std::vector<Entry>::iterator end() { return entries.end(); }
 };

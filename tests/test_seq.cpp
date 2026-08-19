@@ -130,6 +130,78 @@ static void test_reliable_include_independent_records() {
 	printf("  reliable_include independent records: ok\n");
 }
 
+// --- emit_leaves ---
+
+static void test_emit_leaves_stamps_first_send_only() {
+	// The bug this exists to pin: re-stamping on every resend means last_acked is forever
+	// chasing a seq we just moved, so a leave never retires and the wait map never drains.
+	FakeMap wait;
+	wait[1] = 0; // owed, not sent yet
+
+	std::vector<uint32_t> send;
+	emit_leaves(wait, 10, 0, false, 32, send);
+	CHECK(send.size() == 1);
+	CHECK(wait[1] == 10); // stamped with the frame that carried it
+
+	for (uint16_t seq = 11; seq <= 15; seq++) {
+		send.clear();
+		emit_leaves(wait, seq, 9, true, 32, send); // ack still behind the first send
+		CHECK(send.size() == 1); // keep resending
+		CHECK(wait[1] == 10); // ...without moving the stamp
+	}
+
+	send.clear();
+	emit_leaves(wait, 16, 12, true, 32, send); // ack 12 covers the send at 10
+	CHECK(send.empty());
+	CHECK(!wait.has(1)); // retired
+	printf("  emit_leaves stamps the first send only: ok\n");
+}
+
+static void test_emit_leaves_capped_entries_stay_unstamped() {
+	// A leave the cap held back was never on the wire, so it must not carry a stamp an ack
+	// could retire it with — it would be dropped having never been delivered.
+	FakeMap wait;
+	for (uint32_t id = 1; id <= 5; id++) {
+		wait[id] = 0;
+	}
+	std::vector<uint32_t> send;
+	emit_leaves(wait, 10, 0, false, 2, send);
+	CHECK(send.size() == 2);
+	CHECK(wait[1] == 10);
+	CHECK(wait[2] == 10);
+	CHECK(wait[3] == 0); // held back, unstamped
+	CHECK(wait[5] == 0);
+
+	// Once the sent ones retire, the held-back leaves get their turn.
+	send.clear();
+	emit_leaves(wait, 11, 10, true, 2, send);
+	CHECK(wait.size() == 3);
+	CHECK(send.size() == 2);
+	CHECK(send[0] == 3);
+	printf("  emit_leaves holds back past the cap without stamping: ok\n");
+}
+
+static void test_emit_leaves_cap_does_not_starve_new_leaves() {
+	// The live failure: with delivered entries never retiring, a full cap of them starved
+	// every leave queued afterwards — a returned flag stayed rendered where it used to be.
+	FakeMap wait;
+	for (uint32_t id = 1; id <= 32; id++) {
+		wait[id] = 0;
+	}
+	std::vector<uint32_t> send;
+	emit_leaves(wait, 10, 0, false, 32, send);
+	CHECK(send.size() == 32);
+
+	wait[99] = 0; // the flag going home, queued behind a full cap
+
+	send.clear();
+	emit_leaves(wait, 11, 10, true, 32, send); // ack retires the first 32
+	CHECK(wait.size() == 1);
+	CHECK(send.size() == 1);
+	CHECK(send[0] == 99);
+	printf("  emit_leaves drains so new leaves are not starved: ok\n");
+}
+
 // --- retire_acked ---
 
 static void test_retire_acked() {
@@ -189,6 +261,9 @@ int main() {
 	test_reliable_include_no_ack_flag();
 	test_reliable_include_rollover();
 	test_reliable_include_independent_records();
+	test_emit_leaves_stamps_first_send_only();
+	test_emit_leaves_capped_entries_stay_unstamped();
+	test_emit_leaves_cap_does_not_starve_new_leaves();
 	test_retire_acked();
 	test_retire_acked_none();
 	test_retire_acked_rollover();

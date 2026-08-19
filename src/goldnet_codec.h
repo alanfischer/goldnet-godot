@@ -218,6 +218,34 @@ bool reliable_include(M &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_l
 	return true;
 }
 
+// Picks this snapshot's PVS-leave markers out of the wait map, capped so one frame can't
+// overrun the MTU, and retires the ones an ack confirms delivered. wait[id] == 0 means
+// "owed, not sent yet" (seq 0 is reserved), so a leave held back by the cap can't be retired
+// by an ack for a frame it was never in.
+//
+// Same first-seq rule as reliable_include(): the stamp is the seq of the FIRST send and stays
+// put across resends, so an ack can catch up to it. Re-stamping on every resend moves the
+// target the ack is chasing — nothing retires, the map grows without bound, and past the cap
+// those undead entries starve every new leave.
+template <typename M, typename V>
+void emit_leaves(M &p_wait, uint16_t p_seq, uint16_t p_last_acked, bool p_has_ack,
+		int p_cap, V &r_send) {
+	V retired;
+	for (auto &kv : p_wait) {
+		if (kv.value != 0 && p_has_ack && seq_le(kv.value, p_last_acked)) {
+			retired.push_back(kv.key); // the frame that carried it was acked → delivered
+		} else if ((int)r_send.size() < p_cap) {
+			r_send.push_back(kv.key);
+			if (kv.value == 0) {
+				kv.value = p_seq; // first send — the seq an ack has to cover to retire it
+			}
+		}
+	}
+	for (int i = 0; i < (int)retired.size(); i++) {
+		p_wait.erase(retired[i]);
+	}
+}
+
 // Drops the records an ack confirms delivered, reporting them through r_retired.
 template <typename M, typename V>
 void retire_acked(M &p_wait, uint16_t p_last_acked, V &r_retired) {

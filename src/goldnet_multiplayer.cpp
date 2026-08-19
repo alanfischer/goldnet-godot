@@ -1498,21 +1498,21 @@ void GoldNetMultiplayer::_server_tick() {
 			// (every out-of-PVS entity on a big map), and dumping them all in one frame blows past the MTU,
 			// so the snapshot is dropped, never acked, and the same oversized frame resends forever —
 			// nothing is ever delivered. Cap the count so each frame fits; the rest ride the next frames.
-			// Stamp each SENT leave with the seq that actually carries it (not queue time), so a leave held
-			// back by the cap isn't retired by an ack for a frame it was never in. Reliable-until-acked, so
-			// spreading them out loses nothing — they drain over a few ticks.
-			Vector<uint32_t> retired_leaves;
-			for (KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
-				if (kv.value != 0 && pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
-					retired_leaves.push_back(kv.key); // sent and acked → delivered
-				} else if (leave_ct < MAX_LEAVES_PER_SNAPSHOT) {
-					leave_body->put_u32(kv.key);
-					leave_ct++;
-					kv.value = seq; // stamp with the seq we're sending it in
-				}
-			}
-			for (int ri = 0; ri < retired_leaves.size(); ri++) {
-				pr.leave_wait.erase(retired_leaves[ri]);
+			// A leave held back by the cap carries no stamp (0 = owed, never sent), so an ack for a frame
+			// it was never in can't retire it.
+			//
+			// The stamp is the seq of the FIRST send and stays put across resends — reliable_include()'s
+			// rule, which the spawn and despawn sections use. Re-stamping every resend (as this once did)
+			// moves the target the ack is chasing: last_acked always trails the seq we just stamped, so
+			// seq_le() never fires, nothing ever retires, and leave_wait grows without bound. Past
+			// MAX_LEAVES_PER_SNAPSHOT of undead entries the cap then starves every NEW leave — a flag
+			// returning to its stand kept being rendered where the client last saw it, forever.
+			Vector<uint32_t> leaving;
+			goldnet::emit_leaves(pr.leave_wait, seq, pr.last_acked, pr.has_ack,
+					MAX_LEAVES_PER_SNAPSHOT, leaving);
+			for (int li = 0; li < leaving.size(); li++) {
+				leave_body->put_u32(leaving[li]);
+				leave_ct++;
 			}
 			// `relevant` IS this frame's visible set — the diff above has already consumed the
 			// previous one, so assign rather than clear-and-reinsert every id one at a time.
