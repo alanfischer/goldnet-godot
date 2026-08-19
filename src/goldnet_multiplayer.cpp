@@ -1429,7 +1429,10 @@ void GoldNetMultiplayer::_server_tick() {
 			// of integer work — and ~94% of entities exit at mask == 0 having touched nothing.
 			const Vector<uint32_t> &slot_ctr = *ents[idx].slot_ctr;
 			uint32_t mask = 0;
-			if (!base || !base->has(net_id)) {
+			// left_unacked: we've already told this peer to drop the entity, but its acked baseline
+			// still lists it — a slot delta against that baseline would leave the client hidden with
+			// nothing to re-show it (an idle mover re-entering changes no slot at all).
+			if (!base || !base->has(net_id) || pr.left_unacked.has(net_id)) {
 				mask = vals.size() >= MAX_SYNC_SLOTS ? 0xFFFFFFFFu : ((1u << vals.size()) - 1u); // new → all slots
 			} else {
 				int n_slots = MIN(vals.size(), slot_ctr.size());
@@ -1466,57 +1469,39 @@ void GoldNetMultiplayer::_server_tick() {
 		// and pass 1 has already produced it. Wire order is unchanged: the buffer is assembled at
 		// the end of the peer loop in header/spawn/despawn/leave/changed order regardless.
 
-		// Relevance leaves (OPT-IN — off unless the consumer game enables relevance_events): owned_syncs
-		// that were in this peer's PVS last tick but aren't in `frame` now, delivered reliable-until-acked
-		// so the client can hide them. Enters need no event — an entering entity re-appears in the changed
-		// set above with a full baseline, firing the synchronizer's `synchronized` signal the game already
-		// listens to. Dropping the entity from `frame` when invisible also drops it from this peer's next
-		// baseline, so re-entry is a clean all-slots delta (matching the client, which erases the same
-		// net_id from its reconstructed frame on the leave). When disabled, no diff runs and leave_ct is 0
-		// (2 bytes on the wire) — goldnet stays agnostic and games that don't opt in are unaffected.
+		// Relevance leaves (OPT-IN — off unless the consumer game enables relevance_events), derived
+		// GoldSrc-style from the peer's acked baseline: every owned_sync that baseline holds and this
+		// frame can't see gets a remove marker. Nothing is queued and nothing is tracked — a lost
+		// snapshot goes unacked, `held` stays put, and next tick's diff produces the same markers.
+		//
+		// Enters need no event: an entering entity re-appears in the changed set with a full baseline
+		// (it is no longer in `included`, so every slot is "changed"), firing the synchronizer's
+		// `synchronized` signal the game already listens to. A joining peer needs no seeding either —
+		// it holds nothing, so it is owed no removals and gets none of the burst that seeding a full
+		// relevant-set used to produce.
+		//
+		// When disabled, no diff runs and leave_ct is 0 (2 bytes on the wire) — goldnet stays agnostic
+		// and games that don't opt in are unaffected.
 		Ref<StreamPeerBuffer> leave_body;
 		leave_body.instantiate();
 		uint16_t leave_ct = 0;
-		if (relevance_events_enabled && (pr.relevance_seeded || !frame.is_empty())) {
-			// Seed on first contact with an EMPTY relevant-set: the client defaults each owned sync ABSENT
-			// (GoldSrc-faithful — see EntityBase._setup_mover_sync) and materializes it only when its state
-			// first arrives, so there is nothing to hide up front. This replaces the old "seed everything
-			// relevant, then leave every out-of-PVS entity" scheme, whose first diff emitted a leave per
-			// out-of-PVS entity — hundreds on a big map, overrunning the MTU so the snapshot was dropped and
-			// never acked (the backlog then resent forever). Now leaves only fire for genuine PVS exits of
-			// entities the client actually saw. The MAX_LEAVES_PER_SNAPSHOT cap remains as a backstop.
-			pr.relevance_seeded = true;
-			for (const uint32_t &rid : pr.relevant) {
-				if (!frame.has(rid) && !pr.leave_wait.has(rid)) {
-					pr.leave_wait[rid] = 0; // 0 = queued, not yet sent (seq 0 is reserved elsewhere)
-				}
+		if (relevance_events_enabled) {
+			Vector<uint32_t> leaving;
+			Vector<uint32_t> carried;
+			goldnet::derive_leaves(pr.held, frame, MAX_LEAVES_PER_SNAPSHOT, leaving, carried);
+			for (int li = 0; li < leaving.size(); li++) {
+				leave_body->put_u32(leaving[li]);
+				leave_ct++;
+				// Told to drop it, so it leaves this frame's baseline too — which is what makes a
+				// later re-entry a clean all-slots delta. Until the peer acks that, `left_unacked`
+				// covers the window where its own baseline still disagrees.
+				pr.left_unacked.insert(leaving[li]);
 			}
-			for (const uint32_t &fid : frame) {
-				pr.leave_wait.erase(fid); // re-entered → cancel any pending leave
+			// Held back by the cap: the peer still holds these, so they stay in the baseline and the
+			// next diff picks them up again. Dropping them here would lose the removal entirely.
+			for (int ci = 0; ci < carried.size(); ci++) {
+				included.insert(carried[ci]);
 			}
-			// Emit leaves bounded per snapshot: a fresh peer's seed can queue hundreds of leaves at once
-			// (every out-of-PVS entity on a big map), and dumping them all in one frame blows past the MTU,
-			// so the snapshot is dropped, never acked, and the same oversized frame resends forever —
-			// nothing is ever delivered. Cap the count so each frame fits; the rest ride the next frames.
-			// Stamp each SENT leave with the seq that actually carries it (not queue time), so a leave held
-			// back by the cap isn't retired by an ack for a frame it was never in. Reliable-until-acked, so
-			// spreading them out loses nothing — they drain over a few ticks.
-			Vector<uint32_t> retired_leaves;
-			for (KeyValue<uint32_t, uint16_t> &kv : pr.leave_wait) {
-				if (kv.value != 0 && pr.has_ack && _seq_le(kv.value, pr.last_acked)) {
-					retired_leaves.push_back(kv.key); // sent and acked → delivered
-				} else if (leave_ct < MAX_LEAVES_PER_SNAPSHOT) {
-					leave_body->put_u32(kv.key);
-					leave_ct++;
-					kv.value = seq; // stamp with the seq we're sending it in
-				}
-			}
-			for (int ri = 0; ri < retired_leaves.size(); ri++) {
-				pr.leave_wait.erase(retired_leaves[ri]);
-			}
-			// `relevant` IS this frame's visible set — the diff above has already consumed the
-			// previous one, so assign rather than clear-and-reinsert every id one at a time.
-			pr.relevant = frame;
 		}
 
 		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
@@ -1883,6 +1868,15 @@ void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
 	if (!pr->has_ack || _seq_newer(seq, pr->last_acked)) {
 		pr->last_acked = seq;
 		pr->has_ack = true;
+		// This frame is now what the peer holds — the set every PVS removal is derived against.
+		// Copied rather than read from the ring at send time so it survives the frame aging out
+		// under heavy loss: a stale-but-real `held` re-sends a removal the peer may already have
+		// (harmless, the client just hides an entity twice), while an empty one would lose it.
+		int hslot = seq & (RING - 1);
+		if (pr->frame_seq[hslot] == seq && seq != 0) {
+			pr->held = pr->frames[hslot];
+			pr->left_unacked.clear(); // the acked frame already excludes them
+		}
 	}
 	// Retire spawn/despawn records this ack confirms delivered.
 	Vector<uint32_t> retired;

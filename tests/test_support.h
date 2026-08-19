@@ -62,6 +62,31 @@ struct FakeBuf {
 	}
 };
 
+// Insertion-ordered set with godot HashSet's has()/insert() surface, iterating by value.
+// Ordered rather than hashed so the derived-removal tests can assert on emission order.
+struct FakeSet {
+	std::vector<uint32_t> items;
+
+	bool has(uint32_t v) const {
+		for (uint32_t i : items) {
+			if (i == v) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void insert(uint32_t v) {
+		if (!has(v)) {
+			items.push_back(v);
+		}
+	}
+
+	size_t size() const { return items.size(); }
+	std::vector<uint32_t>::const_iterator begin() const { return items.begin(); }
+	std::vector<uint32_t>::const_iterator end() const { return items.end(); }
+};
+
 // Insertion-ordered map with godot HashMap's has()/erase()/operator[] surface, iterating
 // as {.key, .value}. Ordered rather than hashed so test failures are reproducible.
 struct FakeMap {

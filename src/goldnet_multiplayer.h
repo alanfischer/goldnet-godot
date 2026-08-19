@@ -175,18 +175,21 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// the durable "peer already has this node" marker; a net_id here is never re-sent until
 		// the entity despawns (which clears it).
 		HashSet<uint32_t> spawn_acked;
-		// Per-peer relevance (PVS) for owned_syncs. `relevant` is the set of owned-sync net_ids
-		// visible to this peer as of the last snapshot; diffing it each tick yields the entities that
-		// LEFT this peer's PVS, delivered reliable-until-acked in `leave_wait` so the client can hide
-		// them. (Enter needs no event — an entering entity re-appears in the changed set with a full
+		// Per-peer PVS relevance for owned_syncs, GoldSrc-style: removals are DERIVED from the
+		// delta baseline rather than queued. `held` is what this peer's last acked frame says it
+		// holds; anything in there that the peer can no longer see gets a remove marker in the next
+		// snapshot. A lost snapshot isn't acked, so `held` doesn't move and the same diff recomputes
+		// the same markers next tick — self-correcting, with no retry queue to leak or starve.
+		// (Enter needs no event — an entering entity re-appears in the changed set with a full
 		// baseline, which fires the synchronizer's `synchronized` signal the game already listens to.)
-		HashSet<uint32_t> relevant;
-		HashMap<uint32_t, uint16_t> leave_wait;
-		// Seed: on a peer's first snapshot, `relevant` is initialized to ALL owned syncs so the very
-		// first leave-diff emits a leave for everything currently out of this peer's PVS. The client
-		// defaults entities to present, so without this seed the initially-out-of-PVS ones would render
-		// through walls until they first entered+left. Mirrors the game's old first-pass "all present".
-		bool relevance_seeded = false;
+		// Empty until the first ack, which is also why a joining peer gets no leave burst: it holds
+		// nothing yet, so there is nothing to remove.
+		HashSet<uint32_t> held;
+		// Removals written since this peer's last ack. The peer has been told to drop these, but
+		// `held` won't reflect it until the frame carrying them is acked — so a re-entry inside that
+		// window must ship a full baseline, not a slot delta against a frame the peer no longer
+		// matches. Soft state: losing it only costs a redundant full baseline.
+		HashSet<uint32_t> left_unacked;
 		// Per-peer snapshot cadence (GoldSrc cl_updaterate). 0 = serve this peer every server
 		// tick; otherwise serve it at most once per interval_ms. Throttling costs nothing on the
 		// wire: the next frame this peer does get simply deltas against its older acked baseline,
