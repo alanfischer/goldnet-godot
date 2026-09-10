@@ -268,17 +268,25 @@ delete all of it.
 code gets no replication-ID handshake and never pairs with its remote counterpart — it has to be
 baked into the `.tscn`.
 
-*Forces:* consumers must ship scenes with synchronizers pre-baked (see WizardWars'
-`remote_player.tscn`), so anything assembled at runtime needs a scene file it would not otherwise
-need. Only the parts that can't live in a scene — a per-peer visibility `Callable`, receive hooks
-— get wired in code.
+*Forces:* nothing under goldnet, which is worth stating plainly because the gap reads like it
+binds here and doesn't: goldnet keys a synchronizer by the hash of its scene path
+(`net_id_for`), so a code-built sync pairs exactly like a baked one as long as both peers build
+it at the same path. Consumers must still ship scenes with synchronizers pre-baked for the
+**stock** transport (see WizardWars' `remote_player.tscn`, which keeps a baked config for its
+`--stock` fallback), so anything that needs to run on both, and is assembled at runtime, needs a
+scene file it would not otherwise need.
 
 **5. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
 metadata, so an extension that wants a hint per slot (goldnet's quantization tags: `angle16`,
 `half`, `vec3_half`) has nowhere in the config to put it.
 
 *Forces:* the hints ride a node `meta` dictionary (`gn_quant`) keyed by property leaf name, which
-is a second source of truth that has to be kept aligned with the config by hand.
+is a second source of truth that has to be kept aligned with the config by hand. The alignment
+part is closable without upstream: `SyncSpec` takes one table and derives the config *and* the
+metas from it, so the two cannot drift and a consumer never writes a meta key by hand. What
+stays is the keying — leaf name, not path, because the meta is a flat dictionary hung off the
+node — so two replicated properties that share a leaf name still cannot be hinted apart, and
+`SyncSpec` can only report that rather than fix it.
 
 **Not a gap, just the floor:** `get_indexed` across the GDExtension boundary costs ~0.8 µs per
 slot, and after caching the resolved read plan that's essentially all the read loop is. Reading
@@ -359,8 +367,9 @@ client, where it passes while testing nothing.
 ./tests/gdscript/run.sh interpolation_buffer # just one
 ```
 
-Covers the three client-side helpers the addon ships alongside the extension —
-`InterpolationBuffer`, `PredictedBody` and `ServerClock`. They're pure GDScript with no
+Covers the four helpers the addon ships alongside the extension — the client-side
+`InterpolationBuffer`, `PredictedBody` and `ServerClock`, plus `SyncSpec`, which builds a
+synchronizer's config and goldnet's metas from one declaration. They're pure GDScript with no
 dependency on goldnet's wire protocol, so this needs no built extension, no peer and no
 second process; the whole thing runs in one headless process in well under a second.
 
@@ -419,6 +428,22 @@ something false.
    #                truncating a float here would corrupt it rather than shrink it.
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
    ```
+   The hints and the replication config are two lists that have to agree (see **What we
+   wish Godot had** #5), so prefer declaring them together and letting `SyncSpec` — the
+   addon's GDScript helper — derive both. A hint keyed to a property the config does not
+   replicate is ignored in silence; a table cannot make that mistake, and `SyncSpec`
+   reports the ones it cannot rule out (an unrecognised hint name, two properties sharing
+   a leaf name):
+   ```gdscript
+   const SPEC := {
+       "NetInterp:net_pos":   {"quant": "vec3_half", "push": true},
+       "NetInterp:net_stamp": {"quant": "time_delta", "push": true},
+       "NetInterp:net_anim":  {},   # replicated, full precision, polled every tick
+   }
+   node.add_child(SyncSpec.build("NetSync", SPEC))
+   # or, where the synchronizer is baked into a .tscn and the scene owns the config:
+   SyncSpec.apply($NetSync, SPEC)   # stamps the metas, reports drift from the config
+   ```
 6. (Optional) Weight an entity for the snapshot's entity budget. When more entities
    change in a tick than fit in one packet, candidates are ordered by ticks-waited x
    this weight, so a heavier entity wins the budget more often — without goldnet
@@ -459,6 +484,8 @@ something false.
    node.position = p
    gn.mark_dirty(node)   # accepts the sync, or the node whose state it replicates
    ```
+   `SyncSpec` carries this in the same table as the quantization hints — `{"push": true}`
+   per property — so the promise sits next to the property it is made about.
    Read **once**, on the entity's first tick, like `gn_quant` and `gn_priority`.
 
    `debug_enabled` / `loss_percent` are also settable (mirror `GOLDNET_DEBUG` /
