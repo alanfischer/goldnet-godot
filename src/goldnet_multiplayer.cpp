@@ -1036,22 +1036,11 @@ bool GoldNetMultiplayer::get_push_dirty() const {
 	return push_dirty;
 }
 
-void GoldNetMultiplayer::set_dirty_audit(bool p_enabled) {
-	dirty_audit = p_enabled;
-}
-
-bool GoldNetMultiplayer::get_dirty_audit() const {
-	return dirty_audit;
-}
-
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("mark_dirty", "object"), &GoldNetMultiplayer::mark_dirty);
 	ClassDB::bind_method(D_METHOD("set_push_dirty", "enabled"), &GoldNetMultiplayer::set_push_dirty);
 	ClassDB::bind_method(D_METHOD("get_push_dirty"), &GoldNetMultiplayer::get_push_dirty);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_dirty"), "set_push_dirty", "get_push_dirty");
-	ClassDB::bind_method(D_METHOD("set_dirty_audit", "enabled"), &GoldNetMultiplayer::set_dirty_audit);
-	ClassDB::bind_method(D_METHOD("get_dirty_audit"), &GoldNetMultiplayer::get_dirty_audit);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dirty_audit"), "set_dirty_audit", "get_dirty_audit");
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
@@ -1144,11 +1133,10 @@ static void cache_slot_plan(MultiplayerSynchronizer *p_sync, Vector<uint64_t> &r
 //
 // The read writes straight into last_vals and stamps slot_ctr where a value actually moved, so
 // there is no temporary vector and no second comparison pass: last_vals is both the thing we
-// diff against and the buffer we read into. Returns true if anything changed, which audit mode
-// uses to catch an entity that changed without being marked.
+// diff against and the buffer we read into. Returns true if anything changed.
 //
 // A target that has since been freed reads as nil, exactly as an unresolved one did before.
-bool GoldNetMultiplayer::_read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr) {
+bool GoldNetMultiplayer::_read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr, bool p_polled_only) {
 	const int n = p_entry.slot_prop.size();
 	if (p_entry.last_vals.size() != n) {
 		p_entry.last_vals.resize(n);
@@ -1157,12 +1145,18 @@ bool GoldNetMultiplayer::_read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr) {
 			p_entry.slot_ctr.write[s] = p_ctr;
 		}
 	}
+	// A polled-only pass can only look at slots the plan actually covers; an empty slot_push
+	// means nothing was declared, so every slot is polled.
+	const bool have_push = p_polled_only && p_entry.slot_push.size() == n;
 	// An entity's slots nearly always live on one object (its own node), so resolving the id
 	// once and reusing it across the run turns N lookups per entity into one.
 	uint64_t last_id = 0;
 	Object *last_obj = nullptr;
 	bool changed = false;
 	for (int s = 0; s < n; s++) {
+		if (have_push && p_entry.slot_push[s]) {
+			continue; // the game promised to mark this one, and it didn't — nothing changed
+		}
 		uint64_t id = p_entry.slot_target_id[s];
 		if (id != last_id) {
 			last_id = id;
@@ -1228,6 +1222,40 @@ void GoldNetMultiplayer::_read_quant(MultiplayerSynchronizer *p_sync, Vector<uin
 	}
 }
 
+// Build the per-slot push declaration from a synchronizer's "gn_push" meta: an Array of the sync
+// properties' leaf names (e.g. ["net_pos", "net_stamp"]) that the game promises to announce with
+// mark_dirty(). Leaves r_push empty when there's no meta or it names nothing this sync has, which
+// every caller reads as "poll every slot" — the safe answer for a game that declared nothing.
+void GoldNetMultiplayer::_read_push(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_push) {
+	r_push.clear();
+	const StringName meta_key("gn_push");
+	if (!p_sync->has_meta(meta_key)) {
+		return;
+	}
+	Variant mv = p_sync->get_meta(meta_key);
+	if (mv.get_type() != Variant::ARRAY) {
+		return;
+	}
+	Array names = mv;
+	Vector<NodePath> slots;
+	get_sync_slots(p_sync, slots);
+	Vector<uint8_t> q;
+	q.resize(slots.size());
+	bool any = false;
+	for (int s = 0; s < slots.size(); s++) {
+		uint8_t pushed = 0;
+		int sc = slots[s].get_subname_count();
+		if (sc > 0 && names.has(String(slots[s].get_subname(sc - 1)))) {
+			pushed = 1;
+			any = true;
+		}
+		q.write[s] = pushed;
+	}
+	if (any) {
+		r_push = q;
+	}
+}
+
 void GoldNetMultiplayer::_server_tick() {
 	GoldNetLink *l = _ensure_link();
 	if (!l) {
@@ -1283,24 +1311,38 @@ void GoldNetMultiplayer::_server_tick() {
 			kv.value.priority = gn_read_priority(sync);
 			kv.value.priority_read = true;
 		}
+		// Read the gn_push declaration once, alongside quant. has_polled falls out of it: an
+		// entity that declared every slot never needs the poll pass below.
+		if (!kv.value.push_read) {
+			_read_push(sync, kv.value.slot_push);
+			kv.value.has_polled = true;
+			if (!kv.value.slot_push.is_empty()) {
+				kv.value.has_polled = false;
+				for (int s = 0; s < kv.value.slot_push.size(); s++) {
+					if (!kv.value.slot_push[s]) {
+						kv.value.has_polled = true;
+						break;
+					}
+				}
+			}
+			kv.value.push_read = true;
+		}
 		if (!kv.value.slots_cached) {
 			cache_slot_plan(sync, kv.value.slot_target_id, kv.value.slot_prop);
 			kv.value.slots_cached = true;
 			kv.value.dirty = true; // first sight: last_vals has nothing in it yet
 		}
-		// Only entities the game told us about get read (see mark_dirty). A clean one keeps the
-		// values and stamps it already has, which is all any peer — including one being sent a
-		// full baseline — needs from it.
+		// A marked entity is read whole (see mark_dirty). A clean one keeps the values and stamps
+		// it already has for every slot it declared in gn_push, which is all any peer — including
+		// one being sent a full baseline — needs from it.
 		if (kv.value.dirty || !push_dirty) {
 			_read_and_stamp(kv.value, snapshot_ctr);
 			kv.value.dirty = false;
-		} else if (dirty_audit) {
-			// Audit: read it anyway and shout if it moved without being marked. Left applied
-			// rather than discarded so a dev build limps on correctly while reporting the bug.
-			if (_read_and_stamp(kv.value, snapshot_ctr)) {
-				UtilityFunctions::push_error("[goldnet] dirty_audit: '", sync->get_path(),
-						"' changed without mark_dirty() — it would have gone stale for every peer.");
-			}
+		} else if (kv.value.has_polled) {
+			// Undeclared slots on an unmarked entity: read them anyway. This is what keeps a
+			// missed mark_dirty from being a silent, permanent desync — the worst it can do is
+			// cost the read that push exists to avoid.
+			_read_and_stamp(kv.value, snapshot_ctr, true);
 		}
 		TickEnt e;
 		e.sync = sync;
