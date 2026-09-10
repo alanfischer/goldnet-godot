@@ -94,6 +94,25 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// once when it registers — that first read is what gives last_vals its contents, which
 		// every later full-state send (a new peer, a PVS re-entry) is served from.
 		bool dirty = true;
+		// Per-slot push declaration, from the "gn_push" meta (see _read_push). Listing a slot
+		// there is the game's promise to mark_dirty() every write to it; every slot NOT listed is
+		// read every tick regardless of the mark. That inversion is the point: an undeclared slot
+		// cannot go stale, so forgetting to mark one costs a read instead of silently desyncing it
+		// for every peer, and there is nothing left for an audit mode to hunt for.
+		//
+		// The split pays because the two sets don't overlap in practice. The bulk — a map's mover
+		// transforms, written by one publish funnel per entity — declares push and costs nothing;
+		// the slots that get forgotten are the rare hand-added ones, and there are a few dozen of
+		// those against the thousands of reads push exists to eliminate.
+		//
+		// Read once, like quant, and empty when the meta is absent or lists nothing we recognise
+		// — which reads as "every slot polled", the safe default for a game that says nothing.
+		Vector<uint8_t> slot_push;
+		bool push_read = false;
+		// Precomputed from slot_push: true when at least one slot is undeclared and so must be
+		// read on a tick where the entity was not marked. Entities that declare every slot skip
+		// the poll on one branch.
+		bool has_polled = true;
 	};
 	HashMap<uint64_t, SyncEntry> owned_syncs;    // ObjectID -> entry
 	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id   -> ObjectID (client apply lookup)
@@ -227,14 +246,14 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<uint64_t, uint64_t> dirty_route;
 	// Push mode. OFF by default: goldnet polls every entity every tick, which is correct without
 	// any cooperation from the game. A game that marks its writes (mark_dirty) opts in and pays
-	// only for entities that actually changed. Defaulting this on would silently stale every
+	// only for entities that actually changed. Defaulting this on would poll nothing for a
 	// consumer that has not been taught to mark.
+	//
+	// Turning it on does NOT put the whole entity on the game's word: only the slots it declared
+	// in "gn_push" go quiet when unmarked (see SyncEntry::slot_push). Everything else is still
+	// polled, so opting in is bounded — the worst a wrong declaration can do is lose updates for
+	// the slots it explicitly named.
 	bool push_dirty = false;
-	// Audit mode: read every entity as if it were dirty and report any that changed WITHOUT being
-	// marked. A missed mark_dirty is otherwise invisible — the entity just silently stops updating
-	// for everyone — so this exists to turn that into a loud, testable failure. Off by default;
-	// intended for dev builds and the integration suite, not production.
-	bool dirty_audit = false;
 
 	// Client receive history — mirror ring so a delta can be reconstructed against any
 	// recent baseline the server might diff against.
@@ -335,15 +354,16 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // has streamable sync props
 	// Build the per-slot quantization tags from a synchronizer's "gn_quant" meta (see gn_put_value).
 	static void _read_quant(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_quant);
-	static bool _read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr);
+	static void _read_push(MultiplayerSynchronizer *p_sync, Vector<uint8_t> &r_push);
+	// p_polled_only reads just the slots the game did NOT declare push-managed, for an entity
+	// that was not marked this tick. Slots it skips keep the values and stamps they already have.
+	static bool _read_and_stamp(SyncEntry &p_entry, uint32_t p_ctr, bool p_polled_only = false);
 
 public:
 	/// Tell goldnet an entity's replicated state has changed, so the next snapshot reads it.
 	/// Accepts the MultiplayerSynchronizer or the node it replicates. Cheap (one hash lookup
 	/// after the first call) and safe to call off-server or with no session — it no-ops.
 	void mark_dirty(Object *p_obj);
-	void set_dirty_audit(bool p_enabled);
-	bool get_dirty_audit() const;
 	void set_push_dirty(bool p_enabled);
 	bool get_push_dirty() const;
 
