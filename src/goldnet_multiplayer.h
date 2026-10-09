@@ -422,6 +422,15 @@ public:
 	bool is_debug_enabled() const;
 	// Drop this percent of outbound snapshots server-side to exercise the ack self-heal without a
 	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
+	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
+	// sim_config = {} is the off switch, and a read-back matches what was written. The individual
+	// setters below stay as plain C++ (the GOLDNET_* env parsing in the constructor uses them) but
+	// are deliberately NOT bound — a test harness should not be a third of the public API.
+	// Keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, spike_interval_s,
+	// spike_duration_s.
+	void set_sim_config(const Dictionary &p_cfg);
+	Dictionary get_sim_config() const;
+
 	void set_loss_percent(int p_pct);
 	int get_loss_percent() const;
 	// Seed for the whole network-condition sim — loss rolls AND latency draws (also

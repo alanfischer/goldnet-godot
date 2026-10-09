@@ -766,6 +766,32 @@ void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
 bool GoldNetMultiplayer::is_debug_enabled() const {
 	return dbg;
 }
+// Replace, not merge: every key absent from p_cfg goes back to its default, so `sim_config = {}`
+// turns the whole simulation off and a read-back always matches what was written. Callers that mean
+// to change one knob read, modify and write (see WizardWars' /sim_* commands).
+// spike_ms goes last: it is the one setter with a side effect (zero clears an in-flight spike).
+void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
+	set_loss_percent((int)p_cfg.get("loss_percent", 0));
+	set_sim_seed((int)p_cfg.get("seed", 0));
+	set_latency_min_ms((int)p_cfg.get("latency_min_ms", 0));
+	set_latency_max_ms((int)p_cfg.get("latency_max_ms", 0));
+	set_spike_interval_s((float)(double)p_cfg.get("spike_interval_s", 10.0));
+	set_spike_duration_s((float)(double)p_cfg.get("spike_duration_s", 0.2));
+	set_spike_ms((int)p_cfg.get("spike_ms", 0));
+}
+
+Dictionary GoldNetMultiplayer::get_sim_config() const {
+	Dictionary d;
+	d["loss_percent"] = get_loss_percent();
+	d["seed"] = get_sim_seed();
+	d["latency_min_ms"] = get_latency_min_ms();
+	d["latency_max_ms"] = get_latency_max_ms();
+	d["spike_ms"] = get_spike_ms();
+	d["spike_interval_s"] = get_spike_interval_s();
+	d["spike_duration_s"] = get_spike_duration_s();
+	return d;
+}
+
 void GoldNetMultiplayer::set_loss_percent(int p_pct) {
 	dbg_loss = p_pct < 0 ? 0 : (p_pct > 100 ? 100 : p_pct);
 }
@@ -1054,30 +1080,12 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
 	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
-	ClassDB::bind_method(D_METHOD("set_loss_percent", "pct"), &GoldNetMultiplayer::set_loss_percent);
-	ClassDB::bind_method(D_METHOD("get_loss_percent"), &GoldNetMultiplayer::get_loss_percent);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "loss_percent"), "set_loss_percent", "get_loss_percent");
-	ClassDB::bind_method(D_METHOD("set_sim_seed", "seed"), &GoldNetMultiplayer::set_sim_seed);
-	ClassDB::bind_method(D_METHOD("get_sim_seed"), &GoldNetMultiplayer::get_sim_seed);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "sim_seed"), "set_sim_seed", "get_sim_seed");
+	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
+	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
-	ClassDB::bind_method(D_METHOD("set_latency_min_ms", "ms"), &GoldNetMultiplayer::set_latency_min_ms);
-	ClassDB::bind_method(D_METHOD("get_latency_min_ms"), &GoldNetMultiplayer::get_latency_min_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_min_ms"), "set_latency_min_ms", "get_latency_min_ms");
-	ClassDB::bind_method(D_METHOD("set_latency_max_ms", "ms"), &GoldNetMultiplayer::set_latency_max_ms);
-	ClassDB::bind_method(D_METHOD("get_latency_max_ms"), &GoldNetMultiplayer::get_latency_max_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_max_ms"), "set_latency_max_ms", "get_latency_max_ms");
-	ClassDB::bind_method(D_METHOD("set_spike_ms", "ms"), &GoldNetMultiplayer::set_spike_ms);
-	ClassDB::bind_method(D_METHOD("get_spike_ms"), &GoldNetMultiplayer::get_spike_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "spike_ms"), "set_spike_ms", "get_spike_ms");
-	ClassDB::bind_method(D_METHOD("set_spike_interval_s", "s"), &GoldNetMultiplayer::set_spike_interval_s);
-	ClassDB::bind_method(D_METHOD("get_spike_interval_s"), &GoldNetMultiplayer::get_spike_interval_s);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_interval_s"), "set_spike_interval_s", "get_spike_interval_s");
-	ClassDB::bind_method(D_METHOD("set_spike_duration_s", "s"), &GoldNetMultiplayer::set_spike_duration_s);
-	ClassDB::bind_method(D_METHOD("get_spike_duration_s"), &GoldNetMultiplayer::get_spike_duration_s);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_duration_s"), "set_spike_duration_s", "get_spike_duration_s");
 	ClassDB::bind_method(D_METHOD("sim_reset"), &GoldNetMultiplayer::sim_reset);
 	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server

@@ -40,10 +40,9 @@ func setup(is_server: bool) -> void:
 		# Seed the sim first: this case's verdict depends on random latency draws, so
 		# without a seed a failure here couldn't be reproduced or bisected — which is the
 		# entire argument for the seed existing. Any non-zero constant will do.
-		goldnet().sim_seed = 20260720
-		# Wide spread so consecutive packets draw meaningfully different delays.
-		goldnet().latency_min_ms = 20
-		goldnet().latency_max_ms = 120
+		# The 20-120ms spread is wide on purpose, so consecutive packets draw meaningfully
+		# different delays.
+		goldnet().sim_config = {"seed": 20260720, "latency_min_ms": 20, "latency_max_ms": 120}
 
 
 func server_step(t: float) -> void:

@@ -52,13 +52,13 @@ func server_step(t: float) -> void:
 	if not fired("move"):
 		e.position = HOME
 	if at(t, BLACKOUT_START, "blackout_on"):
-		goldnet().loss_percent = 100
+		goldnet().sim_config = {"loss_percent": 100}
 		print("[server] blackout on (loss=100)")
 	if at(t, MOVE_AT, "move"):
 		e.position = AWAY
 		print("[server] moved Ent0 to AWAY during blackout")
 	if at(t, BLACKOUT_END, "blackout_off"):
-		goldnet().loss_percent = 0
+		goldnet().sim_config = {}
 		print("[server] blackout off (loss=0)")
 
 
