@@ -433,9 +433,9 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 		return nullptr;
 	}
 	// Catch spawners already in the tree and every one added afterward, so their spawn_function is
-	// wrapped before any spawn() call. This runs on our first poll — but a game that spawns during
-	// _ready (before any poll) must call capture_spawners() right after installing us, or those early
-	// spawns use the unwrapped function and are never replicated.
+	// wrapped before any spawn() call. First of three arming points: here (our first poll), again
+	// when a peer is set, and finally the on-the-spot wrap in _object_configuration_add for a spawn
+	// that beat both. A consumer never has to arm it by hand.
 	capture_spawners();
 	GoldNetLink *l = Object::cast_to<GoldNetLink>(root->get_node_or_null(NodePath("__GoldNetLink")));
 	if (!l) {
@@ -535,8 +535,10 @@ void GoldNetMultiplayer::_scan_spawners() {
 }
 
 // Arm spawner capture: wrap every spawner currently in the tree and connect node_added so future ones
-// are wrapped on entry. Idempotent. Called on our first poll, but a game that spawns during _ready must
-// call this immediately after set_multiplayer() so the spawn_function is wrapped before those spawns.
+// are wrapped on entry. Idempotent, and private — the engine never announces a spawner (only
+// synchronizers self-register), so this scan plus node_added is the only way to find them. Armed from
+// our first poll and from _set_multiplayer_peer; a spawn that still beats both is caught and the
+// spawner wrapped in _object_configuration_add, at the cost of that one node.
 void GoldNetMultiplayer::capture_spawners() {
 	if (spawners_scanned) {
 		return;
@@ -1084,7 +1086,6 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
-	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
 	// a re-entering entity arrives as a full delta and fires the synchronizer's own `synchronized`.
@@ -2003,8 +2004,8 @@ Error GoldNetMultiplayer::_poll() {
 }
 
 void GoldNetMultiplayer::_set_multiplayer_peer(const Ref<MultiplayerPeer> &p_peer) {
-	// Backstop: arm spawner capture the moment a session starts, so a game that spawns after setting the
-	// peer (but before our first poll) doesn't need to call capture_spawners() itself. Idempotent.
+	// Second arming point: the moment a session starts, covering a game that spawns after setting the
+	// peer but before our first poll. Idempotent.
 	capture_spawners();
 	inner->set_multiplayer_peer(p_peer);
 }
@@ -2042,7 +2043,24 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 	// spawner). We already learned the reconstruction data from the wrapped spawn_function
 	// (see _wrap_spawner / _spawn_trampoline), so nothing to do here but claim it — do not
 	// forward to the inner.
-	if (Object::cast_to<MultiplayerSpawner>(p_config)) {
+	if (MultiplayerSpawner *sp = Object::cast_to<MultiplayerSpawner>(p_config)) {
+		// Unless we never wrapped it. Then this spawn's spawn_function ran unintercepted and its
+		// recipe is gone for good: the recipe is the ARGUMENT to spawn(), consumed on the way in,
+		// and only the finished node survives — it cannot be read back out. So this one node will
+		// not replicate. What we can do is wrap the spawner right now, so every LATER spawn through
+		// it does, and say plainly what was lost.
+		//
+		// This is the one point the engine always tells us about: it is driven by MultiplayerSpawner
+		// itself, not by our trampoline, so detection never depends on the thing that failed.
+		// Server-only — a client rebuilds through _apply_spawn, which calls orig_fn and add_child
+		// directly and never routes back through here.
+		if (p_object != nullptr && inner->get_unique_id() == 1 && !spawners.has(sp->get_instance_id())) {
+			_wrap_spawner(sp);
+			ERR_PRINT(String("goldnet: spawner '") + String(sp->get_name()) +
+					"' spawned before it was captured - that one node will not replicate "
+					"(its spawn data is unrecoverable). Later spawns through it will. This means "
+					"the spawner was used before goldnet's first poll and before a peer was set.");
+		}
 		return OK;
 	}
 

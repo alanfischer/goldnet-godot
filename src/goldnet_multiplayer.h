@@ -398,6 +398,11 @@ private:
 	void _wrap_spawner(class MultiplayerSpawner *p_spawner);  // capture its spawn_function
 	void _on_node_added(Node *p_node);                        // SceneTree.node_added → wrap new spawners
 	void _scan_spawners();                                    // one-time: wrap spawners already in tree
+	// Arm spawner capture: scan the tree once and watch for later additions. Idempotent, and no
+	// longer public — it is called on our first poll and again when a peer is set, and a spawn that
+	// still slips through both wraps its spawner on the spot (see _object_configuration_add), so
+	// there is nothing left for a consumer to remember to do.
+	void capture_spawners();
 	Variant _spawn_trampoline(Variant p_data, int64_t p_spawner_objid); // wraps the game's spawn_function
 	void _drain_pending_spawns();  // promote captured spawns (now in-tree) to spawn_records
 	void _detect_despawns();       // poll: spawned nodes that were freed become despawns
@@ -470,7 +475,6 @@ public:
 	bool get_relevance_events() const;
 	// Arm spawner capture now (wrap existing spawners + hook node_added). Call right after installing
 	// GoldNet if the game spawns during _ready, before the first poll would otherwise do it.
-	void capture_spawners();
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).
