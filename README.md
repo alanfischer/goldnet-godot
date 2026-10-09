@@ -236,7 +236,7 @@ fire for the script that declares them). So the only way to discover what change
 everything and compare. Godot's own `property_get_watch` works the same way — it re-reads at
 `replication_interval` — so this isn't a mechanism being withheld, it doesn't exist.
 
-*Forces:* the `push_dirty` mode and its `mark_dirty()` API, where the game promises to announce
+*Forces:* the `mark_dirty()` API, where the game promises to announce
 its own writes. On a 390-entity map that turned a 2.8 ms/tick poll into 0.21 ms. The promise is
 scoped per slot rather than per entity — a sync's `gn_push` meta lists the properties it covers,
 and every property it doesn't name is polled every tick — so the mode is bounded: forgetting to
@@ -466,17 +466,17 @@ something false.
    untouched. It is a replication throttle, not a link-wide one.
 
 8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
-   `set_push_dirty(true)` makes goldnet read an entity only when the game announced it
-   with `mark_dirty(node_or_sync)`; on a 390-entity map that is a 2.8 ms/tick poll down
-   to 0.21 ms.
+   Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
+   game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a
+   2.8 ms/tick poll down to 0.21 ms.
 
-   The promise is **per property, not per entity**. A sync's `gn_push` meta lists the
-   leaf names the game commits to announcing; every property it does not name is polled
-   every tick as if push mode were off. So the mode is bounded — the worst a wrong
-   declaration can do is stall the properties it explicitly named, and a property added
-   to the config later can never silently go stale because nobody promised for it.
+   There is no switch to flip: **the `gn_push` meta IS the opt-in**, and the promise is
+   **per property, not per entity**. The meta lists the leaf names the game commits to
+   announcing; every property it does not name is polled every tick, and a sync that
+   declares nothing is polled entirely. So it is bounded — the worst a wrong declaration
+   can do is stall the properties it explicitly named, and a property added to the config
+   later can never silently go stale because nobody promised for it.
    ```gdscript
-   gn.set_push_dirty(true)
    # position is written by one publish funnel that calls mark_dirty; anything else on
    # this sync is left undeclared and keeps being polled.
    sync.set_meta("gn_push", ["position"])
