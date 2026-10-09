@@ -397,7 +397,6 @@ private:
 	bool spawners_scanned = false;
 	void _wrap_spawner(class MultiplayerSpawner *p_spawner);  // capture its spawn_function
 	void _on_node_added(Node *p_node);                        // SceneTree.node_added → wrap new spawners
-	void _scan_spawners();                                    // one-time: wrap spawners already in tree
 	// Arm spawner capture: scan the tree once and watch for later additions. Idempotent, and no
 	// longer public — it is called on our first poll and again when a peer is set, and a spawn that
 	// still slips through both wraps its spawner on the spot (see _object_configuration_add), so
