@@ -488,10 +488,15 @@ something false.
    per property — so the promise sits next to the property it is made about.
    Read **once**, on the entity's first tick, like `gn_quant` and `gn_priority`.
 
-   `debug_enabled` / `loss_percent` are also settable (mirror `GOLDNET_DEBUG` /
-   `GOLDNET_LOSS`). To receive PVS leave events, `set_relevance_events(true)` and
-   connect the `entity_relevance_lost(sync)` signal (see **How it works → Per-peer
-   visibility**).
+   `debug_enabled` is also settable (mirrors `GOLDNET_DEBUG`). Network-condition
+   simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
+   `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
+   `spike_duration_s` — which **replaces** the whole config on write, so `sim_config = {}`
+   is the off switch, a read-back matches what was written, and an unknown key is an
+   error rather than a silent reset. To change one knob, read-modify-write; every
+   setter is idempotent, so that disturbs nothing else (including the seed). To receive
+   PVS leave events, `set_relevance_events(true)` and connect the
+   `entity_relevance_lost(sync)` signal (see **How it works → Per-peer visibility**).
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
@@ -508,5 +513,5 @@ something false.
 - `GOLDNET_SIM_SEED=<n>` — make the whole sim reproducible: both the loss rolls and the
   latency draws come from one seeded generator. Unset (or `0`) uses the engine RNG, so
   every run drops different packets and draws different delays — fine for poking at
-  self-heal, useless for a regression test you need to re-run or bisect. Also exposed as
-  the `sim_seed` property.
+  self-heal, useless for a regression test you need to re-run or bisect. Also settable as
+  the `seed` key of the `sim_config` property.

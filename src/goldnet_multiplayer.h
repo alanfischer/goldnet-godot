@@ -280,8 +280,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
-	int dbg_loss = 0;                            // GOLDNET_LOSS=<pct> → drop that % of snapshots
-	uint32_t sim_seed = 0;                       // GOLDNET_SIM_SEED=<n> → 0 = engine RNG (nondeterministic)
+	int dbg_loss = SIM_LOSS_DEFAULT_PERCENT;     // GOLDNET_LOSS=<pct> → drop that % of snapshots
+	uint32_t sim_seed = SIM_SEED_DEFAULT;        // GOLDNET_SIM_SEED=<n> → 0 = engine RNG (nondeterministic)
 	uint32_t _sim_rng = 0;                       // xorshift state; only advanced when sim_seed != 0
 	// Every random draw the sim makes goes through here, so one seed replays a whole
 	// session. Unseeded falls through to the engine RNG — behavior identical to before.
@@ -296,11 +296,21 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// (dbg_loss, above) drops it. All send-side: the receiver runs its handler on arrival, so
 	// no receive hook is needed. A direct C++ port of the old net_latency_sim.gd (minus the
 	// per-leg >>1 half-split: latency here is the full per-leg delay, configured at each sender).
-	int   latency_min_ms   = 0;                  // GOLDNET_LATENCY=min,max (or a single fixed value)
-	int   latency_max_ms   = 0;
-	int   spike_ms         = 0;                  // GOLDNET_SPIKE=ms,interval,duration — one-way spike latency
-	float spike_interval_s = 10.0f;              // average seconds between spikes
-	float spike_duration_s = 0.2f;               // how long each spike lasts
+	// Defaults live here and nowhere else: set_sim_config uses these same constants as its
+	// absent-key fallbacks, so `sim_config = {}` and a fresh instance agree by construction.
+	static constexpr int   SIM_LATENCY_MIN_DEFAULT_MS = 0;
+	static constexpr int   SIM_LATENCY_MAX_DEFAULT_MS = 0;
+	static constexpr int   SIM_SPIKE_DEFAULT_MS       = 0;
+	static constexpr float SIM_SPIKE_INTERVAL_DEFAULT_S = 10.0f;
+	static constexpr float SIM_SPIKE_DURATION_DEFAULT_S = 0.2f;
+	static constexpr int   SIM_LOSS_DEFAULT_PERCENT   = 0;
+	static constexpr int   SIM_SEED_DEFAULT           = 0;
+
+	int   latency_min_ms   = SIM_LATENCY_MIN_DEFAULT_MS;  // GOLDNET_LATENCY=min,max (or a single fixed value)
+	int   latency_max_ms   = SIM_LATENCY_MAX_DEFAULT_MS;
+	int   spike_ms         = SIM_SPIKE_DEFAULT_MS;        // GOLDNET_SPIKE=ms,interval,duration — one-way spike latency
+	float spike_interval_s = SIM_SPIKE_INTERVAL_DEFAULT_S; // average seconds between spikes
+	float spike_duration_s = SIM_SPIKE_DURATION_DEFAULT_S; // how long each spike lasts
 	bool  _spike_active    = false;
 	float _spike_timer     = 0.0f;               // counts up to spike_interval_s while idle
 	float _spike_elapsed   = 0.0f;               // counts up to spike_duration_s while active
@@ -420,17 +430,19 @@ public:
 	// Periodic per-peer snapshot stats to stdout (also enabled by GOLDNET_DEBUG=1).
 	void set_debug_enabled(bool p_enabled);
 	bool is_debug_enabled() const;
-	// Drop this percent of outbound snapshots server-side to exercise the ack self-heal without a
-	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
 	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
-	// sim_config = {} is the off switch, and a read-back matches what was written. The individual
-	// setters below stay as plain C++ (the GOLDNET_* env parsing in the constructor uses them) but
-	// are deliberately NOT bound — a test harness should not be a third of the public API.
+	// sim_config = {} is the off switch, and a read-back matches what was written. Unknown keys are
+	// an error, so a typo cannot quietly reset the sim. The per-knob setters below stay as plain
+	// C++ (the GOLDNET_* env parsing in the constructor uses them) but are deliberately NOT bound —
+	// a test harness should not be a third of the public API.
 	// Keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, spike_interval_s,
-	// spike_duration_s.
+	// spike_duration_s. Every setter is idempotent, so a read-modify-write of one knob disturbs
+	// nothing else — see set_sim_seed.
 	void set_sim_config(const Dictionary &p_cfg);
 	Dictionary get_sim_config() const;
 
+	// Drop this percent of outbound snapshots server-side to exercise the ack self-heal without a
+	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
 	void set_loss_percent(int p_pct);
 	int get_loss_percent() const;
 	// Seed for the whole network-condition sim — loss rolls AND latency draws (also
