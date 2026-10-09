@@ -740,11 +740,6 @@ void GoldNetMultiplayer::set_peer_snapshot_interval_ms(int p_peer, int p_ms) {
 	pr.interval_ms = p_ms > 0 ? (uint32_t)p_ms : 0;
 }
 
-int GoldNetMultiplayer::get_peer_snapshot_interval_ms(int p_peer) const {
-	const PeerRing *pr = peer_rings.getptr(p_peer);
-	return pr ? (int)pr->interval_ms : 0;
-}
-
 void GoldNetMultiplayer::set_bandwidth_bps(int p_bps) {
 	bandwidth_bps_default = p_bps > 0 ? (uint32_t)p_bps : 0;
 }
@@ -755,17 +750,7 @@ void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
 	PeerRing &pr = peer_rings[p_peer]; // default-constructs: a budget may be set before the first tick
 	pr.bandwidth_bps = p_bps > 0 ? (uint32_t)p_bps : 0;
 }
-int GoldNetMultiplayer::get_peer_bandwidth_bps(int p_peer) const {
-	const PeerRing *pr = peer_rings.getptr(p_peer);
-	return pr ? (int)pr->bandwidth_bps : 0;
-}
 
-void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
-	dbg = p_enabled;
-}
-bool GoldNetMultiplayer::is_debug_enabled() const {
-	return dbg;
-}
 
 // Replace, not merge: every key absent from p_cfg goes back to its default, so `sim_config = {}`
 // turns the whole simulation off and a read-back always matches what was written. Callers that mean
@@ -889,15 +874,6 @@ void GoldNetMultiplayer::set_spike_duration_s(float p_s) {
 float GoldNetMultiplayer::get_spike_duration_s() const {
 	return spike_duration_s;
 }
-void GoldNetMultiplayer::sim_reset() {
-	_sim_queue.clear();
-	_last_fire_at = 0;
-	_spike_active = false;
-	_spike_timer = 0.0f;
-	_spike_elapsed = 0.0f;
-	_rpc_unreliable_cache.clear();
-}
-
 // --- Send-side sim engine (port of net_latency_sim.gd) ---
 
 // Advance the WiFi-spike state machine by one poll's worth of elapsed time. A spike is a brief
@@ -1097,23 +1073,17 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
-	ClassDB::bind_method(D_METHOD("get_peer_snapshot_interval_ms", "peer"), &GoldNetMultiplayer::get_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
 	ClassDB::bind_method(D_METHOD("set_bandwidth_bps", "bps"), &GoldNetMultiplayer::set_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
-	ClassDB::bind_method(D_METHOD("get_peer_bandwidth_bps", "peer"), &GoldNetMultiplayer::get_peer_bandwidth_bps);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
-	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
-	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
 	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
 	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
-	ClassDB::bind_method(D_METHOD("sim_reset"), &GoldNetMultiplayer::sim_reset);
 	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —

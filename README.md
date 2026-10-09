@@ -488,7 +488,8 @@ something false.
    per property — so the promise sits next to the property it is made about.
    Read **once**, on the entity's first tick, like `gn_quant` and `gn_priority`.
 
-   `debug_enabled` is also settable (mirrors `GOLDNET_DEBUG`). Network-condition
+   Per-peer snapshot stats go to stdout via `GOLDNET_DEBUG=1` (env only — there is no
+   runtime property for it). Network-condition
    simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
    `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
    `spike_duration_s` — which **replaces** the whole config on write, so `sim_config = {}`

@@ -415,8 +415,10 @@ public:
 	// replication_interval (min across owned syncs). Set >0 to pin one global tick rate.
 	void set_snapshot_interval_ms(int p_ms);
 	int get_snapshot_interval_ms() const;
+	// Write-only on purpose, like set_peer_bandwidth_bps below: the per-peer value is consulted in
+	// the send path, and nothing has ever needed to read it back, so the getters were dropped rather
+	// than carried as surface. Both are trivial to restore if a consumer turns up wanting them.
 	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
-	int get_peer_snapshot_interval_ms(int p_peer) const;
 	// Entity-delta bandwidth budget in bytes/sec, converted to a per-packet budget via each peer's
 	// snapshot interval. 0 (default) means no rate budget — only the flat MTU-safety ceiling
 	// applies, today's behavior. A rate budget only ever tightens that ceiling, never relaxes it.
@@ -426,10 +428,6 @@ public:
 	void set_bandwidth_bps(int p_bps);
 	int get_bandwidth_bps() const;
 	void set_peer_bandwidth_bps(int p_peer, int p_bps);
-	int get_peer_bandwidth_bps(int p_peer) const;
-	// Periodic per-peer snapshot stats to stdout (also enabled by GOLDNET_DEBUG=1).
-	void set_debug_enabled(bool p_enabled);
-	bool is_debug_enabled() const;
 	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
 	// sim_config = {} is the off switch, and a read-back matches what was written. Unknown keys are
 	// an error, so a typo cannot quietly reset the sim. The per-knob setters below stay as plain
@@ -466,7 +464,6 @@ public:
 	void set_spike_duration_s(float p_s);
 	float get_spike_duration_s() const;
 	// Clear runtime sim state (pending sends, ordering cursors, spike machine). Leaves config intact.
-	void sim_reset();
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
 	void set_relevance_events(bool p_enabled);
