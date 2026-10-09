@@ -49,8 +49,8 @@ var main: Node = null
 var client_index: int = 0
 
 
-## The installed GoldNetMultiplayer, for cases that drive its knobs (loss_percent,
-## sim_seed, snapshot_interval_ms, ...). Returned untyped on purpose: those properties
+## The installed GoldNetMultiplayer, for cases that drive its knobs (sim_config,
+## snapshot_interval_ms, ...). Returned untyped on purpose: those properties
 ## live on the GDExtension class, not on the MultiplayerAPI base, so a static type here
 ## would reject them at parse time.
 func goldnet():
@@ -60,7 +60,8 @@ func goldnet():
 # --- overrides ---
 
 ## Called once after the peer is created, before any frame runs. Use to set timeout_s or
-## configure the GoldNetMultiplayer (loss_percent, sim_seed, ...).
+## configure the GoldNetMultiplayer. Note sim_config REPLACES the whole sim config on write,
+## so `sim_config = {}` turns the simulation off and a partial write resets the rest.
 func setup(_is_server: bool) -> void:
 	pass
 

@@ -302,7 +302,7 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	dbg = getenv("GOLDNET_DEBUG") != nullptr;
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
-		dbg_loss = loss ? atoi(loss) : 0;
+		set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
 		// GOLDNET_SIM_SEED=<n> makes the whole sim (loss rolls + latency draws) reproducible
 		// run-to-run; without it the sim stays nondeterministic (engine RNG), as before.
 		const char *seed = getenv("GOLDNET_SIM_SEED");
@@ -766,6 +766,47 @@ void GoldNetMultiplayer::set_debug_enabled(bool p_enabled) {
 bool GoldNetMultiplayer::is_debug_enabled() const {
 	return dbg;
 }
+
+// Replace, not merge: every key absent from p_cfg goes back to its default, so `sim_config = {}`
+// turns the whole simulation off and a read-back always matches what was written. Callers that mean
+// to change one knob read, modify and write (see WizardWars' /sim_* commands) — which is only safe
+// because every setter below is idempotent.
+void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
+	// Validate every key BEFORE applying any, so a typo rejects the whole write instead of half
+	// configuring the sim. Unbinding the seven per-knob properties took GDScript's own typo check
+	// away (an invalid property assignment used to be a runtime error); this replaces it. Without
+	// it, `sim_config = {"los_percent": 100}` would silently reset the sim to defaults instead.
+	const Array keys = p_cfg.keys();
+	for (int i = 0; i < keys.size(); i++) {
+		const String k = keys[i];
+		if (k != "loss_percent" && k != "seed" && k != "latency_min_ms" && k != "latency_max_ms" &&
+				k != "spike_ms" && k != "spike_interval_s" && k != "spike_duration_s") {
+			ERR_FAIL_MSG("goldnet: unknown sim_config key '" + k +
+					"'. Valid keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, "
+					"spike_interval_s, spike_duration_s.");
+		}
+	}
+	set_loss_percent((int)p_cfg.get("loss_percent", SIM_LOSS_DEFAULT_PERCENT));
+	set_sim_seed((int)p_cfg.get("seed", SIM_SEED_DEFAULT));
+	set_latency_min_ms((int)p_cfg.get("latency_min_ms", SIM_LATENCY_MIN_DEFAULT_MS));
+	set_latency_max_ms((int)p_cfg.get("latency_max_ms", SIM_LATENCY_MAX_DEFAULT_MS));
+	set_spike_ms((int)p_cfg.get("spike_ms", SIM_SPIKE_DEFAULT_MS));
+	set_spike_interval_s((float)p_cfg.get("spike_interval_s", SIM_SPIKE_INTERVAL_DEFAULT_S));
+	set_spike_duration_s((float)p_cfg.get("spike_duration_s", SIM_SPIKE_DURATION_DEFAULT_S));
+}
+
+Dictionary GoldNetMultiplayer::get_sim_config() const {
+	Dictionary d;
+	d["loss_percent"] = get_loss_percent();
+	d["seed"] = get_sim_seed();
+	d["latency_min_ms"] = get_latency_min_ms();
+	d["latency_max_ms"] = get_latency_max_ms();
+	d["spike_ms"] = get_spike_ms();
+	d["spike_interval_s"] = get_spike_interval_s();
+	d["spike_duration_s"] = get_spike_duration_s();
+	return d;
+}
+
 void GoldNetMultiplayer::set_loss_percent(int p_pct) {
 	dbg_loss = p_pct < 0 ? 0 : (p_pct > 100 ? 100 : p_pct);
 }
@@ -773,7 +814,15 @@ int GoldNetMultiplayer::get_loss_percent() const {
 	return dbg_loss;
 }
 void GoldNetMultiplayer::set_sim_seed(int p_seed) {
-	sim_seed = (uint32_t)(p_seed < 0 ? 0 : p_seed);
+	const uint32_t next = (uint32_t)(p_seed < 0 ? 0 : p_seed);
+	if (next == sim_seed) {
+		// Idempotent on purpose: re-writing the same seed must NOT restart the sequence. A caller
+		// doing a read-modify-write of one unrelated knob (/sim_loss on a seeded run) writes the
+		// seed back unchanged, and rewinding there would destroy the reproducibility the seed
+		// exists to provide.
+		return;
+	}
+	sim_seed = next;
 	_sim_rng = goldnet::sim_rng_seed(sim_seed); // restart the sequence
 }
 int GoldNetMultiplayer::get_sim_seed() const {
@@ -814,7 +863,11 @@ int GoldNetMultiplayer::get_latency_max_ms() const {
 	return latency_max_ms;
 }
 void GoldNetMultiplayer::set_spike_ms(int p_ms) {
-	spike_ms = p_ms < 0 ? 0 : p_ms;
+	const int next = p_ms < 0 ? 0 : p_ms;
+	if (next == spike_ms) {
+		return; // idempotent, same reason as set_sim_seed
+	}
+	spike_ms = next;
 	if (spike_ms == 0) { // disabling clears any in-flight spike
 		_spike_active = false;
 		_spike_timer = 0.0f;
@@ -1054,30 +1107,12 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_debug_enabled", "enabled"), &GoldNetMultiplayer::set_debug_enabled);
 	ClassDB::bind_method(D_METHOD("is_debug_enabled"), &GoldNetMultiplayer::is_debug_enabled);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "debug_enabled"), "set_debug_enabled", "is_debug_enabled");
-	ClassDB::bind_method(D_METHOD("set_loss_percent", "pct"), &GoldNetMultiplayer::set_loss_percent);
-	ClassDB::bind_method(D_METHOD("get_loss_percent"), &GoldNetMultiplayer::get_loss_percent);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "loss_percent"), "set_loss_percent", "get_loss_percent");
-	ClassDB::bind_method(D_METHOD("set_sim_seed", "seed"), &GoldNetMultiplayer::set_sim_seed);
-	ClassDB::bind_method(D_METHOD("get_sim_seed"), &GoldNetMultiplayer::get_sim_seed);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "sim_seed"), "set_sim_seed", "get_sim_seed");
+	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
+	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
-	ClassDB::bind_method(D_METHOD("set_latency_min_ms", "ms"), &GoldNetMultiplayer::set_latency_min_ms);
-	ClassDB::bind_method(D_METHOD("get_latency_min_ms"), &GoldNetMultiplayer::get_latency_min_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_min_ms"), "set_latency_min_ms", "get_latency_min_ms");
-	ClassDB::bind_method(D_METHOD("set_latency_max_ms", "ms"), &GoldNetMultiplayer::set_latency_max_ms);
-	ClassDB::bind_method(D_METHOD("get_latency_max_ms"), &GoldNetMultiplayer::get_latency_max_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "latency_max_ms"), "set_latency_max_ms", "get_latency_max_ms");
-	ClassDB::bind_method(D_METHOD("set_spike_ms", "ms"), &GoldNetMultiplayer::set_spike_ms);
-	ClassDB::bind_method(D_METHOD("get_spike_ms"), &GoldNetMultiplayer::get_spike_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "spike_ms"), "set_spike_ms", "get_spike_ms");
-	ClassDB::bind_method(D_METHOD("set_spike_interval_s", "s"), &GoldNetMultiplayer::set_spike_interval_s);
-	ClassDB::bind_method(D_METHOD("get_spike_interval_s"), &GoldNetMultiplayer::get_spike_interval_s);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_interval_s"), "set_spike_interval_s", "get_spike_interval_s");
-	ClassDB::bind_method(D_METHOD("set_spike_duration_s", "s"), &GoldNetMultiplayer::set_spike_duration_s);
-	ClassDB::bind_method(D_METHOD("get_spike_duration_s"), &GoldNetMultiplayer::get_spike_duration_s);
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spike_duration_s"), "set_spike_duration_s", "get_spike_duration_s");
 	ClassDB::bind_method(D_METHOD("sim_reset"), &GoldNetMultiplayer::sim_reset);
 	ClassDB::bind_method(D_METHOD("capture_spawners"), &GoldNetMultiplayer::capture_spawners);
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server

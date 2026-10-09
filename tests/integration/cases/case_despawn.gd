@@ -51,7 +51,7 @@ func server_step(t: float) -> void:
 			e0.queue_free()
 			print("[server] freed Ent0 (link clear)")
 	if at(t, BLACKOUT_START, "blackout_on"):
-		goldnet().loss_percent = 100
+		goldnet().sim_config = {"loss_percent": 100}
 		print("[server] blackout on")
 	if at(t, FREE_HIDDEN_AT, "free_hidden"):
 		var e1: Node3D = ents.get("Ent1")
@@ -59,7 +59,7 @@ func server_step(t: float) -> void:
 			e1.queue_free()
 			print("[server] freed Ent1 during blackout")
 	if at(t, BLACKOUT_END, "blackout_off"):
-		goldnet().loss_percent = 0
+		goldnet().sim_config = {}
 		print("[server] blackout off")
 
 
