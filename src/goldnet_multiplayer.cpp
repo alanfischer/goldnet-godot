@@ -1046,25 +1046,8 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 	dirty_route[id] = 0;
 }
 
-void GoldNetMultiplayer::set_push_dirty(bool p_enabled) {
-	push_dirty = p_enabled;
-	if (!p_enabled) {
-		// Back to polling: nothing is trusted to be up to date, so read everything next tick.
-		for (KeyValue<uint64_t, SyncEntry> &kv : owned_syncs) {
-			kv.value.dirty = true;
-		}
-	}
-}
-
-bool GoldNetMultiplayer::get_push_dirty() const {
-	return push_dirty;
-}
-
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("mark_dirty", "object"), &GoldNetMultiplayer::mark_dirty);
-	ClassDB::bind_method(D_METHOD("set_push_dirty", "enabled"), &GoldNetMultiplayer::set_push_dirty);
-	ClassDB::bind_method(D_METHOD("get_push_dirty"), &GoldNetMultiplayer::get_push_dirty);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "push_dirty"), "set_push_dirty", "get_push_dirty");
 	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
@@ -1334,7 +1317,11 @@ void GoldNetMultiplayer::_server_tick() {
 		// A marked entity is read whole (see mark_dirty). A clean one keeps the values and stamps
 		// it already has for every slot it declared in gn_push, which is all any peer — including
 		// one being sent a full baseline — needs from it.
-		if (kv.value.dirty || !push_dirty) {
+		//
+		// No global enable: the "gn_push" meta IS the opt-in. An entity that declares nothing has
+		// an empty slot_push, so has_polled is true and the branch below reads every slot — exactly
+		// what a consumer that says nothing used to get from the old push_dirty=false default.
+		if (kv.value.dirty) {
 			_read_and_stamp(kv.value, snapshot_ctr);
 			kv.value.dirty = false;
 		} else if (kv.value.has_polled) {

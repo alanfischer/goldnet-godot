@@ -244,17 +244,6 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// game thinks in entities, not synchronizers. Resolving node -> sync means scanning children,
 	// so the answer is memoized here on first use. Keyed by node ObjectID.
 	HashMap<uint64_t, uint64_t> dirty_route;
-	// Push mode. OFF by default: goldnet polls every entity every tick, which is correct without
-	// any cooperation from the game. A game that marks its writes (mark_dirty) opts in and pays
-	// only for entities that actually changed. Defaulting this on would poll nothing for a
-	// consumer that has not been taught to mark.
-	//
-	// Turning it on does NOT put the whole entity on the game's word: only the slots it declared
-	// in "gn_push" go quiet when unmarked (see SyncEntry::slot_push). Everything else is still
-	// polled, so opting in is bounded — the worst a wrong declaration can do is lose updates for
-	// the slots it explicitly named.
-	bool push_dirty = false;
-
 	// Client receive history — mirror ring so a delta can be reconstructed against any
 	// recent baseline the server might diff against.
 	FrameData client_frames[RING];
@@ -374,8 +363,6 @@ public:
 	/// Accepts the MultiplayerSynchronizer or the node it replicates. Cheap (one hash lookup
 	/// after the first call) and safe to call off-server or with no session — it no-ops.
 	void mark_dirty(Object *p_obj);
-	void set_push_dirty(bool p_enabled);
-	bool get_push_dirty() const;
 
 private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
