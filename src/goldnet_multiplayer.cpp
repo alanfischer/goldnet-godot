@@ -523,17 +523,6 @@ void GoldNetMultiplayer::_on_node_added(Node *p_node) {
 	}
 }
 
-void GoldNetMultiplayer::_scan_spawners() {
-	SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
-	if (!tree || !tree->get_root()) {
-		return;
-	}
-	TypedArray<Node> found = tree->get_root()->find_children("*", "MultiplayerSpawner", true, false);
-	for (int i = 0; i < found.size(); i++) {
-		_wrap_spawner(Object::cast_to<MultiplayerSpawner>(found[i]));
-	}
-}
-
 // Arm spawner capture: wrap every spawner currently in the tree and connect node_added so future ones
 // are wrapped on entry. Idempotent, and private — the engine never announces a spawner (only
 // synchronizers self-register), so this scan plus node_added is the only way to find them. Armed from
@@ -548,8 +537,12 @@ void GoldNetMultiplayer::capture_spawners() {
 		return; // tree not ready yet — the first poll will retry
 	}
 	spawners_scanned = true;
+	// node_added covers every spawner from here on; the sweep below covers the ones already in.
 	tree->connect("node_added", callable_mp(this, &GoldNetMultiplayer::_on_node_added));
-	_scan_spawners();
+	TypedArray<Node> found = tree->get_root()->find_children("*", "MultiplayerSpawner", true, false);
+	for (int i = 0; i < found.size(); i++) {
+		_wrap_spawner(Object::cast_to<MultiplayerSpawner>(found[i]));
+	}
 }
 
 // The wrapper installed over each spawner's spawn_function. On the server, spawn(data)
