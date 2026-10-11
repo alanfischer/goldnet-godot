@@ -1,8 +1,8 @@
 class_name ServerClock
 extends RefCounted
 
-## Reusable client-side server-clock estimator — the third goldnet client helper, alongside
-## InterpolationBuffer and PredictedBody, and transport-agnostic like them. Feed it server-time
+## Reusable client-side server-clock estimator — a goldnet client helper alongside
+## InterpolationBuffer, and transport-agnostic like it. Feed it server-time
 ## observations (goldnet emits one per snapshot via the `server_time_received` signal, but any
 ## beacon RPC or packet stamp works) and it maintains a smoothly-corrected estimate of the current
 ## server clock. now() is the render timeline that drives interpolation:

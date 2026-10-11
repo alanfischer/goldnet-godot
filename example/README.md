@@ -46,6 +46,7 @@ The client prints, once per second:
 - The server defers its initial `spawn()` by one frame (`await get_tree().process_frame`)
   so goldnet has wrapped the spawner before entities are created. In a real game, entities
   spawn well after setup, so this only matters when spawning in the spawner's own first frame.
-- Client-side smoothing (`InterpolationBuffer`) and local prediction (`PredictedBody`) are
-  shipped in `addons/goldnet/` as optional helpers; this demo keeps things minimal and just
-  applies the replicated state directly.
+- Client-side smoothing (`InterpolationBuffer`) is shipped in `addons/goldnet/` as an optional
+  helper; this demo keeps things minimal and just applies the replicated state directly. Local
+  prediction is not part of this addon — it lives in pmove-godot, which owns the movement it
+  reconciles.
