@@ -3,8 +3,8 @@ extends RefCounted
 
 ## One table saying what a MultiplayerSynchronizer replicates — the properties, and per property
 ## goldnet's per-slot hints — from which the SceneReplicationConfig and goldnet's metas are BOTH
-## derived. The fourth addon helper, alongside InterpolationBuffer, PredictedBody and ServerClock,
-## and like them pure GDScript: it needs no built extension and is inert without goldnet installed.
+## derived. The third addon helper, alongside InterpolationBuffer and ServerClock, and like them
+## pure GDScript: it needs no built extension and is inert without goldnet installed.
 ##
 ## Why it exists: goldnet's per-slot hints ride node metas (`gn_quant`, `gn_push`, `gn_priority`)
 ## keyed by a property's LEAF name, because SceneReplicationConfig has nowhere to put per-property
@@ -34,9 +34,9 @@ extends RefCounted
 ## Sync-wide options (the third argument):
 ##   "priority" float  goldnet's `gn_priority` entity weight for the snapshot budget.
 ##
-## For a synchronizer BAKED into a .tscn — which stock SceneMultiplayer requires, since a
-## runtime-built one gets no replication-ID handshake; goldnet pairs either, by scene path — the
-## scene owns the config, so declare the same table and call apply() instead. It stamps the metas
+## For a synchronizer BAKED into a .tscn, the scene owns the config, so declare the same table and
+## call apply() instead. (Baking is not a transport requirement: goldnet pairs a runtime-built sync
+## by scene path, and stock pairs one too — measured on 4.7, see the README's retracted gap #4.) It stamps the metas
 ## and reports any drift between the table and the config the scene actually shipped:
 ##
 ##   SyncSpec.apply($NetSync, SPEC)

@@ -264,17 +264,21 @@ and replaces the spawner's `spawn_function` with a trampoline purely to capture 
 data. A `spawner_registered` hook, or spawn data available on the configuration callback, would
 delete all of it.
 
-**4. Runtime-added synchronizers that actually pair.** A `MultiplayerSynchronizer` created in
-code gets no replication-ID handshake and never pairs with its remote counterpart — it has to be
-baked into the `.tscn`.
+**4. Runtime-added synchronizers that actually pair — RETRACTED, this is not a gap.** This entry
+used to claim that a `MultiplayerSynchronizer` created in code gets no replication-ID handshake,
+never pairs with its remote counterpart, and therefore has to be baked into a `.tscn` for stock
+SceneMultiplayer. Measured on Godot 4.7 and it is false: a headless host+client run on
+WizardWars' `--stock` fallback paired both of its runtime-built synchronizers — one built on a
+map-static node, one built inside a spawner-instantiated entity — and movers, dynamic entities
+and player puppets all arrived, with no errors on either side.
 
-*Forces:* nothing under goldnet, which is worth stating plainly because the gap reads like it
-binds here and doesn't: goldnet keys a synchronizer by the hash of its scene path
-(`net_id_for`), so a code-built sync pairs exactly like a baked one as long as both peers build
-it at the same path. Consumers must still ship scenes with synchronizers pre-baked for the
-**stock** transport (see WizardWars' `remote_player.tscn`, which keeps a baked config for its
-`--stock` fallback), so anything that needs to run on both, and is assembled at runtime, needs a
-scene file it would not otherwise need.
+*Forces:* nothing, either way. goldnet keys a synchronizer by the hash of its scene path
+(`net_id_for`), so a code-built sync pairs exactly like a baked one as long as both peers build it
+at the same path; stock, on 4.7, pairs them too. The entry is kept rather than deleted because the
+numbering is cited from elsewhere — and because a reader who has met the same lore should be able
+to find the retraction. If your runtime-built sync does not pair under stock, the difference is
+likely that the two peers build it at different paths, which is worth checking before baking a
+scene you would not otherwise need.
 
 **5. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
 metadata, so an extension that wants a hint per slot (goldnet's quantization tags: `angle16`,
@@ -367,9 +371,10 @@ client, where it passes while testing nothing.
 ./tests/gdscript/run.sh interpolation_buffer # just one
 ```
 
-Covers the four helpers the addon ships alongside the extension — the client-side
-`InterpolationBuffer`, `PredictedBody` and `ServerClock`, plus `SyncSpec`, which builds a
-synchronizer's config and goldnet's metas from one declaration. They're pure GDScript with no
+Covers the three helpers the addon ships alongside the extension — the client-side
+`InterpolationBuffer` and `ServerClock`, plus `SyncSpec`, which builds a synchronizer's config and
+goldnet's metas from one declaration. (Local prediction, once `PredictedBody` here, moved out to
+pmove-godot — its only consumer — and is not part of this addon.) They're pure GDScript with no
 dependency on goldnet's wire protocol, so this needs no built extension, no peer and no
 second process; the whole thing runs in one headless process in well under a second.
 
