@@ -7,7 +7,7 @@ delta-against-acked-baseline snapshot stream — served **behind the stock
 synchronizers, spawners, and `@rpc` methods; installing goldnet swaps only the
 *state-replication* layer underneath them.
 
-It is the netcode sibling to [`goldsrc-godot`](../goldsrc-godot) (the asset
+It is the netcode sibling to [`goldsrc-godot`](https://github.com/alanfischer/goldsrc-godot) (the asset
 loader), built as a single Godot GDExtension.
 
 ## Why
