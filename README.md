@@ -296,6 +296,15 @@ node — so two replicated properties that share a leaf name still cannot be hin
 slot, and after caching the resolved read plan that's essentially all the read loop is. Reading
 fewer properties is the only way past it — hence (1).
 
+## Related projects
+
+Part of a set of Godot 4 libraries for GoldSrc-style games:
+
+- [goldsrc-godot](https://github.com/alanfischer/goldsrc-godot): BSP/MDL/SPR/WAD loading, PVS, hull data
+- [hop-godot](https://github.com/alanfischer/hop-godot): hop physics as a `PhysicsServer3D` backend, with BSP hull traces
+- [pmove-godot](https://github.com/alanfischer/pmove-godot): GoldSrc player movement and client prediction
+- **goldnet-godot**: snapshot replication behind Godot's `MultiplayerAPI`
+
 ## Building
 
 ```bash
