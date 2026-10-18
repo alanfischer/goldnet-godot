@@ -82,6 +82,9 @@ server emits one unreliable snapshot:
 [u16 changed]    { [u32 net_id][uvarint changed_mask]{ value } per set bit } *
 ```
 
+The byte-level contract — primitives, every value tag, the ack, and what each end does with a
+snapshot — is in [`docs/protocol.md`](docs/protocol.md).
+
 - `base_seq` is the frame this peer last acked (0 = full state). The server keeps a
   per-peer ring of recent frames; the client keeps a matching ring and acks the
   newest frame it applied. On loss the ack stalls, the server keeps diffing against
@@ -515,6 +518,14 @@ something false.
    gn.get_peer_chokes(peer)          # snapshots withheld so far
    ```
 
+   A peer can also be served less often than the server ticks (GoldSrc's `cl_updaterate`),
+   without slowing anyone else: the tick still runs at full rate and only skips that peer until
+   its interval has passed. It is dropped with the peer on disconnect, so set it again on
+   reconnect.
+   ```gdscript
+   gn.set_peer_snapshot_interval_ms(peer, 50)  # 20 Hz for this peer; 0 = every tick (the default)
+   ```
+
    By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
    `replication_interval`. A game with a fixed server tick can instead send them itself,
    once per tick after writing that tick's state — GoldSrc's `SV_SendClientMessages` at the
@@ -574,6 +585,40 @@ something false.
 > To add the extension without opening the editor, append
 > `res://addons/goldnet/goldnet.gdextension` to that file manually. WizardWars gates
 > the install behind the `--goldnet` command-line flag.
+
+## Using the core without Godot
+
+`core/include/goldnet/` is header-only C++17 with no dependency beyond the standard library: add
+it to the include path. `goldnet::Server<V, X>` and `goldnet::Client<V>` are templates over your
+engine's value type `V` (default-constructible, copyable, comparable with `!=`) and optional
+per-entity storage `X`. They reach the engine only through a host object you pass in, whose
+methods are listed at the top of `server.h` and `client.h`. `tests/test_protocol.cpp` has a
+complete minimal pair, `TestServerHost` and `TestClientHost`, over plain ints.
+
+On the server:
+
+```cpp
+goldnet::Server<MyValue> server;
+server.set_tick_interval_ms(33);
+server.set_packet_overhead(28);     // what your link adds per packet, for rate budgets
+
+server.add_entity(key, net_id);     // an entity starts replicating; remove_entity(key)
+server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
+server.mark_dirty(key);             // a pushed slot was written (see gn_push)
+
+server.tick(now_ms, peers, host);   // every tick: reads state, sends each due peer a snapshot
+server.on_ack(peer, seq);           // each ack the client sends
+server.remove_peer(peer);           // on disconnect
+```
+
+Per-peer cadence, budget and rate are `set_peer_interval_ms`, `set_peer_bandwidth_bps` and
+`set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
+
+On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
+for a new session. The host's `send_ack(seq)` must reach the server's `on_ack`. Both directions
+expect an unreliable datagram link; the wire format is in [`docs/protocol.md`](docs/protocol.md).
+`goldnet::NetSim` (`netsim.h`) adds simulated loss, latency, spikes and a slow link to your send
+path; its header shows the calls.
 
 ## Debugging
 
