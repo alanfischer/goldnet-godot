@@ -11,11 +11,12 @@
 // PHASE 0: pure pass-through — every virtual forwarded to the inner.
 // PHASE 1 (this file): we intercept the synchronizers we can fully own — those whose
 //   replication config is *sync-only* (no spawn-marked properties) — into our own
-//   registry, and stream their full state ourselves each tick as an unreliable
-//   snapshot (via GoldNetLink), honoring the synchronizer's visibility. Synchronizers
-//   with spawn-marked properties stay coupled to the inner's spawner (Phase 3 folds
-//   spawns into our stream), as do MultiplayerSpawners and all RPCs.
-//   This is "old netcode (ALWAYS full-state) on our path" — parity, not yet the delta.
+//   registry, and stream them ourselves each tick as an unreliable snapshot (via
+//   GoldNetLink), honoring the synchronizer's visibility. Each peer gets a delta
+//   against the last frame it acked, and a full frame only on its first send or when
+//   that ack has aged out. Synchronizers with spawn-marked properties stay coupled to
+//   the inner's spawner (Phase 3 folds spawns into our stream), as do
+//   MultiplayerSpawners and all RPCs.
 
 #include "goldnet_codec.h"
 
