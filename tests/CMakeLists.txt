@@ -1,7 +1,6 @@
-# Standalone tests for the engine-agnostic parts of goldnet (src/goldnet_codec.h).
-# No godot-cpp: its engine classes route through GDExtension function pointers that only
-# exist inside a running Godot process, so anything touching Variant/StreamPeerBuffer is
-# out of scope here and belongs in an in-engine test instead.
+# Standalone tests for goldnet's engine-agnostic core (core/include/goldnet). No godot-cpp:
+# its engine classes route through GDExtension function pointers that only exist inside a
+# running Godot process, so the Godot adapter itself belongs in the integration suite.
 #
 # Build & run:
 #
@@ -33,10 +32,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_link_options(-fsanitize=undefined)
 endif()
 
-foreach(test_name test_codec test_seq)
+foreach(test_name test_codec test_seq test_protocol test_netsim)
     add_executable(${test_name} ${test_name}.cpp)
     target_include_directories(${test_name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../core/include)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()

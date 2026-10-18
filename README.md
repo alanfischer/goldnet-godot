@@ -23,6 +23,17 @@ loss levels where reliable replication drops clients (see **Performance** below)
 
 ## How it works
 
+**An engine-agnostic core, adapted to Godot.** The protocol itself lives in
+`core/include/goldnet/` as header-only C++ with no Godot dependency: `goldnet::Server`
+(change tracking, per-peer deltas against the acked frame, acks, spawns, leaves, the
+packet budget) and `goldnet::Client` (baseline reconstruction and apply), over the
+byte-level wire in `buffer.h` / `codec.h` / `protocol.h`, plus `goldnet::NetSim`, the
+send-side loss / latency / spike simulator. Both are templated on the
+host's value type and reach the engine only through a small host interface — read a
+slot, test visibility, encode a value, send bytes — so Godot's `Variant`s pass through
+unconverted. Everything Godot-specific (synchronizers, spawners, `Variant` encoding, the
+inner `SceneMultiplayer`) is the adapter in `src/`.
+
 **Composition, not replacement.** `GoldNetMultiplayer extends
 MultiplayerAPIExtension` and holds an inner stock `SceneMultiplayer`
 (`MultiplayerAPI::create_default_interface()`). Handshake, auth, peer lifecycle,
@@ -39,7 +50,7 @@ simply drops a `net_id` it doesn't yet hold and self-heals.
 entity-agnostic; players, bots, projectiles, and map movers all flow through one
 pipeline. A node lands in:
 
-- **`owned_syncs`** when its `MultiplayerSynchronizer` enters the tree with at
+- **the core server's entities** when its `MultiplayerSynchronizer` enters the tree with at
   least one per-tick property (`_object_configuration_add`). This is the
   per-tick delta stream, and it covers *both* map-static movers and spawned
   entities.
@@ -54,7 +65,7 @@ pipeline. A node lands in:
   every transition is observed. goldnet converges instead — if a property goes
   A→B→A between two acked frames, the peer sees only the final A. That holds for
   every slot; goldnet carries *state*, not events. Put events on `@rpc`.
-- **`spawn_records`** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
+- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
   Map-static entities load with the map (both peers already have them) so they need
   no spawn record; runtime entities do, because the client has no other way to know
   they should exist.
@@ -330,18 +341,31 @@ cmake --build tests/build
 ctest --test-dir tests/build --output-on-failure
 ```
 
-Standalone — no godot-cpp, no engine, runs in under a second. The suite covers
-`src/goldnet_codec.h`: the zig-zag and unsigned varint codecs (round-trip, encoded
-widths, and malformed over-long streams, which are reachable from the wire), the
-angle16/angle8 quantizers (round-trip, wraparound, non-finite input), uint16 sequence
-comparison across rollover, the reliable-until-acked bookkeeping, and the seeded loss
-PRNG.
+Standalone — no godot-cpp, no engine, runs in about a second. It covers the core in
+`core/include/goldnet/`:
+
+- `test_codec`: the zig-zag and unsigned varint codecs (round-trip, encoded widths, and
+  malformed over-long streams, which are reachable from the wire), the angle16/angle8
+  quantizers (round-trip, wraparound, non-finite input), the half-float codec (every
+  non-NaN value, and the round-to-nearest-even edges), the bounds-checked `Reader`, and
+  the seeded loss PRNG.
+- `test_seq`: uint16 sequence comparison across rollover and the reliable-until-acked
+  bookkeeping.
+- `test_protocol`: a real `goldnet::Server` feeding real `goldnet::Client`s over a fake
+  link that drops snapshots or acks, with plain ints as values — deltas against the
+  acked baseline, self-heal after a lost snapshot or ack, ack aging into a full frame,
+  lazy and reliable spawns, despawns scoped to holders, derived PVS leaves (including
+  re-entry before the leave is acked), the packet budget and its priority order,
+  per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
+  reordered, truncated or mismatched packets.
+- `test_netsim`: config clamping, one seed replaying loss and latency together, the
+  latency range and loss rate, the in-order delay pipe, the spike cycle, and the link
+  cap (serialization, overhead, per-link independence, the full-buffer drop rule).
 
 Scope is deliberate. godot-cpp's engine classes call through GDExtension function
-pointers that only exist inside a running Godot process, so anything touching
-`Variant` or `StreamPeerBuffer` can't be tested here — that's why the helpers in
-`goldnet_codec.h` are templated over their buffer and map types. The protocol itself
-is covered by the integration suite below.
+pointers that only exist inside a running Godot process, so the Godot adapter in `src/`
+— synchronizers, spawners, `Variant` encoding — is covered by the integration suite
+below instead.
 
 ### Integration tests
 
@@ -479,6 +503,29 @@ something false.
    rate-limited, and `@rpc` traffic goes through the inner `SceneMultiplayer`
    untouched. It is a replication throttle, not a link-wide one.
 
+   For a link-wide limit, set the peer's **rate** (GoldSrc's `rate`): the most bytes per
+   second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
+   clear time out by its size over the rate; while that's in the future the peer is
+   **choked** — it gets no snapshot that tick, and the next one it does get deltas against
+   its acked baseline, so it carries the latest state rather than a backlog. A slow link
+   then gets fewer snapshots instead of a queue in front of every one of them. Reliable
+   RPCs still go out when choked (they can't be skipped), but they count.
+   ```gdscript
+   gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
+   gn.get_peer_chokes(peer)          # snapshots withheld so far
+   ```
+
+   By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
+   `replication_interval`. A game with a fixed server tick can instead send them itself,
+   once per tick after writing that tick's state — GoldSrc's `SV_SendClientMessages` at the
+   end of `SV_Frame`. A timer that isn't locked to the tick drifts against it: some ticks go
+   out twice (the second with nothing new) and some never go out on their own, which a
+   client sees as uneven gaps. Per-peer intervals and rates still apply.
+   ```gdscript
+   gn.manual_send = true             # goldnet's timer sends nothing
+   gn.send_snapshots()               # call once per server tick, after the tick's writes
+   ```
+
 8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
    Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
    game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a
@@ -506,12 +553,21 @@ something false.
    runtime property for it). Network-condition
    simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
    `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
-   `spike_duration_s` — which **replaces** the whole config on write, so `sim_config = {}`
+   `spike_duration_s`, and a slow link's `link_bps` / `link_queue_ms` / `link_overhead` —
+   which **replaces** the whole config on write, so `sim_config = {}`
    is the off switch, a read-back matches what was written, and an unknown key is an
    error rather than a silent reset. To change one knob, read-modify-write; every
    setter is idempotent, so that disturbs nothing else (including the seed). To receive
    PVS leave events, `set_relevance_events(true)` and connect the
    `entity_relevance_lost(sync)` signal (see **How it works → Per-peer visibility**).
+
+   The link cap models a modem or BLE connection rather than a lossy one: sending over
+   `link_bps` queues, so delay grows, and only once a link has `link_queue_ms` of backlog
+   are unreliable sends dropped (reliable ones keep queuing, as ENet would keep
+   retransmitting them). Each endpoint caps its own send leg, per peer: a server's
+   cap applies to each client's link separately, a client's to its one uplink. Headless,
+   `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
+   `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
