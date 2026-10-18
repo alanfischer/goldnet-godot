@@ -95,6 +95,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// game thinks in entities, not synchronizers. Resolving node -> sync means scanning children,
 	// so the answer is memoized here on first use. Keyed by node ObjectID.
 	HashMap<uint64_t, uint64_t> dirty_route;
+	bool manual_send = false;                    // see set_manual_send
 	uint64_t last_send_us = 0;                   // server send deadline (microseconds — see _poll)
 	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
 	// The same cadence in microseconds. The gate runs off this rather than the millisecond value
@@ -227,6 +228,15 @@ public:
 	void set_peer_rate(int p_peer, int p_bytes_per_sec);
 	// Snapshots withheld from this peer by its rate so far.
 	int get_peer_chokes(int p_peer) const;
+	// Who decides when snapshots go out. Off (the default): goldnet sends on its own clock, at the
+	// synchronizers' replication_interval, from poll. On: the game calls send_snapshots() once per
+	// server tick, after it has written that tick's state — GoldSrc's SV_SendClientMessages at the
+	// end of SV_Frame. A timer that isn't locked to the game's tick drifts against it: some ticks
+	// go out twice (the second with nothing new, so skipped) and some never go out on their own,
+	// which a client sees as uneven gaps. Per-peer intervals and rates apply either way.
+	void set_manual_send(bool p_manual);
+	bool get_manual_send() const;
+	void send_snapshots();
 	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
 	// sim_config = {} is the off switch, and a read-back matches what was written. Unknown keys are
 	// an error, so a typo cannot quietly reset the sim. Latency is the full per-leg delay applied at

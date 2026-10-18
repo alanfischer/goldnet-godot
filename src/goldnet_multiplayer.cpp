@@ -668,6 +668,22 @@ int GoldNetMultiplayer::get_peer_chokes(int p_peer) const {
 	return (int)server.chokes(p_peer);
 }
 
+void GoldNetMultiplayer::set_manual_send(bool p_manual) {
+	manual_send = p_manual;
+}
+bool GoldNetMultiplayer::get_manual_send() const {
+	return manual_send;
+}
+
+void GoldNetMultiplayer::send_snapshots() {
+	if (inner->get_multiplayer_peer().is_null() || inner->get_unique_id() != 1 || inner->get_peers().is_empty()) {
+		return;
+	}
+	_drain_pending_spawns(); // this tick's spawns ride this tick's snapshot
+	_detect_despawns();
+	_server_tick();
+}
+
 void GoldNetMultiplayer::set_peer_rate(int p_peer, int p_bps) {
 	server.set_peer_rate(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0);
 }
@@ -917,6 +933,10 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_rate", "peer", "bytes_per_sec"), &GoldNetMultiplayer::set_peer_rate);
+	ClassDB::bind_method(D_METHOD("set_manual_send", "manual"), &GoldNetMultiplayer::set_manual_send);
+	ClassDB::bind_method(D_METHOD("get_manual_send"), &GoldNetMultiplayer::get_manual_send);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "manual_send"), "set_manual_send", "get_manual_send");
+	ClassDB::bind_method(D_METHOD("send_snapshots"), &GoldNetMultiplayer::send_snapshots);
 	ClassDB::bind_method(D_METHOD("get_peer_chokes", "peer"), &GoldNetMultiplayer::get_peer_chokes);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
 	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
@@ -1278,7 +1298,7 @@ Error GoldNetMultiplayer::_poll() {
 	if (inner->get_unique_id() == 1) {
 		_drain_pending_spawns(); // every poll — pick up spawns promptly
 		_detect_despawns();
-		if (inner->get_peers().size() > 0) {
+		if (!manual_send && inner->get_peers().size() > 0) {
 			// Advance the deadline by the interval rather than resetting it to the clock we happened
 			// to read. `last = now` makes every period the interval rounded UP to the next poll, so
 			// the cadence inherits the poll granularity and loses the remainder every time: a server

@@ -515,6 +515,17 @@ something false.
    gn.get_peer_chokes(peer)          # snapshots withheld so far
    ```
 
+   By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
+   `replication_interval`. A game with a fixed server tick can instead send them itself,
+   once per tick after writing that tick's state — GoldSrc's `SV_SendClientMessages` at the
+   end of `SV_Frame`. A timer that isn't locked to the tick drifts against it: some ticks go
+   out twice (the second with nothing new) and some never go out on their own, which a
+   client sees as uneven gaps. Per-peer intervals and rates still apply.
+   ```gdscript
+   gn.manual_send = true             # goldnet's timer sends nothing
+   gn.send_snapshots()               # call once per server tick, after the tick's writes
+   ```
+
 8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
    Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
    game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a
