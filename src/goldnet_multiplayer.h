@@ -266,6 +266,24 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
+	// GOLDNET_RPC_STATS=1 → every 5 s, the game's @rpc traffic per method next to the snapshot
+	// stream, so a server's egress can be split by what sent it. Byte counts are estimates: the
+	// args' Variant encoding plus a fixed header guess, times recipients. ENet's own socket
+	// statistics are left alone — pop_statistic resets them, and the game reads them.
+	struct RpcStat {
+		uint64_t calls = 0;
+		uint64_t sends = 0;   // calls times recipients
+		uint64_t bytes = 0;   // estimated, summed over recipients
+		bool unreliable = false;
+		String owner;         // script file of the first caller seen
+	};
+	bool rpc_stats = false;
+	uint64_t rpc_stats_last_ms = 0;
+	uint64_t rpc_stats_snap_bytes = 0;
+	uint64_t rpc_stats_snap_sends = 0;
+	HashMap<StringName, RpcStat> rpc_stats_methods;
+	void _rpc_stats_count(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
+	void _rpc_stats_print(uint64_t p_now);
 	int dbg_loss = SIM_LOSS_DEFAULT_PERCENT;     // GOLDNET_LOSS=<pct> → drop that % of snapshots
 	uint32_t sim_seed = SIM_SEED_DEFAULT;        // GOLDNET_SIM_SEED=<n> → 0 = engine RNG (nondeterministic)
 	uint32_t _sim_rng = 0;                       // xorshift state; only advanced when sim_seed != 0

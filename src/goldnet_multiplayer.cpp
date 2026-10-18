@@ -1,7 +1,9 @@
 #include "goldnet_multiplayer.h"
 #include "goldnet_link.h"
 
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/multiplayer_spawner.hpp>
@@ -44,6 +46,10 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 // priority (PeerRing::stale_since) only goes up — it outranks everything that fit this tick on the
 // next one, the same self-heal the leave cap relies on.
 static const int SAFE_PACKET_BYTES = 1200;
+// GOLDNET_RPC_STATS' per-send overhead guess: SceneMultiplayer's command byte, node and method ids
+// (about 4 bytes) plus ENet's per-command header (about 8). It is a constant, so it shifts every
+// row by the same amount and never reorders them.
+static const int RPC_HEADER_EST = 12;
 
 // Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, and the four
 // section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when
@@ -300,6 +306,7 @@ static Variant gn_get_value(const Ref<StreamPeerBuffer> &buf, uint32_t p_ref_tim
 
 GoldNetMultiplayer::GoldNetMultiplayer() {
 	dbg = getenv("GOLDNET_DEBUG") != nullptr;
+	rpc_stats = getenv("GOLDNET_RPC_STATS") != nullptr;
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
 		set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
@@ -1659,6 +1666,11 @@ void GoldNetMultiplayer::_server_tick() {
 			_sim_send(peer, l, "_gn_recv", Array::make(bytes));
 		}
 		dbg_bytes += bytes.size();
+		if (rpc_stats) {
+			// The snapshot rides an RPC too: its PackedByteArray arg costs 8 bytes of Variant header.
+			rpc_stats_snap_bytes += bytes.size() + 8 + RPC_HEADER_EST;
+			rpc_stats_snap_sends++;
+		}
 	}
 
 	if (dbg && now - dbg_last_ms > 2000) {
@@ -1954,6 +1966,9 @@ Error GoldNetMultiplayer::_poll() {
 	if (inner->get_multiplayer_peer().is_null()) {
 		return e;
 	}
+	if (rpc_stats) {
+		_rpc_stats_print(now);
+	}
 	if (inner->get_unique_id() == 1) {
 		_drain_pending_spawns(); // every poll — pick up spawns promptly
 		_detect_despawns();
@@ -2011,7 +2026,74 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	if (dbg_loss > 0 && _rpc_is_unreliable(p_object, p_method) && _loss_roll()) {
 		return OK; // simulated drop
 	}
+	if (rpc_stats) {
+		_rpc_stats_count(p_peer, p_object, p_method, p_args);
+	}
 	return _sim_send(p_peer, p_object, p_method, p_args);
+}
+
+void GoldNetMultiplayer::_rpc_stats_count(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
+	if (p_peer == inner->get_unique_id()) {
+		return; // a call to ourselves never reaches the wire
+	}
+	int recipients = 1;
+	if (p_peer <= 0) {
+		recipients = inner->get_peers().size();
+		if (p_peer < 0 && recipients > 0) {
+			recipients -= 1;
+		}
+	}
+	if (recipients <= 0) {
+		return;
+	}
+	int bytes = RPC_HEADER_EST;
+	for (int i = 0; i < p_args.size(); i++) {
+		bytes += UtilityFunctions::var_to_bytes(p_args[i]).size();
+	}
+	RpcStat &s = rpc_stats_methods[p_method];
+	if (s.calls == 0) {
+		s.unreliable = _rpc_is_unreliable(p_object, p_method);
+		Ref<Script> scr = p_object->get_script();
+		s.owner = scr.is_valid() ? scr->get_path().get_file() : p_object->get_class();
+	}
+	s.calls++;
+	s.sends += recipients;
+	s.bytes += (uint64_t)bytes * recipients;
+}
+
+void GoldNetMultiplayer::_rpc_stats_print(uint64_t p_now) {
+	if (rpc_stats_last_ms == 0) {
+		rpc_stats_last_ms = p_now;
+		return;
+	}
+	uint64_t span = p_now - rpc_stats_last_ms;
+	if (span < 5000) {
+		return;
+	}
+	double secs = (double)span / 1000.0;
+	std::vector<std::pair<StringName, RpcStat>> rows;
+	uint64_t rpc_bytes = 0;
+	uint64_t rpc_sends = 0;
+	for (const KeyValue<StringName, RpcStat> &kv : rpc_stats_methods) {
+		rpc_bytes += kv.value.bytes;
+		rpc_sends += kv.value.sends;
+		rows.push_back({ kv.key, kv.value });
+	}
+	std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.bytes > b.second.bytes; });
+	UtilityFunctions::print("[goldnet rpc] ", String::num(secs, 1), "s peers=", inner->get_peers().size(),
+			" snapshot=", String::num(rpc_stats_snap_bytes / 1024.0 / secs, 2), " KB/s (",
+			String::num(rpc_stats_snap_sends / secs, 0), " sends/s) rpc=",
+			String::num(rpc_bytes / 1024.0 / secs, 2), " KB/s (", String::num(rpc_sends / secs, 0), " sends/s)");
+	for (const auto &row : rows) {
+		const RpcStat &s = row.second;
+		UtilityFunctions::print("[goldnet rpc]   ", String::num(s.bytes / 1024.0 / secs, 2), " KB/s ",
+				s.unreliable ? "unrel" : "rel  ", " ", String::num(s.sends / secs, 1), " sends/s avg ",
+				(int64_t)(s.sends ? s.bytes / s.sends : 0), " B  ", String(row.first), " (", s.owner, ")");
+	}
+	rpc_stats_methods.clear();
+	rpc_stats_snap_bytes = 0;
+	rpc_stats_snap_sends = 0;
+	rpc_stats_last_ms = p_now;
 }
 
 int32_t GoldNetMultiplayer::_get_remote_sender_id() const {
