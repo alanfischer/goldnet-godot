@@ -11,7 +11,7 @@ add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    # The engine-agnostic goldnet core lands here in Phase 6 (mirrors extern/hop/include).
+    # Placeholder: no engine-agnostic goldnet core exists yet, so this path is empty.
     ${CMAKE_SOURCE_DIR}/extern/goldnet/include
 )
 
