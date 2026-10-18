@@ -503,6 +503,18 @@ something false.
    rate-limited, and `@rpc` traffic goes through the inner `SceneMultiplayer`
    untouched. It is a replication throttle, not a link-wide one.
 
+   For a link-wide limit, set the peer's **rate** (GoldSrc's `rate`): the most bytes per
+   second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
+   clear time out by its size over the rate; while that's in the future the peer is
+   **choked** — it gets no snapshot that tick, and the next one it does get deltas against
+   its acked baseline, so it carries the latest state rather than a backlog. A slow link
+   then gets fewer snapshots instead of a queue in front of every one of them. Reliable
+   RPCs still go out when choked (they can't be skipped), but they count.
+   ```gdscript
+   gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
+   gn.get_peer_chokes(peer)          # snapshots withheld so far
+   ```
+
 8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
    Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
    game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a

@@ -189,6 +189,35 @@ public:
 	void set_bandwidth_bps(uint32_t p_bps) { bandwidth_bps_default_ = p_bps; }
 	uint32_t bandwidth_bps() const { return bandwidth_bps_default_; }
 
+	// GoldSrc rate / choke: the most bytes per second this peer's link takes (0 = unlimited). Every
+	// send to the peer — snapshots here, and whatever else the host reports through charge() —
+	// pushes its clear time out by bytes / rate. While that's in the future the peer is choked: it
+	// gets no snapshot this tick, and the next one it does get deltas against its acked baseline,
+	// so it carries the latest state rather than a backlog. A slow link then gets fewer snapshots
+	// instead of a queue that delays every one of them.
+	void set_peer_rate(int32_t p_peer, uint32_t p_bps) { rings_[p_peer].rate_bps = p_bps; }
+	uint32_t peer_rate(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.rate_bps;
+	}
+	// Wire bytes a snapshot costs beyond its payload (headers below the protocol), charged per packet.
+	void set_packet_overhead(int p_bytes) { packet_overhead_ = p_bytes > 0 ? p_bytes : 0; }
+	// Count p_bytes sent to p_peer against its rate. No-op for an unrated peer.
+	void charge(int32_t p_peer, uint32_t p_now, size_t p_bytes) {
+		auto it = rings_.find(p_peer);
+		if (it == rings_.end() || it->second.rate_bps == 0) {
+			return;
+		}
+		PeerRing &pr = it->second;
+		const double start = pr.clear_at_ms > (double)p_now ? pr.clear_at_ms : (double)p_now;
+		pr.clear_at_ms = start + (double)p_bytes * 1000.0 / (double)pr.rate_bps;
+	}
+	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
+	uint32_t chokes(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.chokes;
+	}
+
 	// The server's own send interval, used to convert a bandwidth budget for an unthrottled peer.
 	void set_tick_interval_ms(uint32_t p_ms) { tick_interval_ms_ = p_ms > 0 ? p_ms : 1; }
 
@@ -309,6 +338,9 @@ private:
 		// merely a later tick touching it again.
 		std::unordered_map<uint32_t, uint32_t> stale_since;
 		uint32_t bandwidth_bps = 0;
+		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
+		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
+		uint32_t chokes = 0;
 	};
 
 	struct Candidate {
@@ -331,6 +363,7 @@ private:
 	uint32_t ctr_ = 0;
 	uint32_t bandwidth_bps_default_ = 0;
 	uint32_t tick_interval_ms_ = 33;
+	int packet_overhead_ = 0;
 	bool relevance_events_ = false;
 	std::vector<size_t> live_; // scratch: entities live this tick
 };
@@ -345,6 +378,10 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 	for (int32_t peer : p_peers) {
 		PeerRing &pr = rings_[peer]; // default-constructs on first use
 		if (pr.interval_ms > 0 && pr.last_sent_ms != 0 && p_now - pr.last_sent_ms < pr.interval_ms) {
+			continue;
+		}
+		if (pr.rate_bps > 0 && pr.clear_at_ms > (double)p_now) {
+			pr.chokes++;
 			continue;
 		}
 		due.push_back(peer);
@@ -634,6 +671,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(changed);
 		packet.put_data(body);
 		p_host.send(peer, packet);
+		charge(peer, p_now, packet.size() + (size_t)packet_overhead_);
 	}
 }
 

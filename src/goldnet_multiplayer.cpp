@@ -32,6 +32,11 @@ static const uint32_t DEFAULT_INTERVAL_MS = 33;
 // (about 4 bytes) plus ENet's per-command header (about 8). It is a constant, so it shifts every
 // row by the same amount and never reorders them.
 static const int RPC_HEADER_EST = 12;
+// What a snapshot costs on the wire beyond its bytes, for the rate budget: IP + UDP (28), ENet's
+// header and command (~10), and the _gn_recv RPC carrying it (~12). Close enough for a budget.
+static const int SNAPSHOT_WIRE_OVERHEAD = 50;
+// The same for a game RPC, whose own header rpc_wire_bytes already counts.
+static const int RPC_WIRE_OVERHEAD = 38;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -81,6 +86,8 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 // it lossily behind its own tag. The tags stay self-describing, so the DECODER needs no hint; only
 // the SENDER consults it.
 using goldnet::QUANT_AUTO;
+
+static int rpc_wire_bytes(const Array &p_args);
 
 // Map a "gn_quant" hint name to its tag, or QUANT_AUTO if the name is unknown.
 static uint8_t gn_quant_from_name(const String &name) {
@@ -295,6 +302,7 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 			}
 		}
 	}
+	server.set_packet_overhead(SNAPSHOT_WIRE_OVERHEAD);
 	inner = MultiplayerAPI::create_default_interface(); // a SceneMultiplayer
 
 	SceneMultiplayer *sm = Object::cast_to<SceneMultiplayer>(inner.ptr());
@@ -656,6 +664,44 @@ void GoldNetMultiplayer::set_bandwidth_bps(int p_bps) {
 int GoldNetMultiplayer::get_bandwidth_bps() const {
 	return (int)server.bandwidth_bps();
 }
+int GoldNetMultiplayer::get_peer_chokes(int p_peer) const {
+	return (int)server.chokes(p_peer);
+}
+
+void GoldNetMultiplayer::set_peer_rate(int p_peer, int p_bps) {
+	server.set_peer_rate(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0);
+}
+
+// Charge a game RPC to each recipient's rate (see goldnet::Server::set_peer_rate). Its size is only
+// worked out when some recipient has a rate, so an unrated server pays nothing for this.
+void GoldNetMultiplayer::_charge_rpc(int32_t p_peer, const Array &p_args) {
+	if (inner->get_unique_id() != 1) {
+		return;
+	}
+	PackedInt32Array targets;
+	if (p_peer > 0) {
+		targets.push_back(p_peer);
+	} else {
+		PackedInt32Array peers = inner->get_peers();
+		for (int i = 0; i < peers.size(); i++) {
+			if (!(p_peer < 0 && peers[i] == -p_peer)) {
+				targets.push_back(peers[i]);
+			}
+		}
+	}
+	int bytes = -1;
+	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
+	for (int i = 0; i < targets.size(); i++) {
+		if (server.peer_rate(targets[i]) == 0) {
+			continue;
+		}
+		if (bytes < 0) {
+			bytes = rpc_wire_bytes(p_args) + RPC_WIRE_OVERHEAD;
+		}
+		server.charge(targets[i], now, (size_t)bytes);
+	}
+}
+
 void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
 	server.set_peer_bandwidth_bps(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0); // may be set before the first tick
 }
@@ -870,6 +916,8 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_bandwidth_bps", "bps"), &GoldNetMultiplayer::set_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
+	ClassDB::bind_method(D_METHOD("set_peer_rate", "peer", "bytes_per_sec"), &GoldNetMultiplayer::set_peer_rate);
+	ClassDB::bind_method(D_METHOD("get_peer_chokes", "peer"), &GoldNetMultiplayer::get_peer_chokes);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
 	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
 	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
@@ -1289,6 +1337,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	if (rpc_stats) {
 		_rpc_stats_count(p_peer, p_object, p_method, p_args);
 	}
+	_charge_rpc(p_peer, p_args);
 	return _sim_send(p_peer, p_object, p_method, p_args, droppable);
 }
 

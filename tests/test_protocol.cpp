@@ -507,6 +507,60 @@ static void test_removed_entity_leaves_client_frame() {
 	printf("  removed entity is pruned and the stream continues: ok\n");
 }
 
+// GoldSrc rate / choke: a rated peer's snapshot bytes stay within its rate, it still converges, and
+// a choke costs nothing an unrated peer would notice.
+static void test_rate_chokes_to_the_budget() {
+	Net n;
+	n.add_peer(2);
+	Peer &slow = n.add_peer(3);
+	for (int i = 0; i < 10; i++) {
+		n.add_entity(10 + i, 100 + i, { 0, 0 });
+	}
+	n.server.set_peer_rate(3, 2000); // bytes per second
+	size_t fast_bytes = 0, slow_bytes = 0;
+	int fast_packets = 0, slow_packets = 0;
+	for (int t = 0; t < 125; t++) { // 2 s
+		for (int i = 0; i < 10; i++) {
+			n.world.ents[10 + i].vals[0] = t; // everything moves every tick
+		}
+		n.tick();
+		for (auto &pkt : n.world.outbox[2]) {
+			fast_bytes += pkt.size();
+			fast_packets++;
+		}
+		for (auto &pkt : n.world.outbox[3]) {
+			slow_bytes += pkt.size();
+			slow_packets++;
+		}
+	}
+	CHECK(fast_packets == 125);                  // unrated: every tick
+	CHECK(slow_bytes <= 2000 * 2 + 200);         // rated: within its budget (plus the packet in hand)
+	CHECK(slow_packets < fast_packets / 2);      // by sending less often, not by sending nothing
+	CHECK(n.server.chokes(3) > 0);
+	CHECK(n.server.chokes(2) == 0);
+	CHECK(slow.vals[100][0] >= 120);             // and still current, not a backlog behind
+	printf("  rate chokes a peer to its budget, and it stays current: ok\n");
+}
+
+static void test_charged_traffic_delays_the_next_snapshot() {
+	Net n;
+	n.add_peer(2);
+	n.add_entity(10, 100, { 0 });
+	n.server.set_peer_rate(2, 1000);
+	n.tick();                          // the first snapshot goes out
+	n.server.charge(2, n.now, 250);    // then the host sends two RPC bursts, 500 bytes in all:
+	n.server.charge(2, n.now, 250);    // half a second's worth, so they queue behind each other
+	int sent = 0;
+	for (int t = 0; t < 25; t++) {     // 400 ms
+		n.world.ents[10].vals[0] = t + 1;
+		n.tick();
+		sent += (int)n.sent_to(2);
+	}
+	CHECK(sent == 0);
+	CHECK(n.server.chokes(2) == 25);
+	printf("  other traffic charged to a peer delays its next snapshot: ok\n");
+}
+
 int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
@@ -527,6 +581,8 @@ int main() {
 	test_push_declared_slots_skip_reads();
 	test_warmup_defer_then_accept();
 	test_removed_entity_leaves_client_frame();
+	test_rate_chokes_to_the_budget();
+	test_charged_traffic_delays_the_next_snapshot();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

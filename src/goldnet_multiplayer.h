@@ -144,6 +144,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// immediate path (OK otherwise — the deferral can't fail here).
 	Error _sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args,
 			bool p_droppable, int p_bytes = -1);
+	void _charge_rpc(int32_t p_peer, const Array &p_args); // count a game RPC against its recipients' rates
 	// True iff (object, method)'s @rpc transfer mode is one of the unreliable modes — i.e. loss may
 	// drop it without corrupting state (ENet retransmits reliable RPCs, so dropping one desyncs).
 	// Resolved from the node's rpc config and cached per (object, method). Only consulted when loss
@@ -219,6 +220,13 @@ public:
 	void set_bandwidth_bps(int p_bps);
 	int get_bandwidth_bps() const;
 	void set_peer_bandwidth_bps(int p_peer, int p_bps);
+	// GoldSrc rate / choke: the most bytes per second to send this peer (0 = unlimited, the
+	// default). Snapshots and game RPCs both count; while the peer is over, its snapshots are
+	// skipped (choked), and the next one it gets carries the latest state. Unlike
+	// set_peer_bandwidth_bps, which caps each snapshot's entity bytes, this spaces snapshots out.
+	void set_peer_rate(int p_peer, int p_bytes_per_sec);
+	// Snapshots withheld from this peer by its rate so far.
+	int get_peer_chokes(int p_peer) const;
 	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
 	// sim_config = {} is the off switch, and a read-back matches what was written. Unknown keys are
 	// an error, so a typo cannot quietly reset the sim. Latency is the full per-leg delay applied at
