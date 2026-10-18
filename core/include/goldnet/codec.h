@@ -1,23 +1,16 @@
 #pragma once
 //
-// Engine-agnostic wire helpers — the parts of the GoldSrc snapshot protocol that are
-// pure arithmetic over a byte buffer, with no dependency on Variant, String, or any
-// other engine-backed type.
-//
-// They live in their own header so they can be exercised by the standalone test suite
-// in ../tests (see tests/CMakeLists.txt). godot-cpp's engine classes route through
-// GDExtension function pointers that only exist inside a running Godot process, so
-// anything touching Variant/StreamPeerBuffer directly cannot be unit tested out of
-// process. These helpers can — and they're where the subtle bugs live: zig-zag varint
-// widths, angle wraparound, and uint16 sequence rollover.
+// Wire helpers — the parts of the GoldSrc snapshot protocol that are pure arithmetic: varints,
+// angle quantization, uint16 sequence comparison, and the ack bookkeeping. They're where the
+// subtle bugs live (zig-zag widths, angle wraparound, sequence rollover), so the standalone test
+// suite in ../../../tests pins them directly.
 //
 // Templating notes:
-//   * Buffer access is through `buf->`, so production passes a Ref<StreamPeerBuffer>
-//     and tests pass a pointer to a fake with the same put_*/get_* surface. The
-//     production call sites are unchanged from when these were file-static functions.
-//   * The ack-tracking helpers are templated on the map type so tests can supply a
-//     minimal stand-in for godot-cpp's HashMap (which allocates through the engine).
-//     The map must expose has()/erase()/operator[] and iterate as {.key, .value}.
+//   * Buffer access is through `buf->`, so the protocol passes a Writer* / Reader* and tests may
+//     pass a pointer to any fake with the same put_*/get_* surface.
+//   * The bookkeeping helpers are templated on their container types, which need the std
+//     interface: count()/erase()/operator[], with maps iterating as {.first, .second}. Tests use
+//     insertion-ordered fakes so emission order is assertable.
 //
 #include <cmath>
 #include <cstdint>
@@ -205,7 +198,7 @@ template <typename M>
 bool reliable_include(M &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_last_acked,
 		bool p_has_ack) {
 	uint16_t fs;
-	if (p_wait.has(p_net_id)) {
+	if (p_wait.count(p_net_id)) {
 		fs = p_wait[p_net_id];
 	} else {
 		fs = p_seq;
@@ -232,7 +225,7 @@ bool reliable_include(M &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_l
 template <typename S, typename V>
 void derive_leaves(const S &p_held, const S &p_visible, int p_cap, V &r_send, V &r_carry) {
 	for (const uint32_t &id : p_held) {
-		if (p_visible.has(id)) {
+		if (p_visible.count(id)) {
 			continue; // still in view
 		}
 		if ((int)r_send.size() < p_cap) {
@@ -247,8 +240,8 @@ void derive_leaves(const S &p_held, const S &p_visible, int p_cap, V &r_send, V 
 template <typename M, typename V>
 void retire_acked(M &p_wait, uint16_t p_last_acked, V &r_retired) {
 	for (const auto &kv : p_wait) {
-		if (seq_le(kv.value, p_last_acked)) {
-			r_retired.push_back(kv.key);
+		if (seq_le(kv.second, p_last_acked)) {
+			r_retired.push_back(kv.first);
 		}
 	}
 	for (int i = 0; i < (int)r_retired.size(); i++) {

@@ -1,13 +1,11 @@
 #pragma once
 //
 // Shared support for the standalone tests: the CHECK macro and minimal stand-ins for the
-// two engine types goldnet_codec.h is templated over. godot-cpp's StreamPeerBuffer and
-// HashMap both route through GDExtension function pointers that only exist inside a
-// running Godot, so the real ones can't be constructed here.
+// buffer and container types goldnet/codec.h is templated over. The container fakes are
+// insertion-ordered, so the bookkeeping tests can assert on emission order.
 //
-// The fakes deliberately mimic only the surface goldnet_codec.h uses. They are not
-// general containers and shouldn't grow into one — if a helper starts needing more than
-// this, that's a signal the helper isn't engine-agnostic after all.
+// The fakes deliberately mimic only the surface codec.h uses. They are not general
+// containers and shouldn't grow into one.
 //
 #include <cassert>
 #include <cstdint>
@@ -62,22 +60,22 @@ struct FakeBuf {
 	}
 };
 
-// Insertion-ordered set with godot HashSet's has()/insert() surface, iterating by value.
+// Insertion-ordered set with std::unordered_set's count()/insert() surface, iterating by value.
 // Ordered rather than hashed so the derived-removal tests can assert on emission order.
 struct FakeSet {
 	std::vector<uint32_t> items;
 
-	bool has(uint32_t v) const {
+	size_t count(uint32_t v) const {
 		for (uint32_t i : items) {
 			if (i == v) {
-				return true;
+				return 1;
 			}
 		}
-		return false;
+		return 0;
 	}
 
 	void insert(uint32_t v) {
-		if (!has(v)) {
+		if (!count(v)) {
 			items.push_back(v);
 		}
 	}
@@ -87,37 +85,37 @@ struct FakeSet {
 	std::vector<uint32_t>::const_iterator end() const { return items.end(); }
 };
 
-// Insertion-ordered map with godot HashMap's has()/erase()/operator[] surface, iterating
-// as {.key, .value}. Ordered rather than hashed so test failures are reproducible.
+// Insertion-ordered map with std::unordered_map's count()/erase()/operator[] surface,
+// iterating as {.first, .second}. Ordered rather than hashed so test failures are reproducible.
 struct FakeMap {
 	struct Entry {
-		uint32_t key;
-		uint16_t value;
+		uint32_t first;
+		uint16_t second;
 	};
 	std::vector<Entry> entries;
 
-	bool has(uint32_t k) const {
+	size_t count(uint32_t k) const {
 		for (const Entry &e : entries) {
-			if (e.key == k) {
-				return true;
+			if (e.first == k) {
+				return 1;
 			}
 		}
-		return false;
+		return 0;
 	}
 
 	uint16_t &operator[](uint32_t k) {
 		for (Entry &e : entries) {
-			if (e.key == k) {
-				return e.value;
+			if (e.first == k) {
+				return e.second;
 			}
 		}
 		entries.push_back({ k, 0 });
-		return entries.back().value;
+		return entries.back().second;
 	}
 
 	void erase(uint32_t k) {
 		for (size_t i = 0; i < entries.size(); i++) {
-			if (entries[i].key == k) {
+			if (entries[i].first == k) {
 				entries.erase(entries.begin() + i);
 				return;
 			}

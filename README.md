@@ -23,6 +23,16 @@ loss levels where reliable replication drops clients (see **Performance** below)
 
 ## How it works
 
+**An engine-agnostic core, adapted to Godot.** The protocol itself lives in
+`core/include/goldnet/` as header-only C++ with no Godot dependency: `goldnet::Server`
+(change tracking, per-peer deltas against the acked frame, acks, spawns, leaves, the
+packet budget) and `goldnet::Client` (baseline reconstruction and apply), over the
+byte-level wire in `buffer.h` / `codec.h` / `protocol.h`. Both are templated on the
+host's value type and reach the engine only through a small host interface — read a
+slot, test visibility, encode a value, send bytes — so Godot's `Variant`s pass through
+unconverted. Everything Godot-specific (synchronizers, spawners, `Variant` encoding, the
+inner `SceneMultiplayer`) is the adapter in `src/`.
+
 **Composition, not replacement.** `GoldNetMultiplayer extends
 MultiplayerAPIExtension` and holds an inner stock `SceneMultiplayer`
 (`MultiplayerAPI::create_default_interface()`). Handshake, auth, peer lifecycle,
@@ -39,7 +49,7 @@ simply drops a `net_id` it doesn't yet hold and self-heals.
 entity-agnostic; players, bots, projectiles, and map movers all flow through one
 pipeline. A node lands in:
 
-- **`owned_syncs`** when its `MultiplayerSynchronizer` enters the tree with at
+- **the core server's entities** when its `MultiplayerSynchronizer` enters the tree with at
   least one per-tick property (`_object_configuration_add`). This is the
   per-tick delta stream, and it covers *both* map-static movers and spawned
   entities.
@@ -54,7 +64,7 @@ pipeline. A node lands in:
   every transition is observed. goldnet converges instead — if a property goes
   A→B→A between two acked frames, the peer sees only the final A. That holds for
   every slot; goldnet carries *state*, not events. Put events on `@rpc`.
-- **`spawn_records`** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
+- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
   Map-static entities load with the map (both peers already have them) so they need
   no spawn record; runtime entities do, because the client has no other way to know
   they should exist.
@@ -330,18 +340,28 @@ cmake --build tests/build
 ctest --test-dir tests/build --output-on-failure
 ```
 
-Standalone — no godot-cpp, no engine, runs in under a second. The suite covers
-`src/goldnet_codec.h`: the zig-zag and unsigned varint codecs (round-trip, encoded
-widths, and malformed over-long streams, which are reachable from the wire), the
-angle16/angle8 quantizers (round-trip, wraparound, non-finite input), uint16 sequence
-comparison across rollover, the reliable-until-acked bookkeeping, and the seeded loss
-PRNG.
+Standalone — no godot-cpp, no engine, runs in about a second. It covers the core in
+`core/include/goldnet/`:
+
+- `test_codec`: the zig-zag and unsigned varint codecs (round-trip, encoded widths, and
+  malformed over-long streams, which are reachable from the wire), the angle16/angle8
+  quantizers (round-trip, wraparound, non-finite input), the half-float codec (every
+  non-NaN value, and the round-to-nearest-even edges), the bounds-checked `Reader`, and
+  the seeded loss PRNG.
+- `test_seq`: uint16 sequence comparison across rollover and the reliable-until-acked
+  bookkeeping.
+- `test_protocol`: a real `goldnet::Server` feeding real `goldnet::Client`s over a fake
+  link that drops snapshots or acks, with plain ints as values — deltas against the
+  acked baseline, self-heal after a lost snapshot or ack, ack aging into a full frame,
+  lazy and reliable spawns, despawns scoped to holders, derived PVS leaves (including
+  re-entry before the leave is acked), the packet budget and its priority order,
+  per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
+  reordered, truncated or mismatched packets.
 
 Scope is deliberate. godot-cpp's engine classes call through GDExtension function
-pointers that only exist inside a running Godot process, so anything touching
-`Variant` or `StreamPeerBuffer` can't be tested here — that's why the helpers in
-`goldnet_codec.h` are templated over their buffer and map types. The protocol itself
-is covered by the integration suite below.
+pointers that only exist inside a running Godot process, so the Godot adapter in `src/`
+— synchronizers, spawners, `Variant` encoding — is covered by the integration suite
+below instead.
 
 ### Integration tests
 

@@ -14,7 +14,8 @@
 #include <cstdint>
 
 #include "test_support.h"
-#include "../src/goldnet_codec.h"
+#include "goldnet/buffer.h"
+#include "goldnet/codec.h"
 
 using namespace goldnet;
 
@@ -419,6 +420,59 @@ static void test_rng_distribution() {
 	printf("  rng distribution at 20%%: %d/%d drops: ok\n", drops, trials);
 }
 
+// --- half floats ---
+//
+// float_to_half is ours (Godot's encoder lives in the engine, not godot-cpp), so pin it
+// against IEEE 754 binary16 directly: every non-NaN half must survive a decode/encode round
+// trip, and the rounding edges must land where round-to-nearest-even puts them.
+
+static uint16_t half_of(float f) { return float_to_half(f); }
+
+static void test_half_roundtrip_exhaustive() {
+	for (uint32_t h = 0; h < 0x10000u; h++) {
+		bool nan = ((h >> 10) & 0x1Fu) == 0x1Fu && (h & 0x3FFu) != 0;
+		if (nan) {
+			CHECK(std::isnan(half_to_float((uint16_t)h)));
+			continue;
+		}
+		CHECK(float_to_half(half_to_float((uint16_t)h)) == h);
+	}
+	printf("  half round-trips every non-NaN value: ok\n");
+}
+
+static void test_half_known_values() {
+	CHECK(half_of(1.0f) == 0x3C00);
+	CHECK(half_of(-2.0f) == 0xC000);
+	CHECK(half_of(65504.0f) == 0x7BFF);                // largest finite
+	CHECK(half_of(65520.0f) == 0x7C00);                // halfway past it rounds to infinity
+	CHECK(half_of(65519.0f) == 0x7BFF);                // below halfway stays finite
+	CHECK(half_of(std::ldexp(1.0f, -24)) == 0x0001);   // smallest subnormal
+	CHECK(half_of(std::ldexp(1.0f, -25)) == 0x0000);   // a tie, to even: zero
+	CHECK(half_of(std::ldexp(3.0f, -26)) == 0x0001);   // above the tie rounds up
+	CHECK(half_of(std::ldexp(1.0f, -14)) == 0x0400);   // smallest normal
+	CHECK(half_of(1.0f + std::ldexp(1.0f, -11)) == 0x3C00); // a tie, to even: stays 1.0
+	CHECK(half_of(1.0f + std::ldexp(3.0f, -11)) == 0x3C02); // a tie, to even: rounds up
+	CHECK(half_of(-0.0f) == 0x8000);
+	CHECK(half_of(INFINITY) == 0x7C00);
+	CHECK(std::isnan(half_to_float(half_of(NAN))));
+	printf("  half known values and rounding edges: ok\n");
+}
+
+// The Reader never runs past its end: it reports failure and yields zeros instead.
+static void test_reader_overrun() {
+	Writer w;
+	w.put_u16(0xBEEF);
+	Reader r(w.data(), w.size());
+	CHECK(r.get_u16() == 0xBEEF);
+	CHECK(!r.failed());
+	CHECK(r.get_u32() == 0);
+	CHECK(r.failed());
+	Reader r2(w.data(), w.size());
+	CHECK(r2.get_data(3) == nullptr);
+	CHECK(r2.failed());
+	printf("  reader overrun fails instead of reading past the end: ok\n");
+}
+
 int main() {
 	printf("test_codec\n");
 	test_varint_roundtrip();
@@ -444,6 +498,9 @@ int main() {
 	test_rng_seeds_differ();
 	test_rng_never_latches();
 	test_rng_distribution();
+	test_half_roundtrip_exhaustive();
+	test_half_known_values();
+	test_reader_overrun();
 	printf("test_codec: %d checks passed\n", checks);
 	return 0;
 }

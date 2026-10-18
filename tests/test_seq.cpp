@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "test_support.h"
-#include "../src/goldnet_codec.h"
+#include "goldnet/codec.h"
 
 using namespace goldnet;
 
@@ -66,7 +66,7 @@ static void test_reliable_include_first_send() {
 	FakeMap wait;
 	// No ack yet: the record is sent and starts being tracked.
 	CHECK(reliable_include(wait, 42, 10, 0, false));
-	CHECK(wait.has(42));
+	CHECK(wait.count(42));
 	CHECK(wait[42] == 10);
 	printf("  reliable_include first send: ok\n");
 }
@@ -83,7 +83,7 @@ static void test_reliable_include_retains_first_seq() {
 	}
 	// An ack for 12 covers the original send at 10, even though we're now at seq 15.
 	CHECK(!reliable_include(wait, 42, 15, 12, true));
-	CHECK(!wait.has(42)); // stopped tracking
+	CHECK(!wait.count(42)); // stopped tracking
 	printf("  reliable_include retains first seq: ok\n");
 }
 
@@ -92,7 +92,7 @@ static void test_reliable_include_ack_too_old() {
 	FakeMap wait;
 	reliable_include(wait, 42, 10, 0, false);
 	CHECK(reliable_include(wait, 42, 11, 9, true)); // ack 9 < first send 10 → resend
-	CHECK(wait.has(42));
+	CHECK(wait.count(42));
 	printf("  reliable_include ack too old: ok\n");
 }
 
@@ -102,7 +102,7 @@ static void test_reliable_include_no_ack_flag() {
 	FakeMap wait;
 	reliable_include(wait, 42, 10, 0, false);
 	CHECK(reliable_include(wait, 42, 11, 9999, false));
-	CHECK(wait.has(42));
+	CHECK(wait.count(42));
 	printf("  reliable_include ignores last_acked without has_ack: ok\n");
 }
 
@@ -112,7 +112,7 @@ static void test_reliable_include_rollover() {
 	CHECK(reliable_include(wait, 7, 65530, 0, false));
 	CHECK(wait[7] == 65530);
 	CHECK(!reliable_include(wait, 7, 3, 3, true)); // ack 3 is newer than 65530 → delivered
-	CHECK(!wait.has(7));
+	CHECK(!wait.count(7));
 	printf("  reliable_include across rollover: ok\n");
 }
 
@@ -124,9 +124,9 @@ static void test_reliable_include_independent_records() {
 	reliable_include(wait, 3, 30, 0, false);
 	CHECK(wait.size() == 3);
 	CHECK(!reliable_include(wait, 2, 31, 25, true)); // only #2 is covered by ack 25
-	CHECK(wait.has(1));
-	CHECK(!wait.has(2));
-	CHECK(wait.has(3));
+	CHECK(wait.count(1));
+	CHECK(!wait.count(2));
+	CHECK(wait.count(3));
 	printf("  reliable_include independent records: ok\n");
 }
 
@@ -212,9 +212,9 @@ static void test_retire_acked() {
 
 	// Entries first sent at or before seq 20 are confirmed delivered and dropped.
 	CHECK(retired.size() == 2);
-	CHECK(!wait.has(1));
-	CHECK(!wait.has(2));
-	CHECK(wait.has(3)); // 30 is still in flight
+	CHECK(!wait.count(1));
+	CHECK(!wait.count(2));
+	CHECK(wait.count(3)); // 30 is still in flight
 	CHECK(wait.size() == 1);
 	printf("  retire_acked partial: ok\n");
 }
@@ -242,8 +242,8 @@ static void test_retire_acked_rollover() {
 
 	CHECK(retired.size() == 1);
 	CHECK(retired[0] == 1);
-	CHECK(!wait.has(1));
-	CHECK(wait.has(2));
+	CHECK(!wait.count(1));
+	CHECK(wait.count(2));
 	printf("  retire_acked across rollover: ok\n");
 }
 
