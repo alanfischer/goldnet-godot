@@ -359,7 +359,8 @@ Standalone — no godot-cpp, no engine, runs in about a second. It covers the co
   per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
   reordered, truncated or mismatched packets.
 - `test_netsim`: config clamping, one seed replaying loss and latency together, the
-  latency range and loss rate, the in-order delay pipe, and the spike cycle.
+  latency range and loss rate, the in-order delay pipe, the spike cycle, and the link
+  cap (serialization, overhead, per-link independence, the full-buffer drop rule).
 
 Scope is deliberate. godot-cpp's engine classes call through GDExtension function
 pointers that only exist inside a running Godot process, so the Godot adapter in `src/`
@@ -529,12 +530,21 @@ something false.
    runtime property for it). Network-condition
    simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
    `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
-   `spike_duration_s` — which **replaces** the whole config on write, so `sim_config = {}`
+   `spike_duration_s`, and a slow link's `link_bps` / `link_queue_ms` / `link_overhead` —
+   which **replaces** the whole config on write, so `sim_config = {}`
    is the off switch, a read-back matches what was written, and an unknown key is an
    error rather than a silent reset. To change one knob, read-modify-write; every
    setter is idempotent, so that disturbs nothing else (including the seed). To receive
    PVS leave events, `set_relevance_events(true)` and connect the
    `entity_relevance_lost(sync)` signal (see **How it works → Per-peer visibility**).
+
+   The link cap models a modem or BLE connection rather than a lossy one: sending over
+   `link_bps` queues, so delay grows, and only once a link has `link_queue_ms` of backlog
+   are unreliable sends dropped (reliable ones keep queuing, as ENet would keep
+   retransmitting them). Each endpoint caps its own send leg, per peer: a server's
+   cap applies to each client's link separately, a client's to its one uplink. Headless,
+   `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
+   `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).

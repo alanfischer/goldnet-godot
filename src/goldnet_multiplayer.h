@@ -126,7 +126,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// --- Network-condition simulation (send-side) — see docs/netsim_plan.md ---
 	// Applied at the two send funnels goldnet owns: _rpc (every game @rpc) and the snapshot send in
 	// ServerHost::send. Loss drops a packet; latency and spikes defer it. Configured through
-	// sim_config, or at startup by GOLDNET_LOSS / GOLDNET_SIM_SEED / GOLDNET_LATENCY / GOLDNET_SPIKE.
+	// sim_config, or at startup by GOLDNET_LOSS / GOLDNET_SIM_SEED / GOLDNET_LATENCY / GOLDNET_SPIKE /
+	// GOLDNET_LINK.
 	//
 	// A deferred send replays inner->rpc(peer, <object>, method, args). The target is held by
 	// ObjectID so a free during the (few-ms) delay is a safe no-op.
@@ -137,9 +138,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		Array args;
 	};
 	goldnet::NetSim<PendingSend> sim;
-	// Shared tail of both send funnels: apply latency/spike, then send now or queue. Returns the
-	// inner->rpc Error for the immediate path (OK for the queued path — the deferral can't fail here).
-	Error _sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
+	// Shared tail of both send funnels: the simulated link, latency and spike, then send now, queue,
+	// or drop. p_droppable: an unreliable send a full link buffer may drop. p_bytes: its wire size,
+	// or -1 to estimate it (only done under a link cap). Returns the inner->rpc Error for the
+	// immediate path (OK otherwise — the deferral can't fail here).
+	Error _sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args,
+			bool p_droppable, int p_bytes = -1);
 	// True iff (object, method)'s @rpc transfer mode is one of the unreliable modes — i.e. loss may
 	// drop it without corrupting state (ENet retransmits reliable RPCs, so dropping one desyncs).
 	// Resolved from the node's rpc config and cached per (object, method). Only consulted when loss
@@ -220,7 +224,8 @@ public:
 	// an error, so a typo cannot quietly reset the sim. Latency is the full per-leg delay applied at
 	// THIS endpoint's send funnels; the opposite leg is configured on its own endpoint.
 	// Keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, spike_interval_s,
-	// spike_duration_s. Every knob is idempotent, so a read-modify-write of one disturbs nothing
+	// spike_duration_s, link_bps (a slow link's bytes/sec, 0 = none), link_queue_ms (its buffer),
+	// link_overhead (per-send wire overhead in bytes). Every knob is idempotent, so a read-modify-write of one disturbs nothing
 	// else. A non-zero seed replays the whole sim (loss rolls and latency draws); 0 is random.
 	void set_sim_config(const Dictionary &p_cfg);
 	Dictionary get_sim_config() const;

@@ -1,16 +1,22 @@
 #pragma once
 //
-// Send-side network-condition simulation: loss, latency, and periodic latency spikes, applied at
-// a host's send funnels. All send-side: the receiver runs its handler on arrival, so no receive
-// hook is needed. Latency is the full per-leg delay, configured at each sender.
+// Send-side network-condition simulation: loss, latency, periodic latency spikes, and a bandwidth
+// cap, applied at a host's send funnels. All send-side: the receiver runs its handler on arrival,
+// so no receive hook is needed. Latency is the full per-leg delay, configured at each sender.
 //
 // P is whatever the host needs to replay a deferred send. The sim decides; the host sends:
 //
 //   if (sim.loss_percent() > 0 && droppable && sim.loss_roll()) return;  // simulated drop
-//   int d = sim.delay_ms();
-//   if (d <= 0) send_now(...); else sim.enqueue(now_ms, d, payload);
+//   int d = sim.schedule(now_ms, link, bytes, droppable);
+//   if (d < 0) return;                                                 // link queue full
+//   if (d == 0) send_now(...); else sim.enqueue(now_ms, link, d, payload);
 //   ...
 //   sim.pump(now_ms, [&](P &payload) { send_now(payload); });          // every poll
+//
+// The bandwidth cap models a slow link (a modem, a BLE connection): sending over capacity doesn't
+// lose packets, it queues them, so delay grows until the link's buffer fills and only then do
+// packets drop. Each link is independent — on a server, one per client, since each client's
+// downlink is its own; on a client, its one uplink.
 //
 // Every random draw goes through one generator, so a non-zero seed replays a whole session —
 // loss rolls and latency draws alike — which is what a regression test needs. Seed 0 is
@@ -18,9 +24,11 @@
 //
 #include "goldnet/codec.h"
 
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <random>
+#include <unordered_map>
 
 namespace goldnet {
 
@@ -36,6 +44,11 @@ public:
 	static constexpr float SPIKE_DURATION_DEFAULT_S = 0.2f;
 	static constexpr int LOSS_DEFAULT_PERCENT = 0;
 	static constexpr int SEED_DEFAULT = 0;
+	static constexpr int BANDWIDTH_DEFAULT_BPS = 0; // 0 = unlimited
+	static constexpr int QUEUE_DEFAULT_MS = 1000;
+	// What one send costs on the wire beyond its payload: IP + UDP headers (28) and the transport's
+	// own framing. A host that knows better passes its own.
+	static constexpr int PACKET_OVERHEAD_DEFAULT = 40;
 
 	NetSim() { rng_ = fresh_state(0); }
 
@@ -84,6 +97,15 @@ public:
 	void set_spike_duration_s(float p_s) { spike_duration_s_ = p_s < 0.0f ? 0.0f : p_s; } // each spike's length
 	float spike_duration_s() const { return spike_duration_s_; }
 
+	// Link capacity in bytes per second; 0 = unlimited.
+	void set_bandwidth_bps(int p_bps) { bandwidth_bps_ = p_bps < 0 ? 0 : p_bps; }
+	int bandwidth_bps() const { return bandwidth_bps_; }
+	// How much backlog, in time, a link buffers before it drops droppable sends.
+	void set_queue_ms(int p_ms) { queue_ms_ = p_ms < 0 ? 0 : p_ms; }
+	int queue_ms() const { return queue_ms_; }
+	void set_packet_overhead(int p_bytes) { packet_overhead_ = p_bytes < 0 ? 0 : p_bytes; }
+	int packet_overhead() const { return packet_overhead_; }
+
 	// --- decisions ---
 
 	// One loss roll: true = drop this packet. Free (no RNG draw) while loss is off.
@@ -108,26 +130,71 @@ public:
 
 	bool spike_active() const { return spike_active_; }
 
-	// Hold a send for p_delay_ms. A pipe, not per-packet jitter: pump() only ever releases the
-	// front of the queue, so a send never fires before one queued earlier — a short draw behind a
-	// long one waits for it.
-	void enqueue(uint64_t p_now_ms, int p_delay_ms, P p_payload) {
-		queue_.push_back(Pending{ p_now_ms + (uint64_t)(p_delay_ms > 0 ? p_delay_ms : 0), std::move(p_payload) });
+	// The delay before a send of p_bytes on link p_link should fire: its wait behind earlier sends
+	// on that link, its own transmit time, then the latency draw. -1 = drop it: the link's backlog
+	// is past queue_ms and the send is droppable. A send that can't be dropped (reliable) always
+	// queues, since the real transport would keep retransmitting it. Without a bandwidth cap this
+	// is just delay_ms().
+	int schedule(uint64_t p_now_ms, int32_t p_link, size_t p_bytes, bool p_droppable) {
+		if (bandwidth_bps_ <= 0) {
+			return delay_ms();
+		}
+		double &free_at = link_free_at_[p_link];
+		const double now = (double)p_now_ms;
+		const double start = free_at > now ? free_at : now;
+		if (p_droppable && start - now > (double)queue_ms_) {
+			return -1;
+		}
+		free_at = start + (double)(p_bytes + (size_t)packet_overhead_) * 1000.0 / (double)bandwidth_bps_;
+		const int wait = (int)std::ceil(free_at - now);
+		return wait + delay_ms();
 	}
 
-	size_t pending() const { return queue_.size(); }
+	// How far behind link p_link is, in ms: what a send made now would wait before transmitting.
+	double backlog_ms(uint64_t p_now_ms, int32_t p_link) const {
+		auto it = link_free_at_.find(p_link);
+		if (it == link_free_at_.end() || it->second <= (double)p_now_ms) {
+			return 0.0;
+		}
+		return it->second - (double)p_now_ms;
+	}
+
+	// A link that's gone (a disconnected peer): drop its backlog and anything still queued on it.
+	void forget_link(int32_t p_link) {
+		link_free_at_.erase(p_link);
+		queues_.erase(p_link);
+	}
+
+	// Hold a send on link p_link for p_delay_ms. Each link is a pipe, not per-packet jitter:
+	// pump() only releases the front of a link's queue, so a send never fires before one queued
+	// earlier on the same link — a short draw behind a long one waits for it. Links don't wait on
+	// each other.
+	void enqueue(uint64_t p_now_ms, int32_t p_link, int p_delay_ms, P p_payload) {
+		queues_[p_link].push_back(Pending{ p_now_ms + (uint64_t)(p_delay_ms > 0 ? p_delay_ms : 0), std::move(p_payload) });
+	}
+
+	size_t pending() const {
+		size_t n = 0;
+		for (const auto &kv : queues_) {
+			n += kv.second.size();
+		}
+		return n;
+	}
 
 	// Call every poll: advances the spike machine by the real elapsed time, then hands every send
-	// whose time has come to p_fire, in the order they were queued.
+	// whose time has come to p_fire, in queue order per link.
 	template <class F>
 	void pump(uint64_t p_now_ms, F &&p_fire) {
 		const float delta = last_pump_ms_ != 0 ? (float)(p_now_ms - last_pump_ms_) / 1000.0f : 0.0f;
 		last_pump_ms_ = p_now_ms;
 		update_spike(delta);
-		while (!queue_.empty() && queue_.front().fire_at_ms <= p_now_ms) {
-			Pending ps = std::move(queue_.front());
-			queue_.pop_front();
-			p_fire(ps.payload);
+		for (auto &kv : queues_) {
+			std::deque<Pending> &q = kv.second;
+			while (!q.empty() && q.front().fire_at_ms <= p_now_ms) {
+				Pending ps = std::move(q.front());
+				q.pop_front();
+				p_fire(ps.payload);
+			}
 		}
 	}
 
@@ -187,7 +254,11 @@ private:
 	float spike_timer_ = 0.0f;   // counts up to spike_interval_s while idle
 	float spike_elapsed_ = 0.0f; // counts up to spike_duration_s while active
 	uint64_t last_pump_ms_ = 0;
-	std::deque<Pending> queue_;
+	std::unordered_map<int32_t, std::deque<Pending>> queues_;
+	int bandwidth_bps_ = BANDWIDTH_DEFAULT_BPS;
+	int queue_ms_ = QUEUE_DEFAULT_MS;
+	int packet_overhead_ = PACKET_OVERHEAD_DEFAULT;
+	std::unordered_map<int32_t, double> link_free_at_; // when each link finishes what it has queued
 };
 
 } // namespace goldnet

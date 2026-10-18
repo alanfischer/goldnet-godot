@@ -270,6 +270,17 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 				sim.set_latency_max_ms(parts[0].to_int());
 			}
 		}
+		// GOLDNET_LINK=bytes_per_sec[,queue_ms]: a slow link (a modem, BLE) on this endpoint's sends.
+		const char *link = getenv("GOLDNET_LINK");
+		if (link) {
+			PackedStringArray parts = String(link).split(",");
+			if (parts.size() >= 1 && !parts[0].is_empty()) {
+				sim.set_bandwidth_bps(parts[0].to_int());
+			}
+			if (parts.size() >= 2) {
+				sim.set_queue_ms(parts[1].to_int());
+			}
+		}
 		const char *spike = getenv("GOLDNET_SPIKE");
 		if (spike) {
 			PackedStringArray parts = String(spike).split(",");
@@ -308,6 +319,7 @@ void GoldNetMultiplayer::_reset_client_state() {
 void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
+	sim.forget_link((int32_t)p_id);
 	emit_signal("peer_disconnected", p_id);
 }
 void GoldNetMultiplayer::_relay_connected_to_server() {
@@ -317,6 +329,7 @@ void GoldNetMultiplayer::_relay_connected_to_server() {
 void GoldNetMultiplayer::_relay_connection_failed() { emit_signal("connection_failed"); }
 void GoldNetMultiplayer::_relay_server_disconnected() {
 	_reset_client_state();
+	sim.forget_link(1);
 	emit_signal("server_disconnected");
 }
 
@@ -661,10 +674,11 @@ void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
 	for (int i = 0; i < keys.size(); i++) {
 		const String k = keys[i];
 		if (k != "loss_percent" && k != "seed" && k != "latency_min_ms" && k != "latency_max_ms" &&
-				k != "spike_ms" && k != "spike_interval_s" && k != "spike_duration_s") {
+				k != "spike_ms" && k != "spike_interval_s" && k != "spike_duration_s" && k != "link_bps" &&
+				k != "link_queue_ms" && k != "link_overhead") {
 			ERR_FAIL_MSG("goldnet: unknown sim_config key '" + k +
 					"'. Valid keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, "
-					"spike_interval_s, spike_duration_s.");
+					"spike_interval_s, spike_duration_s, link_bps, link_queue_ms, link_overhead.");
 		}
 	}
 	typedef goldnet::NetSim<PendingSend> Sim;
@@ -675,6 +689,9 @@ void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
 	sim.set_spike_ms((int)p_cfg.get("spike_ms", Sim::SPIKE_DEFAULT_MS));
 	sim.set_spike_interval_s((float)p_cfg.get("spike_interval_s", Sim::SPIKE_INTERVAL_DEFAULT_S));
 	sim.set_spike_duration_s((float)p_cfg.get("spike_duration_s", Sim::SPIKE_DURATION_DEFAULT_S));
+	sim.set_bandwidth_bps((int)p_cfg.get("link_bps", Sim::BANDWIDTH_DEFAULT_BPS));
+	sim.set_queue_ms((int)p_cfg.get("link_queue_ms", Sim::QUEUE_DEFAULT_MS));
+	sim.set_packet_overhead((int)p_cfg.get("link_overhead", Sim::PACKET_OVERHEAD_DEFAULT));
 }
 
 Dictionary GoldNetMultiplayer::get_sim_config() const {
@@ -686,6 +703,9 @@ Dictionary GoldNetMultiplayer::get_sim_config() const {
 	d["spike_ms"] = sim.spike_ms();
 	d["spike_interval_s"] = sim.spike_interval_s();
 	d["spike_duration_s"] = sim.spike_duration_s();
+	d["link_bps"] = sim.bandwidth_bps();
+	d["link_queue_ms"] = sim.queue_ms();
+	d["link_overhead"] = sim.packet_overhead();
 	return d;
 }
 
@@ -696,10 +716,58 @@ bool GoldNetMultiplayer::get_relevance_events() const {
 	return server.relevance_events();
 }
 
-// Shared tail of both send funnels: this send's latency/spike, then send now or queue it.
-Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
-	int d = sim.delay_ms();
-	if (d <= 0) {
+// An RPC's size on the wire, for the simulated link: SceneMultiplayer's command byte and node and
+// method ids, then each argument. Bools and small ints pack into a byte or a few; anything else is
+// taken at its Variant encoding, which is close (and errs a few bytes high). An estimate — the
+// link sim needs a size, not an exact one.
+static int rpc_wire_bytes(const Array &p_args) {
+	int n = 4;
+	for (int i = 0; i < p_args.size(); i++) {
+		const Variant &v = p_args[i];
+		switch (v.get_type()) {
+			case Variant::NIL:
+			case Variant::BOOL:
+				n += 1;
+				break;
+			case Variant::INT: {
+				int64_t x = v;
+				n += 1 + (x >= -128 && x <= 127 ? 1 : (x >= -32768 && x <= 32767 ? 2 : (x >= INT32_MIN && x <= INT32_MAX ? 4 : 8)));
+			} break;
+			case Variant::PACKED_BYTE_ARRAY:
+				n += 8 + (int)PackedByteArray(v).size();
+				break;
+			default:
+				n += (int)UtilityFunctions::var_to_bytes(v).size();
+				break;
+		}
+	}
+	return n;
+}
+
+// Shared tail of both send funnels: this send's place on the simulated link and its latency/spike,
+// then send now, queue it, or drop it (a droppable send to a link whose buffer is full). Under a
+// link cap a broadcast is split per peer, since each peer's link is its own.
+Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args,
+		bool p_droppable, int p_bytes) {
+	if (sim.bandwidth_bps() > 0 && p_peer <= 0) {
+		PackedInt32Array peers = inner->get_peers();
+		for (int i = 0; i < peers.size(); i++) {
+			if (p_peer < 0 && peers[i] == -p_peer) {
+				continue;
+			}
+			_sim_send(peers[i], p_object, p_method, p_args, p_droppable, p_bytes);
+		}
+		return OK;
+	}
+	uint64_t now = Time::get_singleton()->get_ticks_msec();
+	if (sim.bandwidth_bps() > 0 && p_bytes < 0) {
+		p_bytes = rpc_wire_bytes(p_args);
+	}
+	int d = sim.schedule(now, p_peer, p_bytes > 0 ? (size_t)p_bytes : 0, p_droppable);
+	if (d < 0) {
+		return OK; // the link's buffer is full: dropped, as a real one would
+	}
+	if (d == 0) {
 		return inner->rpc(p_peer, p_object, p_method, p_args);
 	}
 	PendingSend ps;
@@ -707,7 +775,7 @@ Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const Stri
 	ps.object_id = p_object->get_instance_id();
 	ps.method = p_method;
 	ps.args = p_args;
-	sim.enqueue(Time::get_singleton()->get_ticks_msec(), d, ps);
+	sim.enqueue(now, p_peer, d, ps);
 	return OK;
 }
 
@@ -999,7 +1067,7 @@ struct GoldNetMultiplayer::ServerHost {
 		bytes.resize((int64_t)w.size());
 		memcpy(bytes.ptrw(), w.data(), w.size());
 		if (!gn->sim.loss_roll()) {
-			gn->_sim_send(peer, link, "_gn_recv", Array::make(bytes));
+			gn->_sim_send(peer, link, "_gn_recv", Array::make(bytes), true, 4 + 8 + (int)bytes.size());
 		}
 		gn->dbg_bytes += bytes.size();
 		if (gn->rpc_stats) {
@@ -1213,13 +1281,15 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
 	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
 	// (netsim_plan §4a). This is what lets /sim_loss exercise the input-command redundancy ring.
-	if (sim.loss_percent() > 0 && _rpc_is_unreliable(p_object, p_method) && sim.loss_roll()) {
+	const bool simulating = sim.loss_percent() > 0 || sim.bandwidth_bps() > 0;
+	const bool droppable = simulating && _rpc_is_unreliable(p_object, p_method);
+	if (droppable && sim.loss_percent() > 0 && sim.loss_roll()) {
 		return OK; // simulated drop
 	}
 	if (rpc_stats) {
 		_rpc_stats_count(p_peer, p_object, p_method, p_args);
 	}
-	return _sim_send(p_peer, p_object, p_method, p_args);
+	return _sim_send(p_peer, p_object, p_method, p_args, droppable);
 }
 
 void GoldNetMultiplayer::_rpc_stats_count(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
