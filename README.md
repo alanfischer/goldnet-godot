@@ -595,6 +595,16 @@ per-entity storage `X`. They reach the engine only through a host object you pas
 methods are listed at the top of `server.h` and `client.h`. `tests/test_protocol.cpp` has a
 complete minimal pair, `TestServerHost` and `TestClientHost`, over plain ints.
 
+`core/example/demo.cpp` is a runnable one over real UDP (macOS / Linux): a server bouncing
+balls that spawn and despawn, and clients that draw them, with `NetSim` loss/latency and a
+per-peer rate on the server's command line.
+
+```bash
+cmake -S core/example -B core/example/build && cmake --build core/example/build
+core/example/build/goldnet_demo server --loss 20 --latency 60
+core/example/build/goldnet_demo client      # another terminal; as many as you like
+```
+
 On the server:
 
 ```cpp
