@@ -592,7 +592,8 @@ something false.
 it to the include path. `goldnet::Server<V, X>` and `goldnet::Client<V>` are templates over your
 engine's value type `V` (default-constructible, copyable, comparable with `!=`) and optional
 per-entity storage `X`. They reach the engine only through a host object you pass in, whose
-methods are listed at the top of `server.h` and `client.h`. `tests/test_protocol.cpp` has a
+methods are listed at the top of `server.h` and `client.h`, and `server.h` also explains how a
+runtime entity's spawn and its state stream fit together. `tests/test_protocol.cpp` has a
 complete minimal pair, `TestServerHost` and `TestClientHost`, over plain ints.
 
 `core/example/demo.cpp` is a runnable one over real UDP (macOS / Linux): a server bouncing

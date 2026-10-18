@@ -407,6 +407,25 @@ static void test_resent_spawn_reaches_host_once() {
 	printf("  resent spawns and despawns reach the host once: ok\n");
 }
 
+// A refused spawn holds the ack, even on the very first frame: acking would retire the spawn as
+// delivered and nothing would resend it.
+static void test_refused_spawn_holds_ack() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.refuse_spawns = 3;
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	n.tick();
+	n.tick();
+	CHECK(a.spawned.size() == 1);
+	CHECK(n.sent_to(2) == 0 || base_seq_of(n.last_packet(2)) != 0); // acked and back on deltas
+	printf("  a refused spawn holds the ack until it's accepted: ok\n");
+}
+
 static void test_leave_and_reentry() {
 	Net n;
 	n.server.set_relevance_events(true);
@@ -622,6 +641,7 @@ int main() {
 	test_protocol_mismatch_warns_once();
 	test_spawn_is_lazy_and_reliable();
 	test_resent_spawn_reaches_host_once();
+	test_refused_spawn_holds_ack();
 	test_leave_and_reentry();
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();

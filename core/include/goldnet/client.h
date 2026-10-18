@@ -9,7 +9,7 @@
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
 //   void send_ack(uint16_t seq)
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
-//        create it; false = can't yet, and a later resend will offer it again
+//        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
 //   bool registered(uint32_t net_id)               does an entity with this id exist here?
@@ -133,13 +133,18 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// Spawns first: create the entities so they register before the entity deltas below
 	// reference them.
 	const int spawn_ct = r.get_u16();
+	bool spawn_refused = false;
 	for (int i = 0; i < spawn_ct && !r.failed(); i++) {
 		const uint32_t nid = r.get_u32();
 		const uint32_t spawner_nid = r.get_u32();
 		const uint32_t len = r.get_u32();
 		const uint8_t *data = r.get_data(len);
-		if (data && !spawned_.count(nid) && p_host.spawn(nid, spawner_nid, data, len)) {
-			spawned_.insert(nid);
+		if (data && !spawned_.count(nid)) {
+			if (p_host.spawn(nid, spawner_nid, data, len)) {
+				spawned_.insert(nid);
+			} else {
+				spawn_refused = true;
+			}
 		}
 	}
 	info.spawns = spawn_ct;
@@ -250,9 +255,15 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// frame so the server keeps resending its full baseline against a frame we hold, and drop this
 	// one uncommitted. Capped, and needs a prior good frame to fall back to; on the very first
 	// frame we just accept it.
-	if (defer_ack && has_ && defer_streak_ < MAX_DEFER_STREAK) {
+	//
+	// A refused spawn holds the same way, for the same reason: acking a frame that carries it tells
+	// the server it was delivered, and it's never sent again. That one holds even on the first
+	// frame, by not acking at all, since the server then keeps sending full state with the spawn.
+	if ((spawn_refused || (defer_ack && has_)) && defer_streak_ < MAX_DEFER_STREAK) {
 		defer_streak_++;
-		p_host.send_ack(last_seq_);
+		if (has_) {
+			p_host.send_ack(last_seq_);
+		}
 		return info;
 	}
 	defer_streak_ = 0;

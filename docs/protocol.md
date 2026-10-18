@@ -167,8 +167,10 @@ For each snapshot:
 6. **Truncated.** If the packet ran short, keep whatever it applied but neither commit nor ack.
 7. **Warmup.** If an entity the client knows of couldn't take its values yet (not ready), re-ack
    the last committed frame instead of this one, for up to 32 frames in a row (and only once some
-   frame has been committed; the very first is always accepted). Acking would tell
-   the server the entity's state was delivered, and an idle entity would then never be resent.
+   frame has been committed; the very first is always accepted). Acking would tell the server the
+   entity's state was delivered, and an idle entity would then never be resent. A spawn the client
+   couldn't create holds the frame the same way, and also on the very first frame, which it leaves
+   unacked: acking a frame carrying a spawn retires it, so it would never come again.
 8. **Commit.** Store the frame under `seq`, make it the last committed frame, and ack `seq`.
 
 The server, on an ack newer than the peer's previous one, makes that frame the peer's baseline and

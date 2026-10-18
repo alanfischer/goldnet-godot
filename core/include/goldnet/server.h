@@ -19,6 +19,25 @@
 //   void encode(Writer &w, const V &v, uint8_t quant, uint32_t now_ms)  one tagged value
 //   void send(int32_t peer, const Writer &packet)
 //
+// Spawns. An entity the client already has (one loaded with the map, at the same net_id on both
+// ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
+// is two registrations under one net_id, and the host makes both:
+//
+//   add_spawn(net_id, record)   tells each peer to create it; record.data is the host's recipe
+//   add_entity(key, net_id)     streams its slot state, like any other entity
+//
+// and when it's destroyed, despawn(net_id) and remove_entity(key). Calling both on the same tick
+// is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
+// first time the entity is visible to it (see SpawnRecord::vis_keys), is re-sent in every
+// snapshot until the peer acks one carrying it, and the despawn reaches only peers that got it.
+//
+// On the client, Client::apply() hands each spawn to the host's spawn() before it reads the
+// deltas, so by the time spawn() returns, registered() and begin_entity() must know the entity.
+// A delta for an id the host doesn't know is discarded and the frame still acked, and an idle
+// entity's state is then never sent again. A host that can't create it yet returns false from
+// spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
+// the client withholds the ack and the server keeps offering it (Client::apply has the details).
+//
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
 #include "goldnet/protocol.h"
@@ -67,8 +86,9 @@ public:
 	};
 
 	// A runtime entity's creation record, replayed to each peer the first time the entity is
-	// visible to it. node_key is the host's handle for detecting the entity's destruction;
-	// vis_keys are the keys to ask spawn_visible() about. data is opaque to the protocol.
+	// visible to it. spawner_net_id names what creates it on the client (0 = none) and goes on the
+	// wire with data, which is opaque to the protocol. node_key is the host's own; the server never
+	// reads it. vis_keys are the keys to ask spawn_visible() about.
 	struct SpawnRecord {
 		uint32_t spawner_net_id = 0;
 		uint64_t node_key = 0;
