@@ -157,10 +157,13 @@ For each snapshot:
 4. **Baseline.** If `base_seq` ≠ 0 and that frame isn't in the ring, re-ack the last committed
    frame and drop the snapshot. The server keeps diffing against frames the client holds,
    falling back to full state when it has to.
-5. **Apply.** Spawns are applied in order, as read. The new frame starts as a copy of the
-   baseline (empty for `base_seq` 0); each entity entry overwrites its changed slots and is
-   applied to the entity. Despawns are applied after the entities, then entities that no longer
-   exist locally are dropped from the frame, then leaves are dropped from it and reported.
+5. **Apply.** Spawns are applied in order, as read, skipping any net_id the client already created:
+   resends of an unacked spawn arrive every snapshot. A spawn the client can't create yet isn't
+   counted as created, so a later resend gets another try. The new frame starts as a copy of the
+   baseline (empty for `base_seq` 0); each entity entry overwrites its changed slots and is applied
+   to the entity. Despawns are applied after the entities, only for net_ids the client created
+   (they repeat the same way), then entities that no longer exist locally are dropped from the
+   frame, then leaves are dropped from it and reported.
 6. **Truncated.** If the packet ran short, keep whatever it applied but neither commit nor ack.
 7. **Warmup.** If an entity the client knows of couldn't take its values yet (not ready), re-ack
    the last committed frame instead of this one, for up to 32 frames in a row (and only once some

@@ -194,7 +194,7 @@ private:
 	Variant _spawn_trampoline(Variant p_data, int64_t p_spawner_objid); // wraps the game's spawn_function
 	void _drain_pending_spawns();  // promote captured spawns (now in-tree) to core spawn records
 	void _detect_despawns();       // poll: spawned nodes that were freed become despawns
-	void _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data); // client
+	bool _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data); // client
 	void _apply_despawn(uint32_t p_net_id);                                                  // client
 
 protected:

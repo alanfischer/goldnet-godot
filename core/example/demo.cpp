@@ -364,16 +364,14 @@ struct ClientApp {
 		const uint8_t pkt[3] = { 'A', (uint8_t)(seq & 0xFF), (uint8_t)(seq >> 8) };
 		sendto(fd, pkt, sizeof(pkt), 0, (sockaddr *)&server_addr, sizeof(server_addr));
 	}
-	// A spawn is resent until acked, so the same one can arrive several times.
-	void spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
-		if (ents.count(net_id)) {
-			return;
-		}
+	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
 		spawns++;
+		return true;
 	}
 	void despawn(uint32_t net_id) {
-		despawns += (int)ents.erase(net_id); // resent until acked too
+		ents.erase(net_id);
+		despawns++;
 	}
 	void relevance_lost(uint32_t) {}
 	bool registered(uint32_t net_id) { return ents.count(net_id) > 0; }

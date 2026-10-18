@@ -552,30 +552,29 @@ void GoldNetMultiplayer::_detect_despawns() {
 // Client: build a spawned node from its recipe, add it under the spawner's spawn_path, and
 // fire the spawner's `spawned` signal so the game runs its per-node bookkeeping. The node's
 // child synchronizer auto-registers on enter-tree and streams state like any other entity.
-void GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
-	if (client_spawned.has(p_net_id)) {
-		return; // already have it (redundant reliable-until-acked resend)
-	}
+// False when it can't be built yet; goldnet::Client then takes a later resend.
+bool GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
 	if (!spawner_netid_to_objid.has(p_spawner_net_id)) {
-		return; // spawner not registered here yet — a later resend will land
+		return false; // spawner not registered here yet
 	}
 	uint64_t sobj = spawner_netid_to_objid[p_spawner_net_id];
 	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(ObjectDB::get_instance(sobj));
 	if (!spawner || !spawners.has(sobj)) {
-		return;
+		return false;
 	}
 	Node *spawn_root = spawner->get_node_or_null(spawner->get_spawn_path());
 	if (!spawn_root) {
-		return;
+		return false;
 	}
 	Variant node_v = spawners[sobj].orig_fn.callv(Array::make(p_data));
 	Node *node = Object::cast_to<Node>(node_v);
 	if (!node) {
-		return;
+		return false;
 	}
 	spawn_root->add_child(node);
 	client_spawned[p_net_id] = node->get_instance_id();
 	spawner->emit_signal("spawned", node);
+	return true;
 }
 
 // Client: free a spawned node and fire the spawner's `despawned` signal.
@@ -1190,8 +1189,8 @@ struct GoldNetMultiplayer::ClientHost {
 		}
 	}
 
-	void spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
-		gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
+	bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
+		return gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
 	}
 
 	void despawn(uint32_t net_id) { gn->_apply_despawn(net_id); }

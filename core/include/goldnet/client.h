@@ -8,8 +8,9 @@
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
 //   void send_ack(uint16_t seq)
-//   void spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
-//   void despawn(uint32_t net_id)
+//   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
+//        create it; false = can't yet, and a later resend will offer it again
+//   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
 //   bool registered(uint32_t net_id)               does an entity with this id exist here?
 //   int  begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer)
@@ -23,6 +24,7 @@
 #include "goldnet/protocol.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace goldnet {
@@ -46,6 +48,7 @@ public:
 			frames_[i].clear();
 			frame_seq_[i] = 0;
 		}
+		spawned_.clear();
 		last_seq_ = 0;
 		has_ = false;
 		defer_streak_ = 0;
@@ -64,6 +67,9 @@ private:
 	uint16_t frame_seq_[RING] = {};
 	uint16_t last_seq_ = 0;
 	bool has_ = false;
+	// Spawns the host accepted. Spawns and despawns are resent until acked, so the same one can
+	// arrive many times; this is what lets the host see each exactly once.
+	std::unordered_set<uint32_t> spawned_;
 	bool warned_mismatch_ = false;
 	// Consecutive frames deferred because a KNOWN entity wasn't ready yet. Capped so an entity that
 	// never resolves can't stall the stream forever; after the cap we accept the frame and move on.
@@ -132,8 +138,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		const uint32_t spawner_nid = r.get_u32();
 		const uint32_t len = r.get_u32();
 		const uint8_t *data = r.get_data(len);
-		if (data) {
-			p_host.spawn(nid, spawner_nid, data, len);
+		if (data && !spawned_.count(nid) && p_host.spawn(nid, spawner_nid, data, len)) {
+			spawned_.insert(nid);
 		}
 	}
 	info.spawns = spawn_ct;
@@ -216,7 +222,9 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 
 	// Now free despawned entities (after the deltas so nothing applies to one we then free).
 	for (uint32_t nid : despawns) {
-		p_host.despawn(nid);
+		if (spawned_.erase(nid)) {
+			p_host.despawn(nid);
+		}
 	}
 
 	// Drop entities no longer registered here (e.g. after a map change / despawn) so the client
