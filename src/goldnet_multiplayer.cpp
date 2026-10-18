@@ -250,38 +250,37 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	rpc_stats = getenv("GOLDNET_RPC_STATS") != nullptr;
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
-		set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
+		sim.set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
 		// GOLDNET_SIM_SEED=<n> makes the whole sim (loss rolls + latency draws) reproducible
-		// run-to-run; without it the sim stays nondeterministic (engine RNG), as before.
+		// run-to-run; without it the sim stays nondeterministic.
 		const char *seed = getenv("GOLDNET_SIM_SEED");
-		set_sim_seed(seed ? atoi(seed) : 0);
+		sim.set_seed(seed ? atoi(seed) : 0);
 	}
 	{
 		// GOLDNET_LATENCY=min,max (per-leg ms range) or a single fixed value; GOLDNET_SPIKE=ms,interval,duration.
 		// These let a headless server simulate its own send leg with no admin console (see netsim_plan §3.5).
-		// Route through the setters (not raw fields) so clamping/side-effects live in exactly one place.
 		const char *lat = getenv("GOLDNET_LATENCY");
 		if (lat) {
 			PackedStringArray parts = String(lat).split(",");
 			if (parts.size() >= 2) {
-				set_latency_min_ms(parts[0].to_int());
-				set_latency_max_ms(parts[1].to_int());
+				sim.set_latency_min_ms(parts[0].to_int());
+				sim.set_latency_max_ms(parts[1].to_int());
 			} else if (parts.size() == 1 && !parts[0].is_empty()) {
-				set_latency_min_ms(parts[0].to_int());
-				set_latency_max_ms(parts[0].to_int());
+				sim.set_latency_min_ms(parts[0].to_int());
+				sim.set_latency_max_ms(parts[0].to_int());
 			}
 		}
 		const char *spike = getenv("GOLDNET_SPIKE");
 		if (spike) {
 			PackedStringArray parts = String(spike).split(",");
 			if (parts.size() >= 1 && !parts[0].is_empty()) {
-				set_spike_ms(parts[0].to_int());
+				sim.set_spike_ms(parts[0].to_int());
 			}
 			if (parts.size() >= 2) {
-				set_spike_interval_s((float)parts[1].to_float());
+				sim.set_spike_interval_s((float)parts[1].to_float());
 			}
 			if (parts.size() >= 3) {
-				set_spike_duration_s((float)parts[2].to_float());
+				sim.set_spike_duration_s((float)parts[2].to_float());
 			}
 		}
 	}
@@ -668,198 +667,48 @@ void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
 					"spike_interval_s, spike_duration_s.");
 		}
 	}
-	set_loss_percent((int)p_cfg.get("loss_percent", SIM_LOSS_DEFAULT_PERCENT));
-	set_sim_seed((int)p_cfg.get("seed", SIM_SEED_DEFAULT));
-	set_latency_min_ms((int)p_cfg.get("latency_min_ms", SIM_LATENCY_MIN_DEFAULT_MS));
-	set_latency_max_ms((int)p_cfg.get("latency_max_ms", SIM_LATENCY_MAX_DEFAULT_MS));
-	set_spike_ms((int)p_cfg.get("spike_ms", SIM_SPIKE_DEFAULT_MS));
-	set_spike_interval_s((float)p_cfg.get("spike_interval_s", SIM_SPIKE_INTERVAL_DEFAULT_S));
-	set_spike_duration_s((float)p_cfg.get("spike_duration_s", SIM_SPIKE_DURATION_DEFAULT_S));
+	typedef goldnet::NetSim<PendingSend> Sim;
+	sim.set_loss_percent((int)p_cfg.get("loss_percent", Sim::LOSS_DEFAULT_PERCENT));
+	sim.set_seed((int)p_cfg.get("seed", Sim::SEED_DEFAULT));
+	sim.set_latency_min_ms((int)p_cfg.get("latency_min_ms", Sim::LATENCY_MIN_DEFAULT_MS));
+	sim.set_latency_max_ms((int)p_cfg.get("latency_max_ms", Sim::LATENCY_MAX_DEFAULT_MS));
+	sim.set_spike_ms((int)p_cfg.get("spike_ms", Sim::SPIKE_DEFAULT_MS));
+	sim.set_spike_interval_s((float)p_cfg.get("spike_interval_s", Sim::SPIKE_INTERVAL_DEFAULT_S));
+	sim.set_spike_duration_s((float)p_cfg.get("spike_duration_s", Sim::SPIKE_DURATION_DEFAULT_S));
 }
 
 Dictionary GoldNetMultiplayer::get_sim_config() const {
 	Dictionary d;
-	d["loss_percent"] = get_loss_percent();
-	d["seed"] = get_sim_seed();
-	d["latency_min_ms"] = get_latency_min_ms();
-	d["latency_max_ms"] = get_latency_max_ms();
-	d["spike_ms"] = get_spike_ms();
-	d["spike_interval_s"] = get_spike_interval_s();
-	d["spike_duration_s"] = get_spike_duration_s();
+	d["loss_percent"] = sim.loss_percent();
+	d["seed"] = sim.seed();
+	d["latency_min_ms"] = sim.latency_min_ms();
+	d["latency_max_ms"] = sim.latency_max_ms();
+	d["spike_ms"] = sim.spike_ms();
+	d["spike_interval_s"] = sim.spike_interval_s();
+	d["spike_duration_s"] = sim.spike_duration_s();
 	return d;
 }
 
-void GoldNetMultiplayer::set_loss_percent(int p_pct) {
-	dbg_loss = p_pct < 0 ? 0 : (p_pct > 100 ? 100 : p_pct);
-}
-int GoldNetMultiplayer::get_loss_percent() const {
-	return dbg_loss;
-}
-void GoldNetMultiplayer::set_sim_seed(int p_seed) {
-	const uint32_t next = (uint32_t)(p_seed < 0 ? 0 : p_seed);
-	if (next == sim_seed) {
-		// Idempotent on purpose: re-writing the same seed must NOT restart the sequence. A caller
-		// doing a read-modify-write of one unrelated knob (/sim_loss on a seeded run) writes the
-		// seed back unchanged, and rewinding there would destroy the reproducibility the seed
-		// exists to provide.
-		return;
-	}
-	sim_seed = next;
-	_sim_rng = goldnet::sim_rng_seed(sim_seed); // restart the sequence
-}
-int GoldNetMultiplayer::get_sim_seed() const {
-	return (int)sim_seed;
-}
-uint32_t GoldNetMultiplayer::_sim_rand() {
-	// Unseeded keeps the previous behavior exactly: the engine RNG, freshly rolled.
-	return sim_seed == 0 ? (uint32_t)UtilityFunctions::randi() : goldnet::xorshift32(_sim_rng);
-}
-int GoldNetMultiplayer::_sim_rand_range(int p_lo, int p_hi) {
-	if (p_hi <= p_lo) {
-		return p_lo;
-	}
-	return p_lo + (int)(_sim_rand() % (uint32_t)(p_hi - p_lo + 1));
-}
-bool GoldNetMultiplayer::_loss_roll() {
-	if (dbg_loss <= 0) {
-		return false; // keep the disabled path free of any RNG work
-	}
-	return (int)(_sim_rand() % 100) < dbg_loss;
-}
 void GoldNetMultiplayer::set_relevance_events(bool p_enabled) {
 	server.set_relevance_events(p_enabled);
 }
 bool GoldNetMultiplayer::get_relevance_events() const {
 	return server.relevance_events();
 }
-void GoldNetMultiplayer::set_latency_min_ms(int p_ms) {
-	latency_min_ms = p_ms < 0 ? 0 : p_ms;
-}
-int GoldNetMultiplayer::get_latency_min_ms() const {
-	return latency_min_ms;
-}
-void GoldNetMultiplayer::set_latency_max_ms(int p_ms) {
-	latency_max_ms = p_ms < 0 ? 0 : p_ms;
-}
-int GoldNetMultiplayer::get_latency_max_ms() const {
-	return latency_max_ms;
-}
-void GoldNetMultiplayer::set_spike_ms(int p_ms) {
-	const int next = p_ms < 0 ? 0 : p_ms;
-	if (next == spike_ms) {
-		return; // idempotent, same reason as set_sim_seed
-	}
-	spike_ms = next;
-	if (spike_ms == 0) { // disabling clears any in-flight spike
-		_spike_active = false;
-		_spike_timer = 0.0f;
-		_spike_elapsed = 0.0f;
-	}
-}
-int GoldNetMultiplayer::get_spike_ms() const {
-	return spike_ms;
-}
-void GoldNetMultiplayer::set_spike_interval_s(float p_s) {
-	spike_interval_s = p_s < 0.0f ? 0.0f : p_s;
-}
-float GoldNetMultiplayer::get_spike_interval_s() const {
-	return spike_interval_s;
-}
-void GoldNetMultiplayer::set_spike_duration_s(float p_s) {
-	spike_duration_s = p_s < 0.0f ? 0.0f : p_s;
-}
-float GoldNetMultiplayer::get_spike_duration_s() const {
-	return spike_duration_s;
-}
-// --- Send-side sim engine (port of net_latency_sim.gd) ---
 
-// Advance the WiFi-spike state machine by one poll's worth of elapsed time. A spike is a brief
-// window where every send is held by spike_ms instead of the normal latency range, modelling a
-// power-save stall that releases a burst of packets at once.
-void GoldNetMultiplayer::_sim_update_spike(float p_delta) {
-	if (spike_ms <= 0) {
-		return;
-	}
-	if (_spike_active) {
-		_spike_elapsed += p_delta;
-		if (_spike_elapsed >= spike_duration_s) {
-			_spike_active = false;
-			_spike_elapsed = 0.0f;
-			_spike_timer = 0.0f;
-		}
-	} else {
-		_spike_timer += p_delta;
-		if (_spike_timer >= spike_interval_s) {
-			_spike_active = true;
-			_spike_elapsed = 0.0f;
-			_spike_timer = 0.0f;
-		}
-	}
-}
-
-// The delay (ms) to apply to the current send: the full spike latency while a spike is active,
-// otherwise a random draw from [latency_min_ms, latency_max_ms]. 0 ⇒ send immediately. Unlike the
-// GDScript original there is no >>1 half-split — this is the full per-leg delay (netsim_plan §4b).
-int GoldNetMultiplayer::_sim_delay_ms() {
-	if (_spike_active && spike_ms > 0) {
-		return spike_ms > 1 ? spike_ms : 1;
-	}
-	if (latency_max_ms <= 0) {
-		return 0;
-	}
-	return _sim_rand_range(latency_min_ms, latency_max_ms);
-}
-
-// The shared tail of both send funnels (the snapshot send and _rpc, minus their own loss gates):
-// apply this send's latency/spike, sending immediately when there's none or queuing it otherwise.
+// Shared tail of both send funnels: this send's latency/spike, then send now or queue it.
 Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
-	int d = _sim_delay_ms();
+	int d = sim.delay_ms();
 	if (d <= 0) {
 		return inner->rpc(p_peer, p_object, p_method, p_args);
 	}
-	_sim_queue_send(d, p_peer, p_object, p_method, p_args);
-	return OK;
-}
-
-// Queue inner->rpc(peer,object,method,args) to fire after p_delay_ms, clamped so packets never
-// overtake earlier ones (a pipe, not per-packet jitter): a late-released send fires no sooner than
-// the last one queued. One cursor suffices — every send routes through here, so there's no separate
-// reliable stream to order against.
-void GoldNetMultiplayer::_sim_queue_send(int p_delay_ms, int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
-	uint64_t fire_at = Time::get_singleton()->get_ticks_msec() + (uint64_t)p_delay_ms;
-	if (fire_at < _last_fire_at) {
-		fire_at = _last_fire_at;
-	}
-	_last_fire_at = fire_at;
 	PendingSend ps;
-	ps.fire_at_ms = fire_at;
 	ps.peer = p_peer;
 	ps.object_id = p_object->get_instance_id();
 	ps.method = p_method;
 	ps.args = p_args;
-	_sim_queue.push_back(ps);
-}
-
-// Called every poll (client and server): advance the spike timer by the real elapsed delta and
-// replay every queued send whose fire time has passed. A target freed during its delay is a no-op.
-void GoldNetMultiplayer::_sim_pump(uint64_t p_now_ms) {
-	float delta = _sim_last_poll_ms != 0 ? (float)(p_now_ms - _sim_last_poll_ms) / 1000.0f : 0.0f;
-	_sim_last_poll_ms = p_now_ms;
-	_sim_update_spike(delta);
-
-	int i = 0;
-	while (i < _sim_queue.size()) {
-		if (_sim_queue[i].fire_at_ms <= p_now_ms) {
-			PendingSend ps = _sim_queue[i];
-			_sim_queue.remove_at(i);
-			Object *o = ObjectDB::get_instance(ps.object_id);
-			if (o) {
-				inner->rpc(ps.peer, o, ps.method, ps.args);
-			}
-		} else {
-			i++;
-		}
-	}
+	sim.enqueue(Time::get_singleton()->get_ticks_msec(), d, ps);
+	return OK;
 }
 
 // Look p_method up in one rpc-config Dictionary (method name → per-method config carrying a
@@ -1149,7 +998,7 @@ struct GoldNetMultiplayer::ServerHost {
 		PackedByteArray bytes;
 		bytes.resize((int64_t)w.size());
 		memcpy(bytes.ptrw(), w.data(), w.size());
-		if (!gn->_loss_roll()) {
+		if (!gn->sim.loss_roll()) {
 			gn->_sim_send(peer, link, "_gn_recv", Array::make(bytes));
 		}
 		gn->dbg_bytes += bytes.size();
@@ -1293,7 +1142,12 @@ Error GoldNetMultiplayer::_poll() {
 	uint64_t now = Time::get_singleton()->get_ticks_msec();
 	// Pump the send-side sim every poll on BOTH ends: a client delays its input RPCs here (the
 	// client→server leg), a server its snapshots + RPCs (server→client). Also advances the spike timer.
-	_sim_pump(now);
+	sim.pump(now, [this](PendingSend &ps) {
+		Object *o = ObjectDB::get_instance(ps.object_id);
+		if (o) {
+			inner->rpc(ps.peer, o, ps.method, ps.args);
+		}
+	});
 	// A peerless MultiplayerAPI has no unique id to report, and asking for one logs an error.
 	// That is a normal state, not a broken one — the API sits peerless before the first session
 	// and again after one ends (including a join the server refused because it was full) — and
@@ -1359,7 +1213,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
 	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
 	// (netsim_plan §4a). This is what lets /sim_loss exercise the input-command redundancy ring.
-	if (dbg_loss > 0 && _rpc_is_unreliable(p_object, p_method) && _loss_roll()) {
+	if (sim.loss_percent() > 0 && _rpc_is_unreliable(p_object, p_method) && sim.loss_roll()) {
 		return OK; // simulated drop
 	}
 	if (rpc_stats) {

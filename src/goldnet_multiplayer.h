@@ -15,6 +15,7 @@
 // wrapped so their spawns and despawns are streamed through the same path.
 
 #include "goldnet/client.h"
+#include "goldnet/netsim.h"
 #include "goldnet/server.h"
 
 #include <vector>
@@ -122,68 +123,27 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<StringName, RpcStat> rpc_stats_methods;
 	void _rpc_stats_count(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
 	void _rpc_stats_print(uint64_t p_now);
-	int dbg_loss = SIM_LOSS_DEFAULT_PERCENT;     // GOLDNET_LOSS=<pct> → drop that % of snapshots
-	uint32_t sim_seed = SIM_SEED_DEFAULT;        // GOLDNET_SIM_SEED=<n> → 0 = engine RNG (nondeterministic)
-	uint32_t _sim_rng = 0;                       // xorshift state; only advanced when sim_seed != 0
-	// Every random draw the sim makes goes through here, so one seed replays a whole
-	// session. Unseeded falls through to the engine RNG — behavior identical to before.
-	uint32_t _sim_rand();
-	int _sim_rand_range(int p_lo, int p_hi);
-	// One loss roll: true = drop this packet.
-	bool _loss_roll();
-
 	// --- Network-condition simulation (send-side) — see docs/netsim_plan.md ---
-	// Applied at the two send funnels goldnet owns: _rpc (every game @rpc) and the snapshot
-	// send in _server_tick. Latency/spike defer the outgoing packet through _sim_queue; loss
-	// (dbg_loss, above) drops it. All send-side: the receiver runs its handler on arrival, so
-	// no receive hook is needed. A direct C++ port of the old net_latency_sim.gd (minus the
-	// per-leg >>1 half-split: latency here is the full per-leg delay, configured at each sender).
-	// Defaults live here and nowhere else: set_sim_config uses these same constants as its
-	// absent-key fallbacks, so `sim_config = {}` and a fresh instance agree by construction.
-	static constexpr int   SIM_LATENCY_MIN_DEFAULT_MS = 0;
-	static constexpr int   SIM_LATENCY_MAX_DEFAULT_MS = 0;
-	static constexpr int   SIM_SPIKE_DEFAULT_MS       = 0;
-	static constexpr float SIM_SPIKE_INTERVAL_DEFAULT_S = 10.0f;
-	static constexpr float SIM_SPIKE_DURATION_DEFAULT_S = 0.2f;
-	static constexpr int   SIM_LOSS_DEFAULT_PERCENT   = 0;
-	static constexpr int   SIM_SEED_DEFAULT           = 0;
-
-	int   latency_min_ms   = SIM_LATENCY_MIN_DEFAULT_MS;  // GOLDNET_LATENCY=min,max (or a single fixed value)
-	int   latency_max_ms   = SIM_LATENCY_MAX_DEFAULT_MS;
-	int   spike_ms         = SIM_SPIKE_DEFAULT_MS;        // GOLDNET_SPIKE=ms,interval,duration — one-way spike latency
-	float spike_interval_s = SIM_SPIKE_INTERVAL_DEFAULT_S; // average seconds between spikes
-	float spike_duration_s = SIM_SPIKE_DURATION_DEFAULT_S; // how long each spike lasts
-	bool  _spike_active    = false;
-	float _spike_timer     = 0.0f;               // counts up to spike_interval_s while idle
-	float _spike_elapsed   = 0.0f;               // counts up to spike_duration_s while active
-	uint64_t _sim_last_poll_ms = 0;              // last _sim_pump time, for the spike timer's frame delta
-
-	// A deferred send: replay inner->rpc(peer, <object>, method, args) once fire_at_ms elapses.
-	// The target is stored by ObjectID so a free during the (few-ms) delay is a safe no-op —
-	// matching the null-safe Callable capture the GDScript sim relied on.
+	// Applied at the two send funnels goldnet owns: _rpc (every game @rpc) and the snapshot send in
+	// ServerHost::send. Loss drops a packet; latency and spikes defer it. Configured through
+	// sim_config, or at startup by GOLDNET_LOSS / GOLDNET_SIM_SEED / GOLDNET_LATENCY / GOLDNET_SPIKE.
+	//
+	// A deferred send replays inner->rpc(peer, <object>, method, args). The target is held by
+	// ObjectID so a free during the (few-ms) delay is a safe no-op.
 	struct PendingSend {
-		uint64_t fire_at_ms = 0;
-		int32_t  peer = 0;
+		int32_t peer = 0;
 		uint64_t object_id = 0;
 		StringName method;
 		Array args;
 	};
-	Vector<PendingSend> _sim_queue;
-	uint64_t _last_fire_at = 0;                  // ordering cursor: a late-released packet still fires
-	                                             // after earlier ones (models a pipe, not per-packet jitter)
-
-	void _sim_update_spike(float p_delta);       // advance the spike state machine by the poll delta
-	int  _sim_delay_ms();                        // this send's latency (spike-aware); 0 = send immediately
-	void _sim_pump(uint64_t p_now_ms);           // update spike + fire due entries from _sim_queue
+	goldnet::NetSim<PendingSend> sim;
 	// Shared tail of both send funnels: apply latency/spike, then send now or queue. Returns the
 	// inner->rpc Error for the immediate path (OK for the queued path — the deferral can't fail here).
 	Error _sim_send(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
-	// Queue inner->rpc(peer,object,method,args) for delayed replay, preserving send order.
-	void _sim_queue_send(int p_delay_ms, int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
 	// True iff (object, method)'s @rpc transfer mode is one of the unreliable modes — i.e. loss may
 	// drop it without corrupting state (ENet retransmits reliable RPCs, so dropping one desyncs).
 	// Resolved from the node's rpc config and cached per (object, method). Only consulted when loss
-	// is armed (dbg_loss > 0), so normal play pays nothing and the cache stays empty. Unknown/non-node
+	// is armed (loss_percent > 0), so normal play pays nothing and the cache stays empty. Unknown/non-node
 	// targets return false (treated reliable → never dropped), the safe default.
 	bool _rpc_is_unreliable(Object *p_object, const StringName &p_method);
 	HashMap<uint64_t, HashMap<StringName, bool>> _rpc_unreliable_cache; // object_id -> method -> is-unreliable
@@ -257,46 +217,18 @@ public:
 	void set_peer_bandwidth_bps(int p_peer, int p_bps);
 	// Network-condition simulation, as ONE replace-semantics property rather than seven knobs:
 	// sim_config = {} is the off switch, and a read-back matches what was written. Unknown keys are
-	// an error, so a typo cannot quietly reset the sim. The per-knob setters below stay as plain
-	// C++ (the GOLDNET_* env parsing in the constructor uses them) but are deliberately NOT bound —
-	// a test harness should not be a third of the public API.
+	// an error, so a typo cannot quietly reset the sim. Latency is the full per-leg delay applied at
+	// THIS endpoint's send funnels; the opposite leg is configured on its own endpoint.
 	// Keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, spike_interval_s,
-	// spike_duration_s. Every setter is idempotent, so a read-modify-write of one knob disturbs
-	// nothing else — see set_sim_seed.
+	// spike_duration_s. Every knob is idempotent, so a read-modify-write of one disturbs nothing
+	// else. A non-zero seed replays the whole sim (loss rolls and latency draws); 0 is random.
 	void set_sim_config(const Dictionary &p_cfg);
 	Dictionary get_sim_config() const;
 
-	// Drop this percent of outbound snapshots server-side to exercise the ack self-heal without a
-	// real lossy network (also settable via GOLDNET_LOSS=<pct>).
-	void set_loss_percent(int p_pct);
-	int get_loss_percent() const;
-	// Seed for the whole network-condition sim — loss rolls AND latency draws (also
-	// settable via GOLDNET_SIM_SEED=<n>). 0 = use the engine RNG, i.e. a different pattern
-	// every run. Any non-zero value makes the session reproducible, which is what a
-	// regression test needs. Setting it resets the generator, so seed before the session
-	// starts rather than mid-run.
-	void set_sim_seed(int p_seed);
-	int get_sim_seed() const;
-	// Send-side network-condition simulation (see docs/netsim_plan.md). Latency is the full
-	// per-leg delay applied at THIS endpoint's send funnels; the opposite leg is configured on
-	// its own endpoint. Also settable via GOLDNET_LATENCY / GOLDNET_SPIKE env vars (headless).
-	void set_latency_min_ms(int p_ms);
-	int get_latency_min_ms() const;
-	void set_latency_max_ms(int p_ms);
-	int get_latency_max_ms() const;
-	void set_spike_ms(int p_ms);
-	int get_spike_ms() const;
-	void set_spike_interval_s(float p_s);
-	float get_spike_interval_s() const;
-	void set_spike_duration_s(float p_s);
-	float get_spike_duration_s() const;
-	// Clear runtime sim state (pending sends, ordering cursors, spike machine). Leaves config intact.
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
 	void set_relevance_events(bool p_enabled);
 	bool get_relevance_events() const;
-	// Arm spawner capture now (wrap existing spawners + hook node_added). Call right after installing
-	// GoldNet if the game spawns during _ready, before the first poll would otherwise do it.
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

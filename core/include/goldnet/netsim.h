@@ -1,0 +1,193 @@
+#pragma once
+//
+// Send-side network-condition simulation: loss, latency, and periodic latency spikes, applied at
+// a host's send funnels. All send-side: the receiver runs its handler on arrival, so no receive
+// hook is needed. Latency is the full per-leg delay, configured at each sender.
+//
+// P is whatever the host needs to replay a deferred send. The sim decides; the host sends:
+//
+//   if (sim.loss_percent() > 0 && droppable && sim.loss_roll()) return;  // simulated drop
+//   int d = sim.delay_ms();
+//   if (d <= 0) send_now(...); else sim.enqueue(now_ms, d, payload);
+//   ...
+//   sim.pump(now_ms, [&](P &payload) { send_now(payload); });          // every poll
+//
+// Every random draw goes through one generator, so a non-zero seed replays a whole session —
+// loss rolls and latency draws alike — which is what a regression test needs. Seed 0 is
+// nondeterministic: a different pattern every run.
+//
+#include "goldnet/codec.h"
+
+#include <cstdint>
+#include <deque>
+#include <random>
+
+namespace goldnet {
+
+template <class P>
+class NetSim {
+public:
+	// Defaults live here and nowhere else, so a host's "reset to defaults" and a fresh instance
+	// agree by construction.
+	static constexpr int LATENCY_MIN_DEFAULT_MS = 0;
+	static constexpr int LATENCY_MAX_DEFAULT_MS = 0;
+	static constexpr int SPIKE_DEFAULT_MS = 0;
+	static constexpr float SPIKE_INTERVAL_DEFAULT_S = 10.0f;
+	static constexpr float SPIKE_DURATION_DEFAULT_S = 0.2f;
+	static constexpr int LOSS_DEFAULT_PERCENT = 0;
+	static constexpr int SEED_DEFAULT = 0;
+
+	NetSim() { rng_ = fresh_state(0); }
+
+	// --- config: every setter clamps, and is idempotent, so a read-modify-write of one knob
+	// disturbs nothing else ---
+
+	void set_loss_percent(int p_pct) { loss_ = p_pct < 0 ? 0 : (p_pct > 100 ? 100 : p_pct); }
+	int loss_percent() const { return loss_; }
+
+	// Re-writing the same seed must NOT restart the sequence: a read-modify-write of an unrelated
+	// knob on a seeded run writes the seed back unchanged, and rewinding there would destroy the
+	// reproducibility the seed exists to provide. Setting a new one restarts it, so seed before
+	// the session starts rather than mid-run.
+	void set_seed(int p_seed) {
+		const uint32_t next = (uint32_t)(p_seed < 0 ? 0 : p_seed);
+		if (next == seed_) {
+			return;
+		}
+		seed_ = next;
+		rng_ = fresh_state(seed_);
+	}
+	int seed() const { return (int)seed_; }
+
+	void set_latency_min_ms(int p_ms) { latency_min_ = p_ms < 0 ? 0 : p_ms; }
+	int latency_min_ms() const { return latency_min_; }
+	void set_latency_max_ms(int p_ms) { latency_max_ = p_ms < 0 ? 0 : p_ms; }
+	int latency_max_ms() const { return latency_max_; }
+
+	// One-way latency while a spike is active, modelling a power-save stall that releases a burst
+	// of packets at once. 0 disables spikes and clears any in flight.
+	void set_spike_ms(int p_ms) {
+		const int next = p_ms < 0 ? 0 : p_ms;
+		if (next == spike_ms_) {
+			return;
+		}
+		spike_ms_ = next;
+		if (spike_ms_ == 0) {
+			spike_active_ = false;
+			spike_timer_ = 0.0f;
+			spike_elapsed_ = 0.0f;
+		}
+	}
+	int spike_ms() const { return spike_ms_; }
+	void set_spike_interval_s(float p_s) { spike_interval_s_ = p_s < 0.0f ? 0.0f : p_s; } // between spikes
+	float spike_interval_s() const { return spike_interval_s_; }
+	void set_spike_duration_s(float p_s) { spike_duration_s_ = p_s < 0.0f ? 0.0f : p_s; } // each spike's length
+	float spike_duration_s() const { return spike_duration_s_; }
+
+	// --- decisions ---
+
+	// One loss roll: true = drop this packet. Free (no RNG draw) while loss is off.
+	bool loss_roll() {
+		if (loss_ <= 0) {
+			return false;
+		}
+		return (int)(rand() % 100) < loss_;
+	}
+
+	// This send's delay: the full spike latency while a spike is active, otherwise a draw from
+	// [latency_min_ms, latency_max_ms]. 0 = send immediately.
+	int delay_ms() {
+		if (spike_active_ && spike_ms_ > 0) {
+			return spike_ms_ > 1 ? spike_ms_ : 1;
+		}
+		if (latency_max_ <= 0) {
+			return 0;
+		}
+		return rand_range(latency_min_, latency_max_);
+	}
+
+	bool spike_active() const { return spike_active_; }
+
+	// Hold a send for p_delay_ms. A pipe, not per-packet jitter: pump() only ever releases the
+	// front of the queue, so a send never fires before one queued earlier — a short draw behind a
+	// long one waits for it.
+	void enqueue(uint64_t p_now_ms, int p_delay_ms, P p_payload) {
+		queue_.push_back(Pending{ p_now_ms + (uint64_t)(p_delay_ms > 0 ? p_delay_ms : 0), std::move(p_payload) });
+	}
+
+	size_t pending() const { return queue_.size(); }
+
+	// Call every poll: advances the spike machine by the real elapsed time, then hands every send
+	// whose time has come to p_fire, in the order they were queued.
+	template <class F>
+	void pump(uint64_t p_now_ms, F &&p_fire) {
+		const float delta = last_pump_ms_ != 0 ? (float)(p_now_ms - last_pump_ms_) / 1000.0f : 0.0f;
+		last_pump_ms_ = p_now_ms;
+		update_spike(delta);
+		while (!queue_.empty() && queue_.front().fire_at_ms <= p_now_ms) {
+			Pending ps = std::move(queue_.front());
+			queue_.pop_front();
+			p_fire(ps.payload);
+		}
+	}
+
+private:
+	struct Pending {
+		uint64_t fire_at_ms;
+		P payload;
+	};
+
+	static uint32_t fresh_state(uint32_t p_seed) {
+		if (p_seed != 0) {
+			return sim_rng_seed(p_seed);
+		}
+		std::random_device rd;
+		return sim_rng_seed(rd()); // sim_rng_seed maps a 0 draw to a legal state
+	}
+
+	uint32_t rand() { return xorshift32(rng_); }
+
+	int rand_range(int p_lo, int p_hi) {
+		if (p_hi <= p_lo) {
+			return p_lo;
+		}
+		return p_lo + (int)(rand() % (uint32_t)(p_hi - p_lo + 1));
+	}
+
+	void update_spike(float p_delta) {
+		if (spike_ms_ <= 0) {
+			return;
+		}
+		if (spike_active_) {
+			spike_elapsed_ += p_delta;
+			if (spike_elapsed_ >= spike_duration_s_) {
+				spike_active_ = false;
+				spike_elapsed_ = 0.0f;
+				spike_timer_ = 0.0f;
+			}
+		} else {
+			spike_timer_ += p_delta;
+			if (spike_timer_ >= spike_interval_s_) {
+				spike_active_ = true;
+				spike_elapsed_ = 0.0f;
+				spike_timer_ = 0.0f;
+			}
+		}
+	}
+
+	int loss_ = LOSS_DEFAULT_PERCENT;
+	uint32_t seed_ = SEED_DEFAULT;
+	uint32_t rng_ = 0;
+	int latency_min_ = LATENCY_MIN_DEFAULT_MS;
+	int latency_max_ = LATENCY_MAX_DEFAULT_MS;
+	int spike_ms_ = SPIKE_DEFAULT_MS;
+	float spike_interval_s_ = SPIKE_INTERVAL_DEFAULT_S;
+	float spike_duration_s_ = SPIKE_DURATION_DEFAULT_S;
+	bool spike_active_ = false;
+	float spike_timer_ = 0.0f;   // counts up to spike_interval_s while idle
+	float spike_elapsed_ = 0.0f; // counts up to spike_duration_s while active
+	uint64_t last_pump_ms_ = 0;
+	std::deque<Pending> queue_;
+};
+
+} // namespace goldnet

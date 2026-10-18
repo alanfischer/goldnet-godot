@@ -27,7 +27,8 @@ loss levels where reliable replication drops clients (see **Performance** below)
 `core/include/goldnet/` as header-only C++ with no Godot dependency: `goldnet::Server`
 (change tracking, per-peer deltas against the acked frame, acks, spawns, leaves, the
 packet budget) and `goldnet::Client` (baseline reconstruction and apply), over the
-byte-level wire in `buffer.h` / `codec.h` / `protocol.h`. Both are templated on the
+byte-level wire in `buffer.h` / `codec.h` / `protocol.h`, plus `goldnet::NetSim`, the
+send-side loss / latency / spike simulator. Both are templated on the
 host's value type and reach the engine only through a small host interface — read a
 slot, test visibility, encode a value, send bytes — so Godot's `Variant`s pass through
 unconverted. Everything Godot-specific (synchronizers, spawners, `Variant` encoding, the
@@ -357,6 +358,8 @@ Standalone — no godot-cpp, no engine, runs in about a second. It covers the co
   re-entry before the leave is acked), the packet budget and its priority order,
   per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
   reordered, truncated or mismatched packets.
+- `test_netsim`: config clamping, one seed replaying loss and latency together, the
+  latency range and loss rate, the in-order delay pipe, and the spike cycle.
 
 Scope is deliberate. godot-cpp's engine classes call through GDExtension function
 pointers that only exist inside a running Godot process, so the Godot adapter in `src/`
