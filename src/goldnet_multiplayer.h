@@ -5,17 +5,14 @@
 // API.
 //
 // COMPOSITION: we hold an inner SceneMultiplayer and delegate handshake, auth, peer
-// lifecycle, and ALL @rpc traffic to it. We replace only the *state replication*
-// layer.
+// lifecycle, and the game's @rpc traffic to it. We replace the *state replication* layer.
 //
-// PHASE 0: pure pass-through — every virtual forwarded to the inner.
-// PHASE 1 (this file): we intercept the synchronizers we can fully own — those whose
-//   replication config is *sync-only* (no spawn-marked properties) — into our own
-//   registry, and stream their full state ourselves each tick as an unreliable
-//   snapshot (via GoldNetLink), honoring the synchronizer's visibility. Synchronizers
-//   with spawn-marked properties stay coupled to the inner's spawner (Phase 3 folds
-//   spawns into our stream), as do MultiplayerSpawners and all RPCs.
-//   This is "old netcode (ALWAYS full-state) on our path" — parity, not yet the delta.
+// We intercept every synchronizer that has at least one per-tick property (sync or watch)
+// into our own registry, and stream those ourselves each tick as an unreliable snapshot
+// (via GoldNetLink), honoring the synchronizer's visibility. Each peer gets a delta
+// against the last frame it acked, and a full frame only on its first send or when that
+// ack has aged out. Spawn-only configs are left to the inner. MultiplayerSpawners are
+// wrapped so their spawns and despawns are streamed through the same path.
 
 #include "goldnet_codec.h"
 
