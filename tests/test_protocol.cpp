@@ -89,6 +89,7 @@ struct Peer {
 	std::vector<uint16_t> acks;
 	std::vector<uint32_t> times;
 	std::vector<uint16_t> command_acks;
+	std::vector<std::pair<uint32_t, uint32_t>> uplink_reports; // lag_ms, pps
 	std::vector<std::pair<uint16_t, bool>> chan_acks;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
@@ -103,6 +104,7 @@ struct TestClientHost {
 	void protocol_mismatch() { p->mismatches++; }
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
 	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
+	void uplink_report(uint32_t lag_ms, uint32_t pps) { p->uplink_reports.push_back({ lag_ms, pps }); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
 	void channel_ack(const ChannelAck &a) { p->chan_acks.push_back({ a.received, a.bit }); }
 	void message(const uint8_t *data, size_t size, bool reliable) {
@@ -214,8 +216,9 @@ struct Net {
 };
 
 static uint16_t base_seq_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[3] | (pkt[4] << 8)); }
-// With an empty channel part, the spawn count follows the 11-byte header and its 5 bytes.
-static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[16] | (pkt[17] << 8)); }
+// With an empty channel part and no uplink report, the spawn count follows the 11-byte header, the
+// report's two 1-byte zeros and the channel part's 5 bytes.
+static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[18] | (pkt[19] << 8)); }
 
 // --- tests ---
 
@@ -762,6 +765,17 @@ static void test_command_ack_rides_the_header() {
 	printf("  the command ack rides the header and earns a send when new: ok\n");
 }
 
+// The server's measure of a client's uplink rides the header of that client's snapshots.
+static void test_uplink_report_rides_the_header() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.set_uplink_report(2, 340, 44);
+	n.tick();
+	CHECK(!p.uplink_reports.empty() && p.uplink_reports.back() == std::make_pair(340u, 44u));
+	printf("  the uplink report rides the snapshot header: ok\n");
+}
+
 // A gap in the seqs a client receives is a lost snapshot. Idle ticks send nothing and take no
 // seq, so they read as no loss at all, and a late snapshot is taken back off the running total.
 static void test_arrival_stats_count_only_real_loss() {
@@ -876,6 +890,7 @@ int main() {
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
 	test_arrival_stats_count_only_real_loss();
+	test_uplink_report_rides_the_header();
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	printf("%d checks passed\n", checks);

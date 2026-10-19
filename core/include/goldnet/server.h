@@ -243,6 +243,15 @@ public:
 		pr.cmd_news = pr.cmd_news || p_news;
 	}
 
+	// How far behind its best this peer's uplink arrives, ms, and its packets arriving per second
+	// (CommandReceiver::uplink_lag_ms / uplink_pps), carried in the peer's next snapshot header for its
+	// CmdRateAuto.
+	void set_uplink_report(int32_t p_peer, uint32_t p_lag_ms, uint32_t p_pps) {
+		PeerRing &pr = rings_[p_peer];
+		pr.uplink_lag_ms = p_lag_ms;
+		pr.uplink_pps = p_pps;
+	}
+
 	// --- Messages (netchan.h) ---
 
 	void queue_reliable(int32_t p_peer, const uint8_t *p_data, size_t p_size) { rings_[p_peer].rel.queue(p_data, p_size); }
@@ -410,6 +419,8 @@ private:
 		uint16_t cmd_ack = 0;      // see set_command_ack
 		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
 		bool cmd_news = false;     // see set_command_ack
+		uint32_t uplink_lag_ms = 0; // see set_uplink_report
+		uint32_t uplink_pps = 0;
 		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
@@ -760,6 +771,8 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);
 		packet.put_u16(pr.cmd_ack);
+		put_uvarint(&packet, pr.uplink_lag_ms);
+		put_uvarint(&packet, pr.uplink_pps);
 		put_channel(packet, up, block_flags, block, datagram);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);

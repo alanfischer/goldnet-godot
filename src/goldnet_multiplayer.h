@@ -23,6 +23,7 @@
 // GoldSrc's netchan (goldnet/netchan.h): a reliable one in the reliable stream, an unreliable one in
 // the datagram. See _send_message.
 
+#include "goldnet/auto_rate.h"
 #include "goldnet/client.h"
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
@@ -172,6 +173,19 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// --- Command streams (uplink) ---
 	goldnet::CommandSender commands_out;  // client
 	goldnet::CommandReceiver commands_in; // server
+	// Client: the rate and command rate the game set, and the automatic ones (auto_rate.h). Kept
+	// here rather than only in commands_out, which a new session resets.
+	int rate_setting = 0;
+	bool auto_rate = false;
+	double command_rate_setting = 0.0;
+	bool auto_command_rate = false;
+	goldnet::DownlinkMeter downlink;
+	goldnet::CmdRateAuto cmd_auto;
+	uint32_t uplink_lag_ms = 0; // the server's last report of our uplink
+	uint32_t uplink_pps = 0;
+	void _apply_link_settings();
+	void _on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps);
+	void _on_server_time(uint32_t p_ms);
 	// Client: the snapshot ack for the next uplink packet. While a command stream is active it waits
 	// for the next command packet rather than going alone, as GoldSrc's acks ride clc_move.
 	uint16_t snapshot_ack = 0;
@@ -268,10 +282,14 @@ public:
 	int get_snapshot_interval_ms() const;
 	// Write-only: the per-peer value is consulted in the send path and nothing reads it back.
 	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
-	// GoldSrc rate / choke: the most bytes per second to send this peer (0 = unlimited, the
-	// default). Snapshots and game RPCs both count; while the peer is over, its snapshots are
-	// skipped (choked), and the next one it gets carries the latest state.
-	void set_peer_rate(int p_peer, int p_bytes_per_sec);
+	// Client: the most bytes per second the server may send us (GoldSrc `rate`; 0 = no limit, the
+	// default). Snapshots and game RPCs both count; while we're over it the server skips our
+	// snapshots (a choke), and the next one we get carries the latest state. Ignored while
+	// auto_rate is on, which picks it from how far behind the downlink is arriving.
+	void set_rate(int p_bytes_per_sec);
+	int get_rate() const;
+	void set_auto_rate(bool p_enabled);
+	bool get_auto_rate() const;
 	// Who decides when snapshots go out. Off (the default): goldnet sends on its own clock, at the
 	// synchronizers' replication_interval, from poll. On: the game calls send_snapshots() once per
 	// server tick, after it has written that tick's state — GoldSrc's SV_SendClientMessages at the
@@ -306,6 +324,13 @@ public:
 	//   command_rtt_ms           client: the command round trip (current, not a total)
 	//   recv_sim_bytes/packets   client: what the receive sim let through, which is what a downlink
 	//                            meter should count while it is on, not the transport's counters
+	// and these, which are current values rather than totals:
+	//   rate                     the rate in force for the link, bytes/sec; 0 = no limit
+	//   command_rate             client: command packets/sec in force; 0 = one per command
+	//   downlink_lag_ms          client: how far behind its best the downlink is arriving
+	//   uplink_lag_ms, uplink_pps  the same for the uplink, and its packets arriving per second
+	//                            (measured on the server, reported to the client)
+	//   delivered_bps            client: bytes/sec arriving on the wire
 	Dictionary get_peer_stats(int p_peer) const;
 
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
@@ -315,8 +340,12 @@ public:
 
 	// Client: command packets per second (GoldSrc cl_cmdrate). 0 (the default) sends whenever there
 	// is a command to send, which a game calling its command RPC once per tick makes once per tick.
+	// Ignored while auto_command_rate is on, which picks it from the server's report of how far
+	// behind our uplink is arriving, up to the physics tick rate.
 	void set_command_rate(double p_hz);
 	double get_command_rate() const;
+	void set_auto_command_rate(bool p_enabled);
+	bool get_auto_command_rate() const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

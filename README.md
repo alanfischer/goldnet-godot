@@ -337,6 +337,8 @@ Standalone — no godot-cpp, no engine, runs in about a second. It covers the co
   re-entry before the leave is acked), the packet budget and its priority order,
   per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
   reordered, truncated or mismatched packets.
+- `test_auto_rate`: the queue and arrival meters, and the controllers that pick a client's rate and
+  command rate from them.
 - `test_netsim`: config clamping, one seed replaying loss and latency together, the
   latency range and loss rate, the in-order delay pipe, the spike cycle, and the link
   cap (serialization, overhead, per-link independence, the full-buffer drop rule).
@@ -469,8 +471,9 @@ something false.
    ```gdscript
    sync.set_meta("gn_priority", 4.0)   # players over debris
    ```
-7. (Optional) Limit a peer's link with its **rate** (GoldSrc's `rate`): the most bytes per
-   second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
+7. (Optional) Limit a client's downlink with its **rate** (GoldSrc's `rate`): the most bytes per
+   second the server may send it, snapshots and `@rpc` traffic both counted. The client sets it,
+   and every uplink packet tells the server. Each send pushes the peer's
    clear time out by its size over the rate; while that's in the future the peer is
    **choked** — it gets no snapshot that tick, and the next one it does get deltas against
    its acked baseline, so it carries the latest state rather than a backlog. A slow link
@@ -478,8 +481,16 @@ something false.
    netchan wait for the peer's next snapshot like everything else; ones on the inner (see
    **RPCs on the netchan**) still go out when choked, but they count.
    ```gdscript
-   gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
+   gn.rate = 5000                    # client, bytes/sec; 0 = unlimited (the default)
+   gn.auto_rate = true               # or let goldnet pick it
    ```
+
+   With `auto_rate` on, the client picks its rate from how far behind its best each snapshot
+   arrives, by the server's send time: no limit until the downlink queues, then a limit just under
+   what is arriving, a sharp cut while it still queues and a slow climb while it doesn't. A queue full
+   from the first snapshot shows no lag, so before the first limit, lost snapshots count as queueing
+   too. The server applies at least 1000 B/s and emits `peer_rate_changed(peer, rate)` when a client's
+   rate changes, for a game that sizes a peer's cadence by it.
 
    A peer can also be served less often than the server ticks (GoldSrc's `cl_updaterate`),
    without slowing anyone else: the tick still runs at full rate and only skips that peer until
@@ -576,6 +587,7 @@ something false.
    delta-coded bytewise against the previous one, so a fixed layout compresses best.
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
+   gn.auto_command_rate = true   # or let goldnet pick it
    ```
 10. (Optional) Keep an RPC off the netchan by declaring it on a channel other than 0. It goes
    through the inner `SceneMultiplayer` straight away, ordered only against its own channel, as stock
@@ -586,16 +598,23 @@ something false.
    @rpc("authority", "call_remote", "unreliable", 1)
    func sync_voice(packet: PackedByteArray) -> void: ...
    ```
-11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). The values are running
-   totals, so diff two reads for a rate; every key is present on both ends and 0 where it doesn't
-   apply.
+   With `auto_command_rate` on, the client picks its command rate from the server's report of how
+   far behind its uplink packets arrive, carried in each snapshot header. It starts at 20 packets a
+   second and climbs quickly until the uplink first queues, so a slow link isn't flooded before a
+   report can say so; then it cuts under the rate the server sees packets arrive at, and climbs
+   slowly. It never goes past the physics tick rate.
+11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). Every key is present on both
+   ends and 0 where it doesn't apply.
    ```gdscript
    gn.get_peer_stats(peer)
+   # running totals, so diff two reads for a rate:
    # server: chokes (snapshots withheld by the rate), messages_queued, messages_delivered
    # client: snapshots_received, snapshots_lost, messages_queued, messages_delivered,
-   #         commands_pending, commands_dropped, command_rtt_ms (current, not a total),
-   #         recv_sim_bytes, recv_sim_packets (what recv_sim_config let through; count these, not
-   #         the transport's counters, while it is on)
+   #         commands_pending, commands_dropped, recv_sim_bytes, recv_sim_packets (what
+   #         recv_sim_config let through; count these, not the transport's counters, while it is on)
+   # current values:
+   # both:   rate (bytes/sec in force), uplink_lag_ms, uplink_pps (measured by the server)
+   # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
    ```
 
 > **Headless note:** Godot registers `.gdextension` files via
@@ -639,7 +658,7 @@ server.on_ack(peer, seq);           // each ack the client sends
 server.remove_peer(peer);           // on disconnect
 ```
 
-Per-peer cadence and rate are `set_peer_interval_ms` and `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
+Per-peer cadence and rate are `set_peer_interval_ms` and `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`. `CommandReceiver` reads each client's rate (`rate(peer)`) and meters its uplink (`uplink_lag_ms(peer)`, `uplink_pps(peer)`) for `server.set_uplink_report`. `auto_rate.h` has the meters and controllers a client runs to pick its rate and command rate (`DownlinkMeter`, `CmdRateAuto`).
 
 On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
 for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink
@@ -653,6 +672,7 @@ if (commands.due(now)) {                      // or whenever an ack is waiting
     commands.write(now, snapshot_ack, w);     // send w to the server
 }
 commands.on_ack(seq, now);                    // from the client host's command_ack(seq)
+commands.set_rate(bytes_per_sec);             // the rate to ask the server for; 0 = no limit
 
 goldnet::CommandReceiver receiver;            // server
 receiver.receive(peer, bytes, size, host);    // host gets snapshot_ack() and each command() in order

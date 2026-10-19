@@ -1,4 +1,4 @@
-# goldnet wire protocol (version 6)
+# goldnet wire protocol (version 7)
 
 The byte-level contract between goldnet's two ends: what a snapshot and an uplink packet contain,
 how each value is encoded, and what each end does with them. The README's **How it
@@ -56,11 +56,13 @@ the datagram. A message is `uvarint target` and then:
 One per peer per send, server to client.
 
 ```
-u8   version        SNAPSHOT_VERSION = 5
+u8   version        SNAPSHOT_VERSION = 7
 u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
 u16  command_ack    the newest command from this peer delivered with none missing before it; 0 = none
+uvarint uplink_lag  how far behind its best this peer's uplink arrives, ms (see **Uplink report**)
+uvarint uplink_pps  this peer's uplink packets arriving per second; 0 = not known yet
 ...  channel part   (see **Channel**) its ack is the newest uplink packet received
 u16  spawn_ct       then spawn_ct  × spawn entry
 u16  despawn_ct     then despawn_ct × u32 net_id
@@ -69,7 +71,8 @@ u16  changed_ct     then changed_ct × entity entry
 ```
 
 Only the first 11 bytes sit at fixed offsets; each count is followed directly by its entries. The
-fixed part (header, an empty channel part and the four counts) is `SNAPSHOT_HEADER_BYTES` = 24.
+fixed part (header with the uplink report at 3 bytes a field, an empty channel part and the four
+counts) is `SNAPSHOT_HEADER_BYTES` = 30.
 
 **Spawn entry** — a runtime entity the client must create before any delta can reach it:
 
@@ -189,6 +192,8 @@ across all of a client's streams. It is kept over the unreliable link the Quake 
 u8   version        SNAPSHOT_VERSION
 u16  seq            this packet's, counting up from 1 and skipping 0 on the wrap
 u16  snapshot_ack   the newest committed snapshot; 0 = none
+u16  send_time      the client's clock at send, ms, low 16 bits
+uvarint rate        the rate the client asks for, in units of 100 bytes/sec, rounded up; 0 = no limit
 ...  channel part   (see **Channel**) its ack is the newest snapshot received, committed or not
 u16  floor          the oldest command the client still holds; its next seq if it holds none
 u8   stream_ct      then stream_ct × u32 stream_id
@@ -228,6 +233,17 @@ gap until the gap fills. A truncated packet is dropped whole, ack included. The 
 a peer starts it at `floor`; a later `floor` newer than the next command due means the client gave
 up on everything before it, and the server skips ahead. Its `command_ack` is the seq before the
 next command due, sent in the peer's next snapshot.
+
+## Uplink report
+
+The server meters each peer's uplink from its packets' `send_time`s: it unwraps the 16 bits against
+the newest seen, and arrival time minus send time is the two clocks' offset plus the trip. Its floor
+over the last 4 to 8 s is the uncongested trip, and `uplink_lag` is how far the newest packet sits
+above it: time spent queued. A gap of over 500 ms in the stream starts the floor over. `uplink_pps`
+is the packets that arrived over the last 500 ms window. A queueing link delivers at its capacity,
+so the client's command rate can cut to just under it.
+
+The server applies each peer's `rate`, at least 1000 B/s, from its newest packet.
 
 ## Sequence numbers
 
@@ -311,3 +327,4 @@ times its round trip. On any ack, it retires every spawn and despawn that frame 
 - **v5** — added `command_ack` to the snapshot header, and the uplink packet, which carries the
   snapshot ack (it had travelled alone, as `_gn_ack`).
 - **v6** — the channel part in both packets, and the uplink packet's own `seq`.
+- **v7** — the uplink packet's `send_time` and `rate`, and the snapshot header's uplink report.

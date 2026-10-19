@@ -39,6 +39,8 @@ static const int RPC_HEADER_EST = 12;
 static const int SNAPSHOT_WIRE_OVERHEAD = 50;
 // The same for a game RPC, whose own header rpc_wire_bytes already counts.
 static const int RPC_WIRE_OVERHEAD = 38;
+// The least rate a client may ask for: below this a snapshot a second hardly fits.
+static const uint32_t MIN_PEER_RATE = 1000;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -444,6 +446,11 @@ void GoldNetMultiplayer::_reset_client_state() {
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
 	commands_out.reset();
+	downlink = goldnet::DownlinkMeter();
+	cmd_auto = goldnet::CmdRateAuto();
+	uplink_lag_ms = 0;
+	uplink_pps = 0;
+	_apply_link_settings();
 	snapshot_ack = 0;
 	snapshot_ack_new = false;
 	msg_registered.clear();
@@ -805,8 +812,56 @@ void GoldNetMultiplayer::send_snapshots() {
 	_server_tick();
 }
 
-void GoldNetMultiplayer::set_peer_rate(int p_peer, int p_bps) {
-	server.set_peer_rate(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0);
+void GoldNetMultiplayer::set_rate(int p_bps) {
+	rate_setting = p_bps > 0 ? p_bps : 0;
+	_apply_link_settings();
+}
+int GoldNetMultiplayer::get_rate() const {
+	return rate_setting;
+}
+void GoldNetMultiplayer::set_auto_rate(bool p_enabled) {
+	auto_rate = p_enabled;
+	_apply_link_settings();
+}
+bool GoldNetMultiplayer::get_auto_rate() const {
+	return auto_rate;
+}
+
+// The rate and command rate commands_out goes by: the game's settings, or the automatic ones.
+void GoldNetMultiplayer::_apply_link_settings() {
+	commands_out.set_rate((uint32_t)(auto_rate ? downlink.rate() : rate_setting));
+	const double hz = auto_command_rate ? cmd_auto.rate() : command_rate_setting;
+	const double ceiling = (double)Engine::get_singleton()->get_physics_ticks_per_second();
+	commands_out.set_interval_ms(hz > 0.0 && !(auto_command_rate && hz >= ceiling) ? (uint32_t)std::lround(1000.0 / hz) : 0);
+}
+
+// Client: each snapshot's server send time, for the downlink's meter.
+void GoldNetMultiplayer::_on_server_time(uint32_t p_ms) {
+	const uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
+	if (downlink.sample_due(now)) {
+		const goldnet::Client<Variant>::ArrivalStats arrivals = client.arrival_stats();
+		uint64_t bytes = 0;
+		if (recv_peer.is_valid()) {
+			// What reached us past the receive sim, with what the transport adds per packet.
+			bytes = (uint64_t)recv_peer->get_delivered_bytes() + (uint64_t)recv_peer->get_delivered_packets() * RPC_WIRE_OVERHEAD;
+		}
+		downlink.sample(now, bytes, arrivals.received, arrivals.lost);
+	}
+	downlink.note(now, p_ms);
+	if (auto_rate) {
+		_apply_link_settings();
+	}
+}
+
+// Client: the server's measure of our uplink, from a snapshot header.
+void GoldNetMultiplayer::_on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps) {
+	uplink_lag_ms = p_lag_ms;
+	uplink_pps = p_pps;
+	if (auto_command_rate) {
+		cmd_auto.note((uint32_t)Time::get_singleton()->get_ticks_msec(), (double)p_lag_ms, (double)p_pps,
+				(double)Engine::get_singleton()->get_physics_ticks_per_second());
+		_apply_link_settings();
+	}
 }
 
 // Charge a game RPC to each recipient's rate (see goldnet::Server::set_peer_rate). Its size is only
@@ -923,6 +978,13 @@ Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
 	d["command_rtt_ms"] = (int64_t)(on_server ? 0 : commands_out.rtt_ms());
 	d["recv_sim_bytes"] = sim_peer ? recv_peer->get_delivered_bytes() : (int64_t)0;
 	d["recv_sim_packets"] = sim_peer ? recv_peer->get_delivered_packets() : (int64_t)0;
+	const uint32_t iv = commands_out.interval_ms();
+	d["rate"] = (int64_t)(on_server ? server.peer_rate(p_peer) : commands_out.rate());
+	d["command_rate"] = on_server || iv == 0 ? 0.0 : 1000.0 / (double)iv;
+	d["downlink_lag_ms"] = (int64_t)(on_server ? 0 : downlink.lag_ms());
+	d["uplink_lag_ms"] = (int64_t)(on_server ? commands_in.uplink_lag_ms(p_peer) : uplink_lag_ms);
+	d["uplink_pps"] = (int64_t)(on_server ? commands_in.uplink_pps(p_peer) : uplink_pps);
+	d["delivered_bps"] = on_server ? 0.0 : downlink.delivered_bps();
 	return d;
 }
 
@@ -1063,7 +1125,15 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
-	ClassDB::bind_method(D_METHOD("set_peer_rate", "peer", "bytes_per_sec"), &GoldNetMultiplayer::set_peer_rate);
+	ClassDB::bind_method(D_METHOD("set_rate", "bytes_per_sec"), &GoldNetMultiplayer::set_rate);
+	ClassDB::bind_method(D_METHOD("get_rate"), &GoldNetMultiplayer::get_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "rate"), "set_rate", "get_rate");
+	ClassDB::bind_method(D_METHOD("set_auto_rate", "enabled"), &GoldNetMultiplayer::set_auto_rate);
+	ClassDB::bind_method(D_METHOD("get_auto_rate"), &GoldNetMultiplayer::get_auto_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_rate"), "set_auto_rate", "get_auto_rate");
+	ClassDB::bind_method(D_METHOD("set_auto_command_rate", "enabled"), &GoldNetMultiplayer::set_auto_command_rate);
+	ClassDB::bind_method(D_METHOD("get_auto_command_rate"), &GoldNetMultiplayer::get_auto_command_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_command_rate"), "set_auto_command_rate", "get_auto_command_rate");
 	ClassDB::bind_method(D_METHOD("set_manual_send", "manual"), &GoldNetMultiplayer::set_manual_send);
 	ClassDB::bind_method(D_METHOD("get_manual_send"), &GoldNetMultiplayer::get_manual_send);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "manual_send"), "set_manual_send", "get_manual_send");
@@ -1089,6 +1159,9 @@ void GoldNetMultiplayer::_bind_methods() {
 	// clock). An always-on server-time feed regardless of entity traffic — feed it to a clock estimator
 	// (see the ServerClock addon helper) instead of running a separate server-time beacon RPC.
 	ADD_SIGNAL(MethodInfo("server_time_received", PropertyInfo(Variant::INT, "server_time_ms")));
+	// Emitted on the server when a client's rate in force changes (it asked for another), so a game
+	// that sizes the peer's snapshot cadence by its rate can follow it.
+	ADD_SIGNAL(MethodInfo("peer_rate_changed", PropertyInfo(Variant::INT, "peer"), PropertyInfo(Variant::INT, "rate")));
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -1317,7 +1390,12 @@ struct GoldNetMultiplayer::ClientHost {
 	}
 
 	// Every snapshot's header clock, as an always-on server-time feed (see ServerClock).
-	void server_time(uint32_t ms) { gn->emit_signal("server_time_received", (int64_t)ms); }
+	void server_time(uint32_t ms) {
+		gn->_on_server_time(ms);
+		gn->emit_signal("server_time_received", (int64_t)ms);
+	}
+
+	void uplink_report(uint32_t lag_ms, uint32_t pps) { gn->_on_uplink_report(lag_ms, pps); }
 
 	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq); }
 
@@ -1438,6 +1516,15 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
 	server.set_command_ack(p_peer, commands_in.ack(p_peer), commands_in.take_news(p_peer));
 	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
+	server.set_uplink_report(p_peer, commands_in.uplink_lag_ms(p_peer), commands_in.uplink_pps(p_peer));
+	uint32_t rate = commands_in.rate(p_peer);
+	if (rate > 0 && rate < MIN_PEER_RATE) {
+		rate = MIN_PEER_RATE;
+	}
+	if (rate != server.peer_rate(p_peer)) {
+		server.set_peer_rate(p_peer, rate);
+		emit_signal("peer_rate_changed", p_peer, (int64_t)rate);
+	}
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
@@ -1788,12 +1875,21 @@ void GoldNetMultiplayer::_send_uplink() {
 }
 
 void GoldNetMultiplayer::set_command_rate(double p_hz) {
-	commands_out.set_interval_ms(p_hz > 0.0 ? (uint32_t)std::lround(1000.0 / p_hz) : 0);
+	command_rate_setting = p_hz > 0.0 ? p_hz : 0.0;
+	_apply_link_settings();
 }
 
 double GoldNetMultiplayer::get_command_rate() const {
-	const uint32_t iv = commands_out.interval_ms();
-	return iv > 0 ? 1000.0 / (double)iv : 0.0;
+	return command_rate_setting;
+}
+
+void GoldNetMultiplayer::set_auto_command_rate(bool p_enabled) {
+	auto_command_rate = p_enabled;
+	_apply_link_settings();
+}
+
+bool GoldNetMultiplayer::get_auto_command_rate() const {
+	return auto_command_rate;
 }
 
 Error GoldNetMultiplayer::_poll() {

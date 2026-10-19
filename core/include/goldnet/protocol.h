@@ -21,7 +21,9 @@ namespace goldnet {
 // rides its uplink packet instead of travelling alone.
 // v6: GoldSrc's netchan (netchan.h): both packets carry a reliable block and a datagram after the
 // header, and the uplink packet gained a seq of its own and the newest snapshot received.
-static const uint8_t SNAPSHOT_VERSION = 6;
+// v7: the uplink packet carries its send time and the client's rate; the snapshot header carries the
+// server's measure of the client's uplink (auto_rate.h).
+static const uint8_t SNAPSHOT_VERSION = 7;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.
@@ -48,10 +50,10 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 static const int SAFE_PACKET_BYTES = 1200;
 
 // Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, command_ack u16,
-// the channel part's ack u16, flags u8 and datagram length u16, and the four section counts
+// the uplink report's two uvarints at their widest in practice, the channel part's ack u16, flags u8 and datagram length u16, and the four section counts
 // (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when sizing the
 // entity-delta budget, so the budget describes the packet rather than one section.
-static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
+static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 3 + 3 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
 
 // Largest reliable block (netchan.h), the GoldSrc fragment size scaled to SAFE_PACKET_BYTES: a block
 // leaves a third of the packet for the datagram and the entities, and a bigger message is cut into
