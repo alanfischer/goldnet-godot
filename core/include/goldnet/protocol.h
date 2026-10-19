@@ -68,6 +68,10 @@ static const int COMMAND_RING = 64;
 // before anyone could know it was lost.
 static const int COMMAND_BACKUP_DEFAULT = 2;
 
+// Snapshots right after a spawn's or despawn's first that carry it again, the same cover for the
+// downlink's reliable sections. Past those it goes again only when overdue (see codec.h).
+static const int RELIABLE_BACKUP = 2;
+
 // Compact, self-delimiting wire encoding for per-slot values: a 1-byte tag, then the payload.
 // The DECODER needs no hint (it reads the tag and knows the width, so a value for an unknown
 // entity can still be consumed); only the SENDER chooses a lossy tag, from the slot's hint.

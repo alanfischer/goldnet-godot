@@ -178,12 +178,18 @@ Per tick, for each peer:
    A peer's first snapshot is never skipped.
 2. **Baseline.** `base_seq` is the peer's newest ack if that frame is still in the ring, else 0
    and the snapshot carries full state.
-3. **Reliable-until-acked sections.** Spawns, despawns and leaves are included in every snapshot,
-   from the first one that carried them, until an ack at or past that first one arrives. A spawn
-   goes only to peers the entity is visible to (all of them, when it has no visibility to ask
-   about), and a despawn only to peers that were sent its spawn.
+3. **Reliable-until-acked sections.** A spawn or despawn goes in the first snapshot that owes it
+   and the `RELIABLE_BACKUP` = 2 after it, then again, with the same backups, whenever its last
+   copy is older than `max(1.5 × rtt, 50) + 16` ms, where rtt is the peer's smoothed time from a
+   snapshot's send to its first ack. It stops once the peer acks a snapshot that carried it: an
+   ack names only the newest frame committed, so an ack of a later frame proves nothing about an
+   earlier one. A spawn goes only to peers the entity is visible to (all of them, when it has no
+   visibility to ask about), and a despawn only to peers that were sent its spawn. Leaves are
+   derived from the baseline instead, so they repeat every snapshot until acked (see **Ack**).
 4. **Entities.** An entity is a candidate when it is visible to the peer and has any slot that
-   changed since the baseline. Each changed slot is written with its current value.
+   changed since the baseline. Each changed slot is written with its current value. An entity
+   named by a spawn not yet proven delivered to the peer is written whole and left out of the
+   frame's baseline: a client that missed the spawn discards its values and acks anyway.
 5. **Budget.** The whole snapshot aims for `SAFE_PACKET_BYTES` = 1200. Header and the three
    sections come first; entities get what is left, further capped by the peer's
    `bandwidth_bps` turned into a per-packet allowance. Candidates go in order of how long they
@@ -208,7 +214,7 @@ For each snapshot:
    frame and drop the snapshot. The server keeps diffing against frames the client holds,
    falling back to full state when it has to.
 5. **Apply.** Spawns are applied in order, as read, skipping any net_id the client already created:
-   resends of an unacked spawn arrive every snapshot. A spawn the client can't create yet isn't
+   an unacked spawn arrives again as backups and on every overdue resend. A spawn the client can't create yet isn't
    counted as created, so a later resend gets another try. The new frame starts as a copy of the
    baseline (empty for `base_seq` 0); each entity entry overwrites its changed slots and is applied
    to the entity. Despawns are applied after the entities, only for net_ids the client created
@@ -220,11 +226,11 @@ For each snapshot:
    frame has been committed; the very first is always accepted). Acking would tell the server the
    entity's state was delivered, and an idle entity would then never be resent. A spawn the client
    couldn't create holds the frame the same way, and also on the very first frame, which it leaves
-   unacked: acking a frame carrying a spawn retires it, so it would never come again.
+   unacked: acking a frame carrying a spawn retires it, so it would come only when overdue.
 8. **Commit.** Store the frame under `seq`, make it the last committed frame, and ack `seq`.
 
 The server, on an ack newer than the peer's previous one, makes that frame the peer's baseline and
-retires every reliable section entry first sent at or before it.
+times its round trip. On any ack, it retires every spawn and despawn that frame carried.
 
 ## Version history
 

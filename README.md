@@ -117,8 +117,9 @@ snapshot — is in [`docs/protocol.md`](docs/protocol.md).
 - A snapshot with nothing to report — no changed entity, no spawn, despawn, or leave
   — **isn't sent at all**, so a fully static world costs nothing per tick. The one
   exception is the clock feed below.
-- Spawns/despawns are **reliable-until-acked**: re-sent each frame until the peer
-  acks a frame carrying them, then retired. A spawn's source record outlives
+- Spawns/despawns are **reliable-until-acked**, resent on loss rather than every
+  frame: sent with two backups, then again once overdue (a round trip and a half),
+  until the peer acks a frame carrying them. A spawn's source record outlives
   delivery, so each peer keeps a durable `spawn_acked` set — a spawn is delivered
   exactly once, never re-armed frame after frame.
 - The **leave** section is the opt-in PVS-relevance channel (off by default;

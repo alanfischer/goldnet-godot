@@ -1339,7 +1339,9 @@ struct GoldNetMultiplayer::UplinkHost {
 		UtilityFunctions::push_error("goldnet: uplink protocol mismatch from peer ", peer, " — the server "
 				"and client are running different goldnet builds. Rebuild/redeploy both to the same version.");
 	}
-	void snapshot_ack(int32_t peer, uint16_t seq) { gn->server.on_ack(peer, seq); }
+	void snapshot_ack(int32_t peer, uint16_t seq) {
+		gn->server.on_ack(peer, seq, (uint32_t)Time::get_singleton()->get_ticks_msec());
+	}
 	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
 		gn->_deliver_command(peer, stream, data, size);
 	}

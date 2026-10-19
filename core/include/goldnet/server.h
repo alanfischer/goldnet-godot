@@ -28,8 +28,12 @@
 //
 // and when it's destroyed, despawn(net_id) and remove_entity(key). Calling both on the same tick
 // is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
-// first time the entity is visible to it (see SpawnRecord::vis_keys), is re-sent in every
-// snapshot until the peer acks one carrying it, and the despawn reaches only peers that got it.
+// first time the entity is visible to it (see SpawnRecord::vis_keys), goes in that snapshot and
+// the RELIABLE_BACKUP after it, then again whenever it is overdue, until the peer acks a snapshot
+// carrying it; the despawn reaches only peers that got it, the same way. Until a spawn is proven
+// delivered, the entities in its vis_keys don't count as held by the peer, so each snapshot sends
+// them whole: a client that missed the spawn discards their deltas, and acking those must not
+// leave the server believing it has them.
 //
 // On the client, Client::apply() hands each spawn to the host's spawn() before it reads the
 // deltas, so by the time spawn() returns, registered() and begin_entity() must know the entity.
@@ -264,7 +268,7 @@ public:
 	}
 
 	// A client acked the newest frame it received. Advances that peer's delta baseline.
-	void on_ack(int32_t p_peer, uint16_t p_seq) {
+	void on_ack(int32_t p_peer, uint16_t p_seq, uint32_t p_now) {
 		auto rit = rings_.find(p_peer);
 		if (rit == rings_.end()) {
 			return;
@@ -281,16 +285,19 @@ public:
 			if (pr.frame_seq[hslot] == p_seq && p_seq != 0) {
 				pr.held = pr.frames[hslot];
 				pr.left_unacked.clear(); // the acked frame already excludes them
+				// Only the first ack of a frame is timed: the client repeats it until a newer frame.
+				const uint32_t sample = p_now - pr.frame_ms[hslot];
+				pr.srtt_ms = pr.srtt_ms == 0 ? sample : (pr.srtt_ms * 7 + sample) / 8;
 			}
 		}
-		// Retire spawn/despawn records this ack confirms delivered.
+		// Retire spawn/despawn records this ack proves delivered.
 		std::vector<uint32_t> retired;
-		retire_acked(pr.spawn_wait, pr.last_acked, retired);
+		retire_proven(pr.spawn_wait, p_seq, retired);
 		for (uint32_t nid : retired) {
 			pr.spawn_acked.insert(nid); // durably remember delivery (spawn source record persists)
 		}
 		retired.clear();
-		retire_acked(pr.despawn_wait, pr.last_acked, retired);
+		retire_proven(pr.despawn_wait, p_seq, retired);
 		for (uint32_t nid : retired) {
 			auto dit = despawn_pending_.find(nid);
 			if (dit != despawn_pending_.end()) {
@@ -323,13 +330,15 @@ private:
 		// (16-bit, its own space), while change tracking needs a counter that never aliases: a slot
 		// untouched for 32768 ticks would otherwise compare as newly changed.
 		uint32_t frame_ctr[RING] = {};
+		uint32_t frame_ms[RING] = {}; // when each frame went, to time its ack
+		uint32_t srtt_ms = 0;         // smoothed snapshot-to-ack round trip; 0 = none timed yet
 		uint16_t next_seq = 1; // 0 is reserved for "no baseline / full state"
 		uint16_t last_acked = 0;
 		bool has_ack = false;
-		// Reliable-until-acked spawn/despawn delivery. net_id -> first seq we (re)sent it in the
-		// current unacked run; once last_acked >= that seq the peer has it and we stop.
-		std::unordered_map<uint32_t, uint16_t> spawn_wait;
-		std::unordered_map<uint32_t, uint16_t> despawn_wait;
+		// Reliable-until-acked spawn/despawn delivery: net_id -> the snapshots that carried it,
+		// until an ack of one of them proves it arrived (see owe_include / retire_proven).
+		std::unordered_map<uint32_t, Owed> spawn_wait;
+		std::unordered_map<uint32_t, Owed> despawn_wait;
 		// Spawns already acked by this peer. Unlike despawns (one-shot — the record is dropped once
 		// delivered), a spawn's source record lives as long as the entity, so "absent from
 		// spawn_wait" can't mean "delivered" — it would re-arm the spawn every frame. This set is the
@@ -374,6 +383,7 @@ private:
 		uint32_t net_id;
 		uint32_t mask;
 		float score;
+		bool holdable; // false while the entity's spawn isn't proven delivered to this peer
 	};
 
 	std::vector<Entity> ents_;
@@ -392,6 +402,7 @@ private:
 	int packet_overhead_ = 0;
 	bool relevance_events_ = false;
 	std::vector<size_t> live_; // scratch: entities live this tick
+	std::unordered_set<uint64_t> unproven_; // scratch: entity keys whose spawn this peer may lack
 };
 
 template <class V, class X>
@@ -478,10 +489,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// Spawns owed to this peer, reliable-until-acked.
 		Writer spawn_body;
 		uint16_t spawn_ct = 0;
+		const uint32_t overdue = overdue_ms(pr.srtt_ms);
+		unproven_.clear();
 		for (const auto &kv : spawns_) {
 			if (pr.spawn_acked.count(kv.first)) {
 				continue; // peer already has this node — don't re-arm the spawn every frame
 			}
+			unproven_.insert(kv.second.vis_keys.begin(), kv.second.vis_keys.end());
 			// Lazy spawn (GoldSrc): defer sending the spawn to this peer until the entity is visible
 			// to it — created client-side the first time it enters your PVS. Once delivered it
 			// PERSISTS (spawn_acked keeps it; despawn only on server-free), so there's no
@@ -498,9 +512,8 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 					continue; // not in this peer's PVS yet — defer the spawn
 				}
 			}
-			// on_ack is the sole populator of spawn_acked: it retires+marks a record the moment
-			// last_acked reaches it, before reliable_include here could ever see it delivered.
-			if (!reliable_include(pr.spawn_wait, kv.first, seq, pr.last_acked, pr.has_ack)) {
+			// on_ack is the sole populator of spawn_acked, the moment an ack proves a carrier arrived.
+			if (!owe_include(pr.spawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
 				continue;
 			}
 			spawn_body.put_u32(kv.first);
@@ -515,9 +528,8 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			if (!kv.second.count(peer)) {
 				continue;
 			}
-			if (!reliable_include(pr.despawn_wait, kv.first, seq, pr.last_acked, pr.has_ack)) {
-				kv.second.erase(peer); // delivered → this peer no longer needs it
-				continue;
+			if (!owe_include(pr.despawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
+				continue; // not due again yet; on_ack drops the peer once it's proven delivered
 			}
 			despawn_body.put_u32(kv.first);
 			despawn_ct++;
@@ -561,6 +573,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			// it (an idle entity re-entering changes no slot at all).
 			uint32_t mask = 0;
 			const int n_vals = (int)e.vals.size();
+			const bool holdable = !unproven_.count(e.key);
 			if (!base || !base->count(net_id) || pr.left_unacked.count(net_id)) {
 				mask = n_vals >= MAX_SLOTS ? 0xFFFFFFFFu : ((1u << n_vals) - 1u); // new → all slots
 			} else {
@@ -572,7 +585,9 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 				}
 			}
 			if (mask == 0) {
-				included.insert(net_id); // peer's existing value is already correct
+				if (holdable) {
+					included.insert(net_id); // peer's existing value is already correct
+				}
 				pr.stale_since.erase(net_id); // no longer owed anything — clear any old overflow mark
 				continue;
 			}
@@ -585,6 +600,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			c.net_id = net_id;
 			c.mask = mask;
 			c.score = (float)(wait_ticks + 1) * e.priority;
+			c.holdable = holdable;
 			if (c.score != 1.0f) {
 				needs_sort = true;
 			}
@@ -662,7 +678,9 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 					p_host.encode(body, e.vals[s], s < e.quant.size() ? e.quant[s] : QUANT_AUTO, p_now);
 				}
 			}
-			included.insert(c.net_id);
+			if (c.holdable) {
+				included.insert(c.net_id);
+			}
 			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
 			changed++;
 		}
@@ -688,6 +706,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		pr.frames[slot] = std::move(included);
 		pr.frame_seq[slot] = seq;
 		pr.frame_ctr[slot] = ctr_;
+		pr.frame_ms[slot] = p_now;
 
 		Writer packet;
 		packet.put_u8(SNAPSHOT_VERSION);
