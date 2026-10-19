@@ -69,7 +69,7 @@ struct Link {
 		}
 		CHECK(receiver.receive(2, w.data(), w.size(), host, 0));
 		if (!roll(down_loss)) {
-			sender.on_ack(receiver.ack(2), now);
+			sender.on_ack(receiver.ack(2));
 		}
 	}
 
@@ -264,7 +264,8 @@ static void test_rtt_is_measured_through_backups() {
 		if (in_flight.size() > 5) {
 			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h, 0));
 			in_flight.erase(in_flight.begin());
-			s.on_ack(r.ack(2), now); // the ack comes straight back: an 80 ms round trip
+			s.on_ack(r.ack(2)); // the ack comes straight back: an 80 ms round trip
+			s.on_channel_ack(r.channel_ack(2).at(now), now);
 		}
 	}
 	CHECK(s.rtt_ms() == 80);
@@ -293,13 +294,48 @@ static void test_rtt_is_learned_past_the_first_overdue() {
 		if (in_flight.size() > 10) {
 			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h, 0));
 			in_flight.erase(in_flight.begin());
-			s.on_ack(r.ack(2), now);
+			s.on_ack(r.ack(2));
+			s.on_channel_ack(r.channel_ack(2).at(now), now);
 		}
 	}
 	CHECK(s.rtt_ms() == 160);
 	CHECK(late_cmds == 50 * (1 + COMMAND_BACKUP_DEFAULT)); // each new command and its backups, no resends
 	CHECK(h.got.size() == 190);
 	printf("  a round trip past the first overdue guess is still learned: ok\n");
+}
+
+// A round trip longer than the ring: every command falls out before its ack comes back, so no
+// command ack can time it. Packet acks still do, and the commands then go once each with their
+// backups rather than the whole ring in every packet (which kept a slow link full for good).
+static void test_rtt_longer_than_the_ring_is_learned() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	uint32_t now = 1000;
+	const size_t trip = COMMAND_RING + 16; // packets arriving 80 ticks (1280 ms) after they're sent
+	std::vector<std::vector<uint8_t>> in_flight;
+	int late_cmds = 0;
+	for (int i = 0; i < 400; i++) {
+		now += 16;
+		std::vector<uint8_t> b = cmd_bytes(i);
+		s.push(1, b.data(), b.size(), now);
+		Writer w;
+		s.write(now, 0, ChannelAckSource(), w);
+		if (i >= 350) {
+			late_cmds += w.data()[17]; // cmd_ct, after an empty channel part and one stream id
+		}
+		in_flight.emplace_back(w.data(), w.data() + w.size());
+		if (in_flight.size() > trip) {
+			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h, 0));
+			in_flight.erase(in_flight.begin());
+			s.on_ack(r.ack(2));
+			s.on_channel_ack(r.channel_ack(2).at(now), now);
+		}
+	}
+	CHECK(s.rtt_ms() == trip * 16);
+	CHECK(late_cmds == 50 * (1 + COMMAND_BACKUP_DEFAULT));
+	CHECK(r.skipped(2) == 0);
+	printf("  a round trip longer than the ring is learned, and stops the resends: ok\n");
 }
 
 static void test_interval_paces_packets() {
@@ -343,7 +379,7 @@ static void test_proven_lost_command_goes_at_once() {
 	CHECK(!r.take_news(2));
 	ChannelAck ack = r.channel_ack(2).at(now);
 	now += 16;
-	s.on_channel_ack(ack); // it received packet 2, not packet 1
+	s.on_channel_ack(ack, now); // it received packet 2, not packet 1
 	CHECK(s.due(now));     // long before command 0 is overdue
 	send(true);
 	CHECK(h.got.size() == 2 && cmd_id(h.got[0].bytes) == 0 && cmd_id(h.got[1].bytes) == 1);
@@ -365,7 +401,7 @@ static void test_a_repeat_earns_the_ack_again() {
 	CHECK(r.take_news(2));
 	CHECK(h.got.size() == 1);
 	std::vector<uint8_t> b = cmd_bytes(1);
-	s.on_ack(r.ack(2), 30);
+	s.on_ack(r.ack(2));
 	s.push(1, b.data(), b.size(), 30);
 	Writer w2;
 	s.write(30, 0, ChannelAckSource(), w2); // a new command, with the old one riding as a backup
@@ -389,6 +425,7 @@ int main() {
 	test_malformed_input();
 	test_rtt_is_measured_through_backups();
 	test_rtt_is_learned_past_the_first_overdue();
+	test_rtt_longer_than_the_ring_is_learned();
 	test_interval_paces_packets();
 	test_proven_lost_command_goes_at_once();
 	test_a_repeat_earns_the_ack_again();

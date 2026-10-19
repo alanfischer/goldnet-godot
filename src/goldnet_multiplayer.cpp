@@ -1355,9 +1355,11 @@ struct GoldNetMultiplayer::ClientHost {
 	// Every snapshot's header clock, as an always-on server-time feed (see ServerClock).
 	void server_time(uint32_t ms) { gn->emit_signal("server_time_received", (int64_t)ms); }
 
-	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq, (uint32_t)Time::get_singleton()->get_ticks_msec()); }
+	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq); }
 
-	void channel_ack(const goldnet::ChannelAck &ack) { gn->commands_out.on_channel_ack(ack); }
+	void channel_ack(const goldnet::ChannelAck &ack) {
+		gn->commands_out.on_channel_ack(ack, (uint32_t)Time::get_singleton()->get_ticks_msec());
+	}
 
 	void message(const uint8_t *data, size_t size, bool) { gn->_deliver_message(1, data, size); }
 

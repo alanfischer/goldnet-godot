@@ -215,10 +215,10 @@ compare the same way.
 every command not sent yet, the `COMMAND_BACKUP_DEFAULT` = 2 before them, and any unacked command
 last sent more than `max(1.5 × rtt, 50) + 16` ms ago or proven lost: the snapshot header's channel
 ack names an uplink packet newer than the one that last carried it (the netchan's rule for a block;
-one held behind a lost command arrives twice, which the server ignores). The round trip is timed from a command's
-first send to the snapshot that acks it, skipping commands that went again for being overdue,
-unless 8 acks in a row are of such commands: the round trip is then longer than the overdue time,
-and the shortest of those 8 becomes it. A
+one held behind a lost command arrives twice, which the server ignores). The round trip is timed from an
+uplink packet's send to the first snapshot whose channel ack names it. A packet goes only once, so
+every ack times cleanly, however often its commands went again, and a round trip longer than the
+ring is still measured. A
 packet goes when one of those is due and the command interval (GoldSrc `cl_cmdrate`) is up. A
 command that would overflow the ring drops the oldest, which the client then gives up on. A
 packet is kept under `SAFE_PACKET_BYTES`, but its first command always goes.
