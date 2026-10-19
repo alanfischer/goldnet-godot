@@ -39,8 +39,6 @@ static const int RPC_HEADER_EST = 12;
 static const int SNAPSHOT_WIRE_OVERHEAD = 50;
 // The same for a game RPC, whose own header rpc_wire_bytes already counts.
 static const int RPC_WIRE_OVERHEAD = 38;
-// The least rate a client may ask for: below this a snapshot a second hardly fits.
-static const uint32_t MIN_PEER_RATE = 1000;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -1506,7 +1504,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	}
 }
 
-// The Godot side of goldnet::CommandReceiver::receive.
+// The Godot side of goldnet::Server::receive_uplink.
 struct GoldNetMultiplayer::UplinkHost {
 	GoldNetMultiplayer *gn;
 
@@ -1514,13 +1512,9 @@ struct GoldNetMultiplayer::UplinkHost {
 		UtilityFunctions::push_error("goldnet: uplink protocol mismatch from peer ", peer, " — the server "
 				"and client are running different goldnet builds. Rebuild/redeploy both to the same version.");
 	}
-	void snapshot_ack(int32_t peer, uint16_t seq) {
-		gn->server.on_ack(peer, seq, (uint32_t)Time::get_singleton()->get_ticks_msec());
-	}
 	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
 		gn->_deliver_command(peer, stream, data, size);
 	}
-	void channel_ack(int32_t peer, const goldnet::ChannelAck &ack) { gn->server.on_channel_ack(peer, ack); }
 	void message(int32_t peer, const uint8_t *data, size_t size, bool) { gn->_deliver_message(peer, data, size); }
 };
 
@@ -1529,16 +1523,8 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 		return;
 	}
 	UplinkHost host{ this };
-	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
-	server.set_command_ack(p_peer, commands_in.ack(p_peer), commands_in.take_news(p_peer));
-	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
-	server.set_uplink_report(p_peer, commands_in.uplink_lag_ms(p_peer), commands_in.uplink_pps(p_peer));
-	uint32_t rate = commands_in.rate(p_peer);
-	if (rate > 0 && rate < MIN_PEER_RATE) {
-		rate = MIN_PEER_RATE;
-	}
-	server.set_peer_rate(p_peer, rate);
-	server.set_peer_update_rate(p_peer, commands_in.update_rate(p_peer));
+	server.receive_uplink(p_peer, commands_in, p_bytes.ptr(), (size_t)p_bytes.size(), host,
+			(uint32_t)Time::get_singleton()->get_ticks_msec());
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
