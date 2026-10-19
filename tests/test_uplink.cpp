@@ -21,6 +21,8 @@ struct RecvHost {
 	int mismatches = 0;
 	void protocol_mismatch(int32_t) { mismatches++; }
 	void snapshot_ack(int32_t, uint16_t seq) { snapshot_acks.push_back(seq); }
+	void channel_ack(int32_t, uint16_t, bool) {}
+	void message(int32_t, const uint8_t *, size_t, bool) {}
 	void command(int32_t, uint32_t stream, const uint8_t *data, size_t size) {
 		got.push_back({ stream, std::vector<uint8_t>(data, data + size) });
 	}
@@ -59,7 +61,7 @@ struct Link {
 			return;
 		}
 		Writer w;
-		sender.write(now, 0, w);
+		sender.write(now, 0, 0, false, w);
 		const int n = packets_up++;
 		bytes_up += w.size();
 		if (roll(up_loss) || drop_next.count(n)) {
@@ -198,10 +200,11 @@ static void test_repeated_bytes_cost_their_changes() {
 	s.push(1, a.data(), a.size(), 10);
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
-	s.write(10, 0, w);
-	// Header 13 (incl. one stream and first_seq), then the first command against zeros: len 1, mask 4,
-	// 32 bytes. Then an identical one: gap 1, len 1, mask 4. Then one changed byte: gap, len, mask, 1.
-	CHECK(w.size() == 13 + 37 + 6 + 7);
+	s.write(10, 0, 0, false, w);
+	// Header 20 (incl. an empty channel part, one stream and first_seq), then the first command against
+	// zeros: len 1, mask 4, 32 bytes. Then an identical one: gap 1, len 1, mask 4. Then one changed
+	// byte: gap, len, mask, 1.
+	CHECK(w.size() == 20 + 37 + 6 + 7);
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h));
@@ -212,7 +215,7 @@ static void test_repeated_bytes_cost_their_changes() {
 static void test_snapshot_ack_rides_along() {
 	CommandSender s;
 	Writer w;
-	s.write(10, 321, w); // nothing to send but the ack
+	s.write(10, 321, 0, false, w); // nothing to send but the ack
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h));
@@ -227,7 +230,7 @@ static void test_malformed_input() {
 	s.push(1, b.data(), b.size(), 10);
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
-	s.write(10, 5, w);
+	s.write(10, 5, 0, false, w);
 	CommandReceiver r;
 	RecvHost h;
 	for (size_t cut = 0; cut < w.size(); cut++) {
@@ -256,7 +259,7 @@ static void test_rtt_is_measured_through_backups() {
 		std::vector<uint8_t> b = cmd_bytes(i);
 		s.push(1, b.data(), b.size(), now);
 		Writer w;
-		s.write(now, 0, w);
+		s.write(now, 0, 0, false, w);
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > 5) {
 			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h));
@@ -282,9 +285,9 @@ static void test_rtt_is_learned_past_the_first_overdue() {
 		std::vector<uint8_t> b = cmd_bytes(i);
 		s.push(1, b.data(), b.size(), now);
 		Writer w;
-		s.write(now, 0, w);
+		s.write(now, 0, 0, false, w);
 		if (i >= 150) {
-			late_cmds += w.data()[10]; // cmd_ct, after one stream id
+			late_cmds += w.data()[17]; // cmd_ct, after an empty channel part and one stream id
 		}
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > 10) {

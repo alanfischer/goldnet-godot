@@ -77,6 +77,10 @@ func client_step(_t: float) -> void:
 func on_command(_sender: int, _args: Array) -> void:
 	pass
 
+## Either side: an ordinary RPC arrived (see main.gd's _case_msg_*). `kind` names which.
+func on_message(_sender: int, _kind: String, _args: Array) -> void:
+	pass
+
 ## Server: what to send back when the client asks (main._case_ask).
 func report() -> Variant:
 	return null

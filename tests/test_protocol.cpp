@@ -89,6 +89,9 @@ struct Peer {
 	std::vector<uint16_t> acks;
 	std::vector<uint32_t> times;
 	std::vector<uint16_t> command_acks;
+	std::vector<std::pair<uint16_t, bool>> chan_acks;
+	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
+	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
 	int mismatches = 0;
 	int refuse_spawns = 0; // the host can't create the next N spawns yet
 	std::map<uint32_t, std::pair<uint32_t, int>> creates; // spawn net_id -> the entity it registers
@@ -101,19 +104,28 @@ struct TestClientHost {
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
 	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
+	void channel_ack(uint16_t received, bool bit) { p->chan_acks.push_back({ received, bit }); }
+	void message(const uint8_t *data, size_t size, bool reliable) {
+		p->messages.push_back({ std::vector<uint8_t>(data, data + size), reliable });
+		p->events.push_back((reliable ? "r" : "u") + std::to_string(data[0]));
+	}
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *, size_t) {
 		if (p->refuse_spawns > 0) {
 			p->refuse_spawns--;
 			return false;
 		}
 		p->spawned.push_back(net_id);
+		p->events.push_back("s" + std::to_string(net_id));
 		auto it = p->creates.find(net_id);
 		if (it != p->creates.end()) {
 			p->slot_count[it->second.first] = it->second.second;
 		}
 		return true;
 	}
-	void despawn(uint32_t net_id) { p->despawned.push_back(net_id); }
+	void despawn(uint32_t net_id) {
+		p->despawned.push_back(net_id);
+		p->events.push_back("d" + std::to_string(net_id));
+	}
 	void relevance_lost(uint32_t net_id) { p->lost.push_back(net_id); }
 	bool registered(uint32_t net_id) { return p->slot_count.count(net_id) > 0; }
 	int begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer) {
@@ -191,6 +203,7 @@ struct Net {
 					for (size_t i = acks_before; i < p.acks.size(); i++) {
 						server.on_ack(p.id, p.acks[i], now);
 					}
+					server.on_channel_ack(p.id, p.client.channel_received(), p.client.channel_bit());
 				}
 			}
 		}
@@ -201,7 +214,8 @@ struct Net {
 };
 
 static uint16_t base_seq_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[3] | (pkt[4] << 8)); }
-static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[11] | (pkt[12] << 8)); }
+// With an empty channel part, the spawn count follows the 11-byte header and its 5 bytes.
+static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[16] | (pkt[17] << 8)); }
 
 // --- tests ---
 
@@ -788,6 +802,49 @@ static void test_arrival_stats_count_only_real_loss() {
 	printf("  arrival stats count only real loss: ok\n");
 }
 
+// Messages ride the snapshot: the reliable ones before its spawns, the datagram's after the entity
+// deltas and before its despawns, so an event can name an entity the same snapshot creates or removes.
+static void test_messages_ride_the_snapshot_in_order() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.tick();
+	const uint8_t r1[] = { 1 }, u2[] = { 2 }, r3[] = { 3 }, u4[] = { 4 };
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.server.queue_reliable(2, r1, 1);
+	n.server.queue_unreliable(2, u2, 1);
+	n.tick();
+	CHECK((a.events == std::vector<std::string>{ "r1", "s500", "u2" }));
+	n.server.despawn(500);
+	n.server.queue_reliable(2, r3, 1);
+	n.server.queue_unreliable(2, u4, 1);
+	n.tick();
+	CHECK((a.events == std::vector<std::string>{ "r1", "s500", "u2", "r3", "u4", "d500" }));
+	CHECK(n.server.reliable_delivered(2) == 2);
+	printf("  messages ride the snapshot, ordered around its spawns and despawns: ok\n");
+}
+
+// A snapshot that can't be baselined still delivers its messages, and a lost one's reliable block
+// comes again once the client's ack shows it missing; its datagram doesn't.
+static void test_messages_survive_a_lost_snapshot() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.tick();
+	const uint8_t r1[] = { 1 }, u2[] = { 2 };
+	n.server.queue_reliable(2, r1, 1);
+	n.server.queue_unreliable(2, u2, 1);
+	n.drop_snapshots.insert(2);
+	n.tick();
+	n.drop_snapshots.clear();
+	for (int i = 0; i < 4; i++) {
+		n.world.ents[10].vals[0]++;
+		n.tick();
+	}
+	CHECK((a.events == std::vector<std::string>{ "r1" }));
+	CHECK(n.server.reliable_delivered(2) == 1);
+	printf("  a lost snapshot's reliable block comes again, its datagram doesn't: ok\n");
+}
+
 int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
@@ -818,6 +875,8 @@ int main() {
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
 	test_arrival_stats_count_only_real_loss();
+	test_messages_ride_the_snapshot_in_order();
+	test_messages_survive_a_lost_snapshot();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

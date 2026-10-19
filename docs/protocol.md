@@ -1,11 +1,11 @@
-# goldnet wire protocol (version 5)
+# goldnet wire protocol (version 6)
 
 The byte-level contract between goldnet's two ends: what a snapshot and an uplink packet contain,
 how each value is encoded, and what each end does with them. The README's **How it
 works** explains why the protocol is shaped this way; this page is what a second implementation
 would need to interoperate. The source of truth is `core/include/goldnet/` — `protocol.h` for the
 constants, `codec.h` and `buffer.h` for the encodings, `server.h` and `client.h` for the snapshot
-rules, `uplink.h` for the uplink's.
+rules, `uplink.h` for the uplink's, `netchan.h` for the channel both carry.
 
 ## Primitives
 
@@ -38,6 +38,19 @@ the inner `SceneMultiplayer` and therefore whatever `MultiplayerPeer` is install
 | `_gn_recv` | server → client | `UNRELIABLE`          | the snapshot, as a `PackedByteArray` |
 | `_gn_up`   | client → server | `UNRELIABLE`          | the uplink packet, as a `PackedByteArray` |
 
+Every other RPC between the server and a client is a message on the channel (see **Channel**), as
+GoldSrc's user messages rode its netchan: a reliable RPC in the reliable block, an unreliable one in
+the datagram. A message is `uvarint target` and then:
+
+- target 0, a registration: `uvarint id`, then the node path and the method name, each a
+  `uvarint` length and UTF-8. Each end registers an id with a peer, reliably, the first time it
+  sends that peer a call to the target (GoldSrc's `svc_newusermsg`, done lazily). Until the peer
+  has it, an unreliable call to the target is a registration followed by the call's `argc` and
+  arguments, so it goes in the datagram, in order with the rest, and needs nothing before it.
+- any other target, a call: `uvarint argc`, then each argument as a value (see **Values**), or one
+  of the binding's own tags: 64 nil, 65 string and 66 StringName (`uvarint` length, UTF-8),
+  67 PackedByteArray (`uvarint` length, bytes), 68 a float an f32 would change (8 bytes, binary64).
+
 ## Snapshot
 
 One per peer per send, server to client.
@@ -48,6 +61,7 @@ u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
 u16  command_ack    the newest command from this peer delivered with none missing before it; 0 = none
+...  channel part   (see **Channel**) its ack is the newest uplink packet received
 u16  spawn_ct       then spawn_ct  × spawn entry
 u16  despawn_ct     then despawn_ct × u32 net_id
 u16  leave_ct       then leave_ct   × u32 net_id
@@ -55,7 +69,7 @@ u16  changed_ct     then changed_ct × entity entry
 ```
 
 Only the first 11 bytes sit at fixed offsets; each count is followed directly by its entries. The
-fixed part (header plus the four counts) is `SNAPSHOT_HEADER_BYTES` = 19.
+fixed part (header, an empty channel part and the four counts) is `SNAPSHOT_HEADER_BYTES` = 24.
 
 **Spawn entry** — a runtime entity the client must create before any delta can reach it:
 
@@ -112,16 +126,57 @@ The client acks a `u16 seq`: the newest frame it has **committed** (see below). 
 cumulative records of everything received — only the newest one matters, so every uplink packet
 repeats it and a lost one is covered by the next.
 
+## Channel
+
+GoldSrc's netchan: both packets, the snapshot and the uplink packet, carry a **reliable block** and a
+**datagram** of the host's messages, opaque byte strings (in Godot, one RPC each).
+
+```
+u16  ack            the newest packet received from the other end (its seq), committed or not
+u8   flags          bit 0: a reliable block follows
+                    bit 1: that block's alternating bit
+                    bit 2: the block is a fragment of a message
+                    bit 3: the last fragment
+                    bit 4: the bit of the last block this end took from the other
+u16  block_len      only with bit 0, then block_len bytes
+u16  datagram_len   then datagram_len bytes
+```
+
+A block (its fragments joined) and a datagram are each a run of messages: `uvarint len`, then
+`len` bytes.
+
+**Reliable.** One block is in flight at a time. A new one starts only once the other end's ack
+bit equals the in-flight block's bit, and flips the bit; messages queued meanwhile wait. Each block
+holds as many whole messages as fit in `RELIABLE_BLOCK_BYTES` = 800. A message too big for that
+goes alone, cut into fragments of that size, one block each. A block goes again when an ack names a
+packet newer than the one that last carried it and the bit hasn't flipped: the other end received
+something later and not the block. There is no timer: a block that arrived is never sent twice.
+Pending data past `RELIABLE_OVERFLOW_BYTES` = 64 KB, not counting messages big enough to fragment,
+is an overflow, and the sender drops the other end, as GoldSrc did ("reliable channel overflowed").
+
+**Datagram.** The messages queued since the last packet, all of them or none: one that doesn't fit
+the packet is dropped. It sits after the reliable block and the snapshot's spawn, despawn and leave
+sections in the packet budget, ahead of the entities.
+
+**Receiving.** A packet's block and datagram count only if the packet is newer than every one
+received before it; a block whose bit equals the last one taken is a repeat. The snapshot delivers
+the block's messages before its spawns and the datagram's after its entity deltas and before its
+despawns, so an event can name an entity the same snapshot creates or removes. It delivers them
+even when the frame itself can't be baselined. The uplink delivers the block's before its commands
+and the datagram's after them, as GoldSrc ran a string command before a move.
+
 ## Uplink
 
-Client to server: the snapshot ack, and the client's **commands** — opaque byte strings, each
+Client to server: the snapshot ack, the channel, and the client's **commands** — opaque byte strings, each
 tagged with a host-chosen `u32` stream id (in Godot, the marked RPC it stands for). The contract
 is a reliable channel's: each command reaches the server's host once, in the order it was made,
 across all of a client's streams. It is kept over the unreliable link the Quake way, by repetition.
 
 ```
 u8   version        SNAPSHOT_VERSION
+u16  seq            this packet's, counting up from 1 and skipping 0 on the wrap
 u16  snapshot_ack   the newest committed snapshot; 0 = none
+...  channel part   (see **Channel**) its ack is the newest snapshot received, committed or not
 u16  floor          the oldest command the client still holds; its next seq if it holds none
 u8   stream_ct      then stream_ct × u32 stream_id
 u8   cmd_ct         then, if cmd_ct > 0, u16 first_seq and cmd_ct × command, seqs ascending
@@ -239,3 +294,4 @@ times its round trip. On any ack, it retires every spawn and despawn that frame 
 - **v4** — added `ANGLE8` and `TIME_DELTA`.
 - **v5** — added `command_ack` to the snapshot header, and the uplink packet, which carries the
   snapshot ack (it had travelled alone, as `_gn_ack`).
+- **v6** — the channel part in both packets, and the uplink packet's own `seq`.

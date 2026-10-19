@@ -42,8 +42,14 @@
 // spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
 // the client withholds the ack and the server keeps offering it (Client::apply has the details).
 //
+// Messages. Each peer's snapshots carry its end of a GoldSrc netchan (netchan.h): queue_reliable and
+// queue_unreliable put the host's messages in the peer's next snapshots, ahead of the entities in the
+// packet budget. The client's half of the acks arrives in its uplink (on_channel_ack), and what the
+// server took from the client's uplink goes back in each header (set_uplink_ack).
+//
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
+#include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
 
 #include <algorithm>
@@ -240,6 +246,47 @@ public:
 	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none.
 	void set_command_ack(int32_t p_peer, uint16_t p_seq) { rings_[p_peer].cmd_ack = p_seq; }
 
+	// --- Messages (netchan.h) ---
+
+	void queue_reliable(int32_t p_peer, const uint8_t *p_data, size_t p_size) { rings_[p_peer].rel.queue(p_data, p_size); }
+	// False if the peer's datagram is full and the message was dropped.
+	bool queue_unreliable(int32_t p_peer, const uint8_t *p_data, size_t p_size) {
+		return rings_[p_peer].dgram.queue(p_data, p_size);
+	}
+	// The peer isn't taking its reliable data: GoldSrc dropped the client.
+	bool overflowed(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it != rings_.end() && it->second.rel.overflowed();
+	}
+	// Reliable messages queued to the peer, and how many of those it has. Both in queue order.
+	uint64_t reliable_queued(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.rel.queued();
+	}
+	uint64_t reliable_delivered(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.rel.delivered();
+	}
+	// Datagrams to the peer dropped for not fitting.
+	uint32_t datagram_dropped(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.dgram.dropped();
+	}
+	// From the peer's uplink: the newest snapshot it received, and the bit of the last block it took.
+	void on_channel_ack(int32_t p_peer, uint16_t p_received, bool p_bit) {
+		auto it = rings_.find(p_peer);
+		if (it != rings_.end()) {
+			it->second.rel.on_ack(p_received, p_bit);
+		}
+	}
+	// What the server took from the peer's uplink, for its next header: the newest uplink packet and the
+	// bit of the last block. A new bit earns a snapshot of its own, as it is what lets the peer send on.
+	void set_uplink_ack(int32_t p_peer, uint16_t p_received, bool p_bit) {
+		PeerRing &pr = rings_[p_peer];
+		pr.chan_ack = p_received;
+		pr.chan_ack_bit = p_bit;
+	}
+
 	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
 	uint32_t chokes(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
@@ -376,6 +423,11 @@ private:
 		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
+		ReliableSender rel;
+		DatagramSender dgram;
+		uint16_t chan_ack = 0;          // see set_uplink_ack
+		bool chan_ack_bit = false;
+		bool chan_ack_bit_sent = false; // what the last snapshot told the peer
 	};
 
 	struct Candidate {
@@ -485,6 +537,11 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// Taken for good only once the snapshot goes (below), so a gap in the seqs a client
 		// receives is a lost snapshot, never a skipped one.
 		const uint16_t seq = pr.next_seq;
+
+		// The reliable block first: it has the packet before anything else. One written here always
+		// goes, since it makes the snapshot non-empty.
+		std::vector<uint8_t> block;
+		const uint8_t block_flags = pr.rel.write(seq, block);
 
 		// Spawns owed to this peer, reliable-until-acked.
 		Writer spawn_body;
@@ -647,6 +704,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// server's cadence for an unthrottled peer, which sends every tick).
 		int peer_budget = SAFE_PACKET_BYTES - SNAPSHOT_HEADER_BYTES - (int)spawn_body.size()
 				- (int)despawn_body.size() - (int)leave_body.size();
+		if (block_flags) {
+			peer_budget -= 2 + (int)block.size();
+		}
+		// Then the datagram, all of it or none, and the entities get the rest.
+		std::vector<uint8_t> datagram;
+		pr.dgram.take(peer_budget, datagram);
+		peer_budget -= (int)datagram.size();
 		const uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default_;
 		if (effective_bps > 0) {
 			const uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : tick_interval_ms_;
@@ -692,11 +756,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// unless something went in the packet, so the next snapshot reuses it.
 		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
 		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
+				&& block_flags == 0 && datagram.empty() && pr.chan_ack_bit == pr.chan_ack_bit_sent
 				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
 		pr.last_packet_ms = p_now;
 		pr.cmd_ack_sent = pr.cmd_ack;
+		pr.chan_ack_bit_sent = pr.chan_ack_bit;
 		pr.next_seq++;
 		if (pr.next_seq == 0) {
 			pr.next_seq = 1; // 0 is reserved for "no baseline"
@@ -714,6 +780,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);
 		packet.put_u16(pr.cmd_ack);
+		put_channel(packet, pr.chan_ack, pr.chan_ack_bit, block_flags, block, datagram);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);
 		packet.put_u16(despawn_ct);

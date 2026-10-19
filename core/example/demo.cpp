@@ -214,6 +214,8 @@ struct ServerApp {
 	// The host interface CommandReceiver::receive() calls back into.
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
 	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq, now_ms()); }
+	void channel_ack(int32_t peer, uint16_t received, bool bit) { server.on_channel_ack(peer, received, bit); }
+	void message(int32_t, const uint8_t *, size_t, bool) {}
 	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
 		PeerInfo &p = peers[peer];
 		const uint32_t n = size >= 4 ? data[0] | (data[1] << 8) | (data[2] << 16) | ((uint32_t)data[3] << 24) : 0;
@@ -295,6 +297,7 @@ struct ServerApp {
 				peers[it->second].last_heard = now;
 				commands.receive(it->second, buf + 1, (size_t)n - 1, *this);
 				server.set_command_ack(it->second, commands.ack(it->second));
+				server.set_uplink_ack(it->second, commands.channel_received(it->second), commands.channel_bit(it->second));
 			}
 			len = sizeof(from);
 		}
@@ -394,6 +397,8 @@ struct ClientApp {
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
 	void command_ack(uint16_t seq) { commands.on_ack(seq, now_ms()); }
+	void channel_ack(uint16_t received, bool bit) { commands.on_channel_ack(received, bit); }
+	void message(const uint8_t *, size_t, bool) {}
 	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
@@ -433,7 +438,7 @@ struct ClientApp {
 		}
 		Writer w;
 		w.put_u8('U');
-		commands.write(now, snapshot_ack, w);
+		commands.write(now, snapshot_ack, client.channel_received(), client.channel_bit(), w);
 		if (sim.loss_roll()) {
 			return;
 		}

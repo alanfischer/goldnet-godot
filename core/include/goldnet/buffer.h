@@ -154,6 +154,7 @@ public:
 	}
 
 	bool failed() const { return failed_; }
+	size_t remaining() const { return size_ - pos_; }
 
 private:
 	const uint8_t *data_;
