@@ -426,6 +426,7 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 		}
 	}
 	server.set_packet_overhead(SNAPSHOT_WIRE_OVERHEAD);
+	_refresh_interval();
 	inner = MultiplayerAPI::create_default_interface(); // a SceneMultiplayer
 
 	SceneMultiplayer *sm = Object::cast_to<SceneMultiplayer>(inner.ptr());
@@ -450,6 +451,7 @@ void GoldNetMultiplayer::_reset_client_state() {
 	cmd_auto = goldnet::CmdRateAuto();
 	uplink_lag_ms = 0;
 	uplink_pps = 0;
+	update_rate_granted = -1;
 	_apply_link_settings();
 	snapshot_ack = 0;
 	snapshot_ack_new = false;
@@ -750,11 +752,10 @@ void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
 }
 
 // The send cadence in MICROSECONDS, so the synchronizers' interval (a double, in seconds) survives
-// at full precision: whole milliseconds would turn 60 Hz into 62.5 or 58.8. Only the explicit
-// override, which the config surface takes in whole ms, is coarse.
+// at full precision: whole milliseconds would turn 60 Hz into 62.5 or 58.8.
 uint64_t GoldNetMultiplayer::_min_interval_us() const {
-	if (snapshot_interval_override > 0) {
-		return (uint64_t)snapshot_interval_override * 1000ULL;
+	if (snapshot_rate_setting > 0.0) {
+		return std::max<uint64_t>(1, (uint64_t)(1000000.0 / snapshot_rate_setting + 0.5));
 	}
 	uint64_t best = 0;
 	for (const CoreServer::Entity &e : server.entities()) {
@@ -776,24 +777,29 @@ uint64_t GoldNetMultiplayer::_min_interval_us() const {
 
 void GoldNetMultiplayer::_refresh_interval() {
 	cached_min_interval_us = _min_interval_us();
+	server.set_snapshot_rate(snapshot_rate_setting > 0.0 ? snapshot_rate_setting : 1000000.0 / (double)cached_min_interval_us);
 }
 
 // --- Config surface (Phase 5) ---
 
-void GoldNetMultiplayer::set_snapshot_interval_ms(int p_ms) {
-	snapshot_interval_override = p_ms > 0 ? p_ms : 0;
+void GoldNetMultiplayer::set_snapshot_rate(double p_hz) {
+	snapshot_rate_setting = p_hz > 0.0 ? p_hz : 0.0;
 	_refresh_interval();
 }
-int GoldNetMultiplayer::get_snapshot_interval_ms() const {
-	return snapshot_interval_override;
+double GoldNetMultiplayer::get_snapshot_rate() const {
+	return snapshot_rate_setting;
 }
 
-// Per-peer cadence (GoldSrc cl_updaterate): let one client be served slower than the server ticks,
-// without slowing anyone else down. The server keeps ticking at the fastest replication_interval;
-// this only subsamples which peers a given tick serves. ms <= 0 restores "every tick".
-// Dropped with the ring on disconnect, so a reconnecting client must ask again.
-void GoldNetMultiplayer::set_peer_snapshot_interval_ms(int p_peer, int p_ms) {
-	server.set_peer_interval_ms(p_peer, p_ms > 0 ? (uint32_t)p_ms : 0); // a rate may be set before the first tick
+void GoldNetMultiplayer::set_update_rate(int p_hz) {
+	update_rate_setting = p_hz > 0 ? p_hz : 0;
+	_apply_link_settings();
+}
+int GoldNetMultiplayer::get_update_rate() const {
+	return update_rate_setting;
+}
+
+int GoldNetMultiplayer::get_protocol_version() const {
+	return goldnet::SNAPSHOT_VERSION;
 }
 
 void GoldNetMultiplayer::set_manual_send(bool p_manual) {
@@ -830,6 +836,7 @@ bool GoldNetMultiplayer::get_auto_rate() const {
 // The rate and command rate commands_out goes by: the game's settings, or the automatic ones.
 void GoldNetMultiplayer::_apply_link_settings() {
 	commands_out.set_rate((uint32_t)(auto_rate ? downlink.rate() : rate_setting));
+	commands_out.set_update_rate((uint32_t)update_rate_setting);
 	const double hz = auto_command_rate ? cmd_auto.rate() : command_rate_setting;
 	const double ceiling = (double)Engine::get_singleton()->get_physics_ticks_per_second();
 	commands_out.set_interval_ms(hz > 0.0 && !(auto_command_rate && hz >= ceiling) ? (uint32_t)std::lround(1000.0 / hz) : 0);
@@ -850,6 +857,14 @@ void GoldNetMultiplayer::_on_server_time(uint32_t p_ms) {
 	downlink.note(now, p_ms);
 	if (auto_rate) {
 		_apply_link_settings();
+	}
+}
+
+// Client: the update rate the server grants us, from a snapshot header.
+void GoldNetMultiplayer::_on_update_rate(uint32_t p_hz) {
+	if ((int)p_hz != update_rate_granted) {
+		update_rate_granted = (int)p_hz;
+		emit_signal("update_rate_granted", (int64_t)p_hz);
 	}
 }
 
@@ -980,6 +995,7 @@ Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
 	d["recv_sim_packets"] = sim_peer ? recv_peer->get_delivered_packets() : (int64_t)0;
 	const uint32_t iv = commands_out.interval_ms();
 	d["rate"] = (int64_t)(on_server ? server.peer_rate(p_peer) : commands_out.rate());
+	d["update_rate"] = (int64_t)(on_server ? server.update_rate(p_peer) : std::max(update_rate_granted, 0));
 	d["command_rate"] = on_server || iv == 0 ? 0.0 : 1000.0 / (double)iv;
 	d["downlink_lag_ms"] = (int64_t)(on_server ? 0 : downlink.lag_ms());
 	d["uplink_lag_ms"] = (int64_t)(on_server ? commands_in.uplink_lag_ms(p_peer) : uplink_lag_ms);
@@ -1121,10 +1137,13 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 
 void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("mark_dirty", "object"), &GoldNetMultiplayer::mark_dirty);
-	ClassDB::bind_method(D_METHOD("set_snapshot_interval_ms", "ms"), &GoldNetMultiplayer::set_snapshot_interval_ms);
-	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
-	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
+	ClassDB::bind_method(D_METHOD("set_snapshot_rate", "hz"), &GoldNetMultiplayer::set_snapshot_rate);
+	ClassDB::bind_method(D_METHOD("get_snapshot_rate"), &GoldNetMultiplayer::get_snapshot_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "snapshot_rate"), "set_snapshot_rate", "get_snapshot_rate");
+	ClassDB::bind_method(D_METHOD("set_update_rate", "hz"), &GoldNetMultiplayer::set_update_rate);
+	ClassDB::bind_method(D_METHOD("get_update_rate"), &GoldNetMultiplayer::get_update_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "update_rate"), "set_update_rate", "get_update_rate");
+	ClassDB::bind_method(D_METHOD("get_protocol_version"), &GoldNetMultiplayer::get_protocol_version);
 	ClassDB::bind_method(D_METHOD("set_rate", "bytes_per_sec"), &GoldNetMultiplayer::set_rate);
 	ClassDB::bind_method(D_METHOD("get_rate"), &GoldNetMultiplayer::get_rate);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "rate"), "set_rate", "get_rate");
@@ -1159,9 +1178,9 @@ void GoldNetMultiplayer::_bind_methods() {
 	// clock). An always-on server-time feed regardless of entity traffic — feed it to a clock estimator
 	// (see the ServerClock addon helper) instead of running a separate server-time beacon RPC.
 	ADD_SIGNAL(MethodInfo("server_time_received", PropertyInfo(Variant::INT, "server_time_ms")));
-	// Emitted on the server when a client's rate in force changes (it asked for another), so a game
-	// that sizes the peer's snapshot cadence by its rate can follow it.
-	ADD_SIGNAL(MethodInfo("peer_rate_changed", PropertyInfo(Variant::INT, "peer"), PropertyInfo(Variant::INT, "rate")));
+	// Emitted on a client when the update rate the server grants it changes, and on its first snapshot:
+	// what a game sizes its interpolation delay by. 0 = every tick, at a rate the server doesn't know.
+	ADD_SIGNAL(MethodInfo("update_rate_granted", PropertyInfo(Variant::INT, "rate")));
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -1396,6 +1415,7 @@ struct GoldNetMultiplayer::ClientHost {
 	}
 
 	void uplink_report(uint32_t lag_ms, uint32_t pps) { gn->_on_uplink_report(lag_ms, pps); }
+	void update_rate(uint32_t hz) { gn->_on_update_rate(hz); }
 
 	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq); }
 
@@ -1521,10 +1541,8 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 	if (rate > 0 && rate < MIN_PEER_RATE) {
 		rate = MIN_PEER_RATE;
 	}
-	if (rate != server.peer_rate(p_peer)) {
-		server.set_peer_rate(p_peer, rate);
-		emit_signal("peer_rate_changed", p_peer, (int64_t)rate);
-	}
+	server.set_peer_rate(p_peer, rate);
+	server.set_peer_update_rate(p_peer, commands_in.update_rate(p_peer));
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its

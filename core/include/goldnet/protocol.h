@@ -23,7 +23,9 @@ namespace goldnet {
 // header, and the uplink packet gained a seq of its own and the newest snapshot received.
 // v7: the uplink packet carries its send time and the client's rate; the snapshot header carries the
 // server's measure of the client's uplink (auto_rate.h).
-static const uint8_t SNAPSHOT_VERSION = 7;
+// v8: the uplink packet carries the client's update rate; the snapshot header carries the rate the
+// server grants it.
+static const uint8_t SNAPSHOT_VERSION = 8;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.
@@ -50,10 +52,20 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 static const int SAFE_PACKET_BYTES = 1200;
 
 // Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, command_ack u16,
-// the uplink report's two uvarints at their widest in practice, the channel part's ack u16, flags u8 and datagram length u16, and the four section counts
+// the uplink report's two uvarints and the granted update rate's at their widest in practice, the channel part's ack u16, flags u8 and datagram length u16, and the four section counts
 // (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when sizing the
 // entity-delta budget, so the budget describes the packet rather than one section.
-static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 3 + 3 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
+static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 3 + 3 + 2 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
+
+// The same fixed part at its narrowest: a snapshot with nothing in it.
+static const int IDLE_SNAPSHOT_BYTES = 1 + 2 + 2 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
+
+// The least update rate the server grants (GoldSrc sv_minupdaterate), snapshots/sec.
+static const uint32_t MIN_UPDATE_RATE = 10;
+
+// The most of a peer's rate that idle snapshots alone may take. A grant over it would leave a slow
+// link choking on headers, served unevenly instead of at a lower, steady rate.
+static const double UPDATE_RATE_RATE_SHARE = 0.3;
 
 // Largest reliable block (netchan.h), the GoldSrc fragment size scaled to SAFE_PACKET_BYTES: a block
 // leaves a third of the packet for the datagram and the entities, and a bigger message is cut into

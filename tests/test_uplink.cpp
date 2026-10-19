@@ -201,10 +201,10 @@ static void test_repeated_bytes_cost_their_changes() {
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
 	s.write(10, 0, ChannelAckSource(), w);
-	// Header 23 (incl. the send time, a zero rate, an empty channel part, one stream and first_seq),
+	// Header 24 (incl. the send time, zero rates, an empty channel part, one stream and first_seq),
 	// then the first command against zeros: len 1, mask 4, 32 bytes. Then an identical one: gap 1,
 	// len 1, mask 4. Then one changed byte: gap, len, mask, 1.
-	CHECK(w.size() == 23 + 37 + 6 + 7);
+	CHECK(w.size() == 24 + 37 + 6 + 7);
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h, 0));
@@ -288,7 +288,7 @@ static void test_rtt_is_learned_past_the_first_overdue() {
 		Writer w;
 		s.write(now, 0, ChannelAckSource(), w);
 		if (i >= 150) {
-			late_cmds += w.data()[20]; // cmd_ct, after the send time, a zero rate, an empty channel part and one stream id
+			late_cmds += w.data()[21]; // cmd_ct, after the send time, zero rates, an empty channel part and one stream id
 		}
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > 10) {
@@ -322,7 +322,7 @@ static void test_rtt_longer_than_the_ring_is_learned() {
 		Writer w;
 		s.write(now, 0, ChannelAckSource(), w);
 		if (i >= 350) {
-			late_cmds += w.data()[20]; // cmd_ct, after the send time, a zero rate, an empty channel part and one stream id
+			late_cmds += w.data()[21]; // cmd_ct, after the send time, zero rates, an empty channel part and one stream id
 		}
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > trip) {
@@ -425,7 +425,13 @@ static void test_rate_rides_along() {
 	s.write(26, 0, ChannelAckSource(), w2);
 	CHECK(r.receive(2, w2.data(), w2.size(), h, 26));
 	CHECK(r.rate(2) == 2800);
-	printf("  the rate rides every packet: ok\n");
+	CHECK(r.update_rate(2) == 0);
+	s.set_update_rate(20);
+	Writer w3;
+	s.write(42, 0, ChannelAckSource(), w3);
+	CHECK(r.receive(2, w3.data(), w3.size(), h, 42));
+	CHECK(r.update_rate(2) == 20);
+	printf("  the rate and update rate ride every packet: ok\n");
 }
 
 // The server meters the uplink from each packet's 16-bit send time: a steady trip reads as no lag, a

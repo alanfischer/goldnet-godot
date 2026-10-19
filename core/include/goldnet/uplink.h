@@ -21,7 +21,8 @@
 // queue_unreliable put the host's other messages in it, delivered to the server's host ahead of the
 // commands (reliable) and after them (datagram), as GoldSrc ran a string command before a move.
 //
-// Each packet also carries its send time and the client's rate (GoldSrc `rate`). The server meters
+// Each packet also carries its send time, the client's rate (GoldSrc `rate`) and update rate (GoldSrc
+// `cl_updaterate`). The server meters
 // the uplink from the send times (auto_rate.h) and reports it back in the snapshot header, where the
 // client's CmdRateAuto reads it.
 //
@@ -31,6 +32,7 @@
 //   u16  snapshot_ack     the newest snapshot the client committed; 0 = none
 //   u16  send_time        the client's clock at send, ms, low 16 bits
 //   uvarint rate          the rate the client asks for, in units of 100 bytes/sec; 0 = no limit
+//   uvarint update_rate   the snapshots/sec it asks for; 0 = as many as the server sends
 //   ...  channel part     (netchan.h) its ack is the newest snapshot received, committed or not
 //   u16  floor            the oldest command the client still holds; its next seq if it holds none
 //   u8   stream_ct        then stream_ct × u32 stream_id
@@ -139,6 +141,9 @@ public:
 	// The rate this client asks the server for, in bytes/sec (GoldSrc `rate`). 0 = no limit.
 	void set_rate(uint32_t p_bytes_per_sec) { rate_ = p_bytes_per_sec; }
 	uint32_t rate() const { return rate_; }
+	// The snapshots/sec this client asks for (GoldSrc cl_updaterate). 0 = as many as the server sends.
+	void set_update_rate(uint32_t p_hz) { update_rate_ = p_hz; }
+	uint32_t update_rate() const { return update_rate_; }
 
 	// The client's other messages (netchan.h).
 	void queue_reliable(const uint8_t *p_data, size_t p_size) { rel_.queue(p_data, p_size); }
@@ -250,6 +255,7 @@ public:
 		r_out.put_u16(p_snapshot_ack);
 		r_out.put_u16((uint16_t)p_now);
 		put_uvarint(&r_out, (rate_ + 99) / 100);
+		put_uvarint(&r_out, update_rate_);
 		put_channel(r_out, ack, block_flags, block, datagram);
 		r_out.put_u16(ring_.empty() ? next_seq_ : ring_.front().seq);
 		r_out.put_u8((uint8_t)streams.size());
@@ -301,13 +307,14 @@ private:
 
 	// Packets whose send time is kept for timing their ack: about 8 s at one packet a tick.
 	static constexpr int SENT_RING = 512;
-	// The packet's fixed part, with the rate at its widest and an empty channel part.
-	static constexpr int HEADER_BYTES = 21;
+	// The packet's fixed part, with the rates at their widest and an empty channel part.
+	static constexpr int HEADER_BYTES = 23;
 
 	std::deque<Cmd> ring_; // unacked, oldest first
 	uint16_t next_seq_ = 1;
 	uint32_t interval_ms_ = 0;
 	uint32_t rate_ = 0;
+	uint32_t update_rate_ = 0;
 	int backup_ = COMMAND_BACKUP_DEFAULT;
 	uint32_t last_send_ms_ = 0;
 	bool sent_any_ = false;
@@ -373,6 +380,11 @@ public:
 		auto it = peers_.find(p_peer);
 		return it == peers_.end() ? 0 : it->second.rate;
 	}
+	// The snapshots/sec p_peer asks for; 0 = as many as the server sends.
+	uint32_t update_rate(int32_t p_peer) const {
+		auto it = peers_.find(p_peer);
+		return it == peers_.end() ? 0 : it->second.update_rate;
+	}
 
 	// Commands p_peer gave up on before they arrived.
 	uint32_t skipped(int32_t p_peer) const {
@@ -404,6 +416,7 @@ private:
 		ArrivalMeter arrivals;
 		uint32_t lag_ms = 0;
 		uint32_t rate = 0;
+		uint32_t update_rate = 0;
 	};
 	// Commands held for a gap to fill are bounded by what a client can have unacked.
 	static const int MAX_AHEAD = COMMAND_RING * 2;
@@ -429,6 +442,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	const uint16_t snapshot_ack = r.get_u16();
 	const uint16_t send_time = r.get_u16();
 	const uint32_t rate = get_uvarint(&r);
+	const uint32_t update_rate = get_uvarint(&r);
 	ChannelPart chan;
 	chan.read(r);
 	uint16_t floor = r.get_u16();
@@ -478,6 +492,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	p.lag_ms = p.queue.note(p_now, sent_ms);
 	p.arrivals.note(p_now);
 	p.rate = rate > 0xFFFFFFFFu / 100 ? 0xFFFFFFFFu : rate * 100;
+	p.update_rate = update_rate;
 	// The channel only from a packet newer than every one before it. Commands carry their own seqs,
 	// so a reordered packet still delivers those.
 	std::vector<std::vector<uint8_t>> reliable;

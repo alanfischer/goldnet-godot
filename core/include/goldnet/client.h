@@ -10,6 +10,8 @@
 //   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
 //   void uplink_report(uint32_t lag_ms, uint32_t pps)   and the server's measure of our uplink
 //                                                  (CmdRateAuto)
+//   void update_rate(uint32_t hz)                  and the snapshots/sec the server grants us; 0 =
+//                                                  every tick, at a rate it doesn't know
 //   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
 //                                                  (CommandSender::on_channel_ack)
 //   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
@@ -131,6 +133,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const uint16_t command_ack = r.get_u16();
 	const uint32_t uplink_lag_ms = get_uvarint(&r);
 	const uint32_t uplink_pps = get_uvarint(&r);
+	const uint32_t update_rate = get_uvarint(&r);
 	ChannelPart chan;
 	chan.read(r);
 	info.seq = seq;
@@ -166,6 +169,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	p_host.server_time(server_time);
 	p_host.command_ack(command_ack);
 	p_host.uplink_report(uplink_lag_ms, uplink_pps);
+	p_host.update_rate(update_rate);
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means full state. If
 	// the server diffed against a frame we no longer hold, we can't reconstruct unchanged fields —

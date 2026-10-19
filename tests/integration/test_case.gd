@@ -50,7 +50,7 @@ var client_index: int = 0
 
 
 ## The installed GoldNetMultiplayer, for cases that drive its knobs (sim_config,
-## snapshot_interval_ms, ...). Returned untyped on purpose: those properties
+## snapshot_rate, ...). Returned untyped on purpose: those properties
 ## live on the GDExtension class, not on the MultiplayerAPI base, so a static type here
 ## would reject them at parse time.
 func goldnet():

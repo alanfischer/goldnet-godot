@@ -112,7 +112,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// Send cadence; refreshed on config add/remove, not per poll. Microseconds, because a millisecond
 	// cannot express the tick rates games actually use: 60 Hz is 16.667 ms.
 	uint64_t cached_min_interval_us = 33000;
-	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
+	double snapshot_rate_setting = 0.0;          // config: >0 overrides the synchronizer-derived send cadence (Hz)
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
 	uint64_t dbg_bytes = 0;                      // bytes sent since last stats print
 	bool dbg = false;                            // GOLDNET_DEBUG=1 → periodic snapshot stats
@@ -177,6 +177,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// here rather than only in commands_out, which a new session resets.
 	int rate_setting = 0;
 	bool auto_rate = false;
+	int update_rate_setting = 0;
+	int update_rate_granted = -1; // the server's last word on it; -1 = none yet this session
 	double command_rate_setting = 0.0;
 	bool auto_command_rate = false;
 	goldnet::DownlinkMeter downlink;
@@ -186,6 +188,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _apply_link_settings();
 	void _on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps);
 	void _on_server_time(uint32_t p_ms);
+	void _on_update_rate(uint32_t p_hz);
 	// Client: the snapshot ack for the next uplink packet. While a command stream is active it waits
 	// for the next command packet rather than going alone, as GoldSrc's acks ride clc_move.
 	uint16_t snapshot_ack = 0;
@@ -276,12 +279,16 @@ public:
 	GoldNetMultiplayer();
 
 	// --- Config surface (Phase 5) — settable from GDScript on the installed API instance ---
-	// Snapshot send cadence override in ms; 0 (default) derives it from the synchronizers'
-	// replication_interval (min across owned syncs). Set >0 to pin one global tick rate.
-	void set_snapshot_interval_ms(int p_ms);
-	int get_snapshot_interval_ms() const;
-	// Write-only: the per-peer value is consulted in the send path and nothing reads it back.
-	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
+	// Server: snapshots per second, the ceiling on every client's update_rate. 0 (default) derives it
+	// from the synchronizers' replication_interval (min across owned syncs). With manual_send, set it
+	// to the rate send_snapshots() is called at; otherwise it also sets goldnet's own send timer.
+	void set_snapshot_rate(double p_hz);
+	double get_snapshot_rate() const;
+	// Client: the snapshots per second we ask to be served at (GoldSrc cl_updaterate; 0 = as many as
+	// the server sends, the default). The server grants it under its snapshot_rate and under what our
+	// rate can carry, and at least 10, and says what it granted: update_rate_granted.
+	void set_update_rate(int p_hz);
+	int get_update_rate() const;
 	// Client: the most bytes per second the server may send us (GoldSrc `rate`; 0 = no limit, the
 	// default). Snapshots and game RPCs both count; while we're over it the server skips our
 	// snapshots (a choke), and the next one we get carries the latest state. Ignored while
@@ -326,6 +333,8 @@ public:
 	//                            meter should count while it is on, not the transport's counters
 	// and these, which are current values rather than totals:
 	//   rate                     the rate in force for the link, bytes/sec; 0 = no limit
+	//   update_rate              snapshots/sec the server grants the client; 0 = every tick, at a
+	//                            rate the server doesn't know
 	//   command_rate             client: command packets/sec in force; 0 = one per command
 	//   downlink_lag_ms          client: how far behind its best the downlink is arriving
 	//   uplink_lag_ms, uplink_pps  the same for the uplink, and its packets arriving per second
@@ -346,6 +355,8 @@ public:
 	double get_command_rate() const;
 	void set_auto_command_rate(bool p_enabled);
 	bool get_auto_command_rate() const;
+	// SNAPSHOT_VERSION: two ends that differ can't talk, so a game's own join handshake can compare them.
+	int get_protocol_version() const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

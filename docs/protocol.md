@@ -1,4 +1,4 @@
-# goldnet wire protocol (version 7)
+# goldnet wire protocol (version 8)
 
 The byte-level contract between goldnet's two ends: what a snapshot and an uplink packet contain,
 how each value is encoded, and what each end does with them. The README's **How it
@@ -56,13 +56,14 @@ the datagram. A message is `uvarint target` and then:
 One per peer per send, server to client.
 
 ```
-u8   version        SNAPSHOT_VERSION = 7
+u8   version        SNAPSHOT_VERSION = 8
 u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
 u16  command_ack    the newest command from this peer delivered with none missing before it; 0 = none
 uvarint uplink_lag  how far behind its best this peer's uplink arrives, ms (see **Uplink report**)
 uvarint uplink_pps  this peer's uplink packets arriving per second; 0 = not known yet
+uvarint update_rate the snapshots/sec this peer is granted, rounded (see **Sending**); 0 = every tick, at a rate the server doesn't know
 ...  channel part   (see **Channel**) its ack is the newest uplink packet received
 u16  spawn_ct       then spawn_ct  × spawn entry
 u16  despawn_ct     then despawn_ct × u32 net_id
@@ -194,6 +195,7 @@ u16  seq            this packet's, counting up from 1 and skipping 0 on the wrap
 u16  snapshot_ack   the newest committed snapshot; 0 = none
 u16  send_time      the client's clock at send, ms, low 16 bits
 uvarint rate        the rate the client asks for, in units of 100 bytes/sec, rounded up; 0 = no limit
+uvarint update_rate the snapshots/sec it asks for (GoldSrc cl_updaterate); 0 = as many as the server sends
 ...  channel part   (see **Channel**) its ack is the newest snapshot received, committed or not
 u16  floor          the oldest command the client still holds; its next seq if it holds none
 u8   stream_ct      then stream_ct × u32 stream_id
@@ -243,7 +245,7 @@ above it: time spent queued. A gap of over 500 ms in the stream starts the floor
 is the packets that arrived over the last 500 ms window. A queueing link delivers at its capacity,
 so the client's command rate can cut to just under it.
 
-The server applies each peer's `rate`, at least 1000 B/s, from its newest packet.
+The server applies each peer's `rate`, at least 1000 B/s, and `update_rate`, from its newest packet.
 
 ## Sequence numbers
 
@@ -259,9 +261,13 @@ trusting a slot.
 
 Per tick, for each peer:
 
-1. **Cadence.** Skip the peer if its own interval (`set_peer_snapshot_interval_ms`) hasn't elapsed
-   since its last send, or if its `rate` hasn't cleared what was already sent to it (a *choke*).
-   A peer's first snapshot is never skipped.
+1. **Cadence.** Skip the peer if its granted update rate's interval hasn't elapsed since its last
+   send, or if its `rate` hasn't cleared what was already sent to it (a *choke*). A peer's first
+   snapshot is never skipped. The grant is the `update_rate` it asks for (all of them, if 0), held
+   under the server's snapshot rate and under `rate × 0.3 / (idle snapshot + per-packet overhead)`, so
+   idle headers take at most 30% of the peer's rate, and at least `MIN_UPDATE_RATE` = 10. With the
+   snapshot rate known, it is then rounded down to every nth tick, and a peer is due half a tick
+   early so a jittery clock can't make it a tick late.
 2. **Baseline.** `base_seq` is the peer's newest ack if that frame is still in the ring, else 0
    and the snapshot carries full state.
 3. **Reliable-until-acked sections.** A spawn or despawn goes in the first snapshot that owes it
@@ -328,3 +334,4 @@ times its round trip. On any ack, it retires every spawn and despawn that frame 
   snapshot ack (it had travelled alone, as `_gn_ack`).
 - **v6** — the channel part in both packets, and the uplink packet's own `seq`.
 - **v7** — the uplink packet's `send_time` and `rate`, and the snapshot header's uplink report.
+- **v8** — the uplink packet's `update_rate`, and the snapshot header's granted `update_rate`.

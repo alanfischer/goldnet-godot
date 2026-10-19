@@ -90,6 +90,7 @@ struct Peer {
 	std::vector<uint32_t> times;
 	std::vector<uint16_t> command_acks;
 	std::vector<std::pair<uint32_t, uint32_t>> uplink_reports; // lag_ms, pps
+	std::vector<uint32_t> update_rates;
 	std::vector<std::pair<uint16_t, bool>> chan_acks;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
@@ -105,6 +106,7 @@ struct TestClientHost {
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
 	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
 	void uplink_report(uint32_t lag_ms, uint32_t pps) { p->uplink_reports.push_back({ lag_ms, pps }); }
+	void update_rate(uint32_t hz) { p->update_rates.push_back(hz); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
 	void channel_ack(const ChannelAck &a) { p->chan_acks.push_back({ a.received, a.bit }); }
 	void message(const uint8_t *data, size_t size, bool reliable) {
@@ -629,23 +631,54 @@ static void test_budget_overflow_drains_by_priority() {
 	printf("  budget overflow drains, highest priority first: ok\n");
 }
 
-static void test_peer_interval_throttles_one_peer() {
+static void test_update_rate_throttles_one_peer() {
 	Net n;
-	n.add_peer(2);
+	Peer &fast = n.add_peer(2);
 	Peer &slow = n.add_peer(3);
 	n.add_entity(10, 100, { 0 });
-	n.server.set_peer_interval_ms(3, 50);
+	n.server.set_snapshot_rate(60.0);
+	n.server.set_peer_update_rate(3, 20);
 	int fast_sent = 0, slow_sent = 0;
 	for (int i = 0; i < 30; i++) {
 		n.world.ents[10].vals[0] = i;
-		n.tick();
+		n.tick(i % 3 == 2 ? 17 : 16); // about 60 Hz, as a jittery millisecond clock sees it
 		fast_sent += (int)n.sent_to(2);
 		slow_sent += (int)n.sent_to(3);
 	}
 	CHECK(fast_sent == 30);
-	CHECK(slow_sent == 8); // 16 ms ticks: the first one at or past 50 ms is every 4th
-	CHECK(slow.vals[100][0] >= 26);           // and it still converges
-	printf("  per-peer interval throttles only that peer: ok\n");
+	CHECK(slow_sent == 10);             // every 3rd tick, though the gaps measure 49 ms
+	CHECK(slow.vals[100][0] >= 27);     // and it still converges
+	CHECK(fast.update_rates.back() == 60 && slow.update_rates.back() == 20);
+	printf("  an update rate throttles only that peer, every nth tick: ok\n");
+}
+
+// A grant is what the peer asks for, held to a whole number of ticks, the snapshot rate, its rate's
+// share and MIN_UPDATE_RATE.
+static void test_update_rate_grant() {
+	Net n;
+	n.add_peer(2);
+	n.add_entity(10, 100, { 0 });
+	auto granted = [&n](uint32_t asked, uint32_t rate) {
+		n.server.set_peer_update_rate(2, asked);
+		n.server.set_peer_rate(2, rate);
+		n.tick(1000);
+		return n.server.update_rate(2);
+	};
+	CHECK(granted(0, 0) == 0); // nothing asked, snapshot rate unknown: every tick
+	CHECK(granted(25, 0) == 25);
+	CHECK(granted(1, 0) == 10);
+	n.server.set_snapshot_rate(60.0);
+	CHECK(granted(0, 0) == 60);
+	CHECK(granted(100, 0) == 60);
+	CHECK(granted(45, 0) == 30); // 60 Hz can't serve 45: every 2nd tick
+	CHECK(granted(20, 0) == 20);
+	CHECK(granted(1, 0) == 10);
+	// 3000 B/s, 30% of it in idle snapshots of IDLE_SNAPSHOT_BYTES: 33 Hz, which is every 2nd tick
+	CHECK(granted(0, 3000) == 30);
+	CHECK(granted(0, 1000) == 10); // the floor holds even when the rate can't carry it
+	n.server.set_packet_overhead(50);
+	CHECK(granted(0, 4000) == 15); // 15.6 Hz: every 4th tick
+	printf("  update rate grants: ok\n");
 }
 
 static void test_push_declared_slots_skip_reads() {
@@ -734,10 +767,10 @@ static void test_charged_traffic_delays_the_next_snapshot() {
 	Net n;
 	n.add_peer(2);
 	n.add_entity(10, 100, { 0 });
-	n.server.set_peer_rate(2, 1000);
+	n.server.set_peer_rate(2, 10000);  // fast enough that its update rate isn't what holds it back
 	n.tick();                          // the first snapshot goes out
-	n.server.charge(2, n.now, 250);    // then the host sends two RPC bursts, 500 bytes in all:
-	n.server.charge(2, n.now, 250);    // half a second's worth, so they queue behind each other
+	n.server.charge(2, n.now, 2500);   // then the host sends two RPC bursts, 5000 bytes in all:
+	n.server.charge(2, n.now, 2500);   // half a second's worth, so they queue behind each other
 	int sent = 0;
 	for (int t = 0; t < 25; t++) {     // 400 ms
 		n.world.ents[10].vals[0] = t + 1;
@@ -883,7 +916,8 @@ int main() {
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();
 	test_budget_overflow_drains_by_priority();
-	test_peer_interval_throttles_one_peer();
+	test_update_rate_throttles_one_peer();
+	test_update_rate_grant();
 	test_push_declared_slots_skip_reads();
 	test_warmup_defer_then_accept();
 	test_removed_entity_leaves_client_frame();
