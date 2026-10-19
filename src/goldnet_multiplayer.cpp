@@ -375,10 +375,6 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	dbg = getenv("GOLDNET_DEBUG") != nullptr;
 	rpc_stats = getenv("GOLDNET_RPC_STATS") != nullptr;
 	{
-		const char *netchan = getenv("GOLDNET_RPC_NETCHAN"); // =0: every RPC through the inner, for an A/B
-		rpc_netchan = !(netchan && String(netchan) == "0");
-	}
-	{
 		const char *loss = getenv("GOLDNET_LOSS");
 		sim.set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
 		// GOLDNET_SIM_SEED=<n> makes the whole sim (loss rolls + latency draws) reproducible
@@ -1804,9 +1800,6 @@ void GoldNetMultiplayer::_deliver_message(int32_t p_from, const uint8_t *p_data,
 // A call declared on another channel goes through the inner, unordered against the netchan, as stock
 // orders each channel apart; so does a client's call to another client (the inner relays those).
 bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
-	if (!rpc_netchan) {
-		return false;
-	}
 	Ref<MultiplayerPeer> mp = inner->get_multiplayer_peer();
 	if (mp.is_null() || mp->get_connection_status() != MultiplayerPeer::CONNECTION_CONNECTED) {
 		return false;

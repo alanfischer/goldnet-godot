@@ -703,8 +703,6 @@ path; its header shows the calls.
   every run drops different packets and draws different delays — fine for poking at
   self-heal, useless for a regression test you need to re-run or bisect. Also settable as
   the `seed` key of the `sim_config` property.
-- `GOLDNET_RPC_NETCHAN=0` — send this end's RPCs through the inner `SceneMultiplayer` instead of
-  the netchan, to compare the two.
 
 ## License
 

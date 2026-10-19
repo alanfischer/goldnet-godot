@@ -214,7 +214,6 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// A message names its target (a node path and a method) by a small id, which the sending end
 	// registers with the receiving one reliably, the first time it uses it with that peer: GoldSrc's
 	// svc_newusermsg, done lazily. The ids are this end's own; each peer keeps the ones the other named.
-	bool rpc_netchan = true; // GOLDNET_RPC_NETCHAN=0 sends through the inner, for an A/B
 	HashMap<String, uint32_t> msg_ids; // "path::method" -> id
 	uint32_t msg_next_id = 1;          // 0 is the registration message itself
 	// Peer -> id -> the index of its registration in that peer's reliable stream. Until the peer has
