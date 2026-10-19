@@ -53,6 +53,7 @@
 #include "goldnet/protocol.h"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -207,9 +208,21 @@ public:
 
 	// --- Peers ---
 
-	// Per-peer cadence (GoldSrc cl_updaterate): serve this peer at most once per interval, without
-	// slowing anyone else down. 0 restores "every tick". Dropped with the peer.
-	void set_peer_interval_ms(int32_t p_peer, uint32_t p_ms) { rings_[p_peer].interval_ms = p_ms; }
+	// GoldSrc cl_updaterate: the snapshots/sec this peer asks for (CommandReceiver::update_rate); 0 =
+	// as many as the server sends. It is granted that, under the snapshot rate and under what its rate
+	// can carry in idle snapshots, and at least MIN_UPDATE_RATE, without slowing anyone else down.
+	// Dropped with the peer.
+	void set_peer_update_rate(int32_t p_peer, uint32_t p_hz) { rings_[p_peer].update_rate_asked = p_hz; }
+	// What p_peer was granted at its last tick, snapshots/sec, as its headers tell it; 0 = every tick,
+	// at a rate the server doesn't know.
+	uint32_t update_rate(int32_t p_peer) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() ? 0 : it->second.update_rate;
+	}
+	// The rate tick() is called at, snapshots/sec: the ceiling on every grant, and the tick a slower
+	// peer's cadence is counted in. 0 = unknown.
+	void set_snapshot_rate(double p_hz) { snapshot_rate_ = p_hz > 0.0 ? p_hz : 0.0; }
+	double snapshot_rate() const { return snapshot_rate_; }
 
 	// GoldSrc rate / choke: the most bytes per second this peer's link takes (0 = unlimited). Every
 	// send to the peer — snapshots here, and whatever else the host reports through charge() —
@@ -403,7 +416,8 @@ private:
 		// window must ship a full baseline, not a slot delta against a frame the peer no longer
 		// matches. Soft state: losing it only costs a redundant full baseline.
 		IdSet left_unacked;
-		uint32_t interval_ms = 0;
+		uint32_t update_rate_asked = 0; // see set_peer_update_rate
+		uint32_t update_rate = 0;       // granted, rounded, as the header carries it
 		// When this peer was last considered for a send, for the cadence check. Advances even on a
 		// tick that decides to send nothing.
 		uint32_t last_sent_ms = 0;
@@ -450,9 +464,33 @@ private:
 	// the 16-bit wire seq it never wraps in any realistic session (2^32 ticks at 60 Hz is ~2 years).
 	uint32_t ctr_ = 0;
 	int packet_overhead_ = 0;
+	double snapshot_rate_ = 0.0;
 	bool relevance_events_ = false;
 	std::vector<size_t> live_; // scratch: entities live this tick
 	std::unordered_set<uint64_t> unproven_; // scratch: entity keys whose spawn this peer may lack
+
+	// See set_peer_update_rate. 0 = every tick.
+	double grant(const PeerRing &p_pr) const {
+		double hz = (double)p_pr.update_rate_asked;
+		if (p_pr.rate_bps > 0) {
+			const double cap = p_pr.rate_bps * UPDATE_RATE_RATE_SHARE / (double)(IDLE_SNAPSHOT_BYTES + packet_overhead_);
+			hz = hz > 0.0 ? std::min(hz, cap) : cap;
+		}
+		if (snapshot_rate_ > 0.0 && (hz <= 0.0 || hz > snapshot_rate_)) {
+			hz = snapshot_rate_;
+		}
+		if (hz <= 0.0) {
+			return 0.0;
+		}
+		hz = std::max(hz, (double)MIN_UPDATE_RATE);
+		if (snapshot_rate_ > 0.0) {
+			// Served every nth tick, so that is what it gets.
+			double n = std::ceil(snapshot_rate_ / hz - 1e-9);
+			n = std::max(1.0, std::min(n, std::floor(snapshot_rate_ / (double)MIN_UPDATE_RATE)));
+			hz = snapshot_rate_ / n;
+		}
+		return hz;
+	}
 };
 
 template <class V, class X>
@@ -461,10 +499,15 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 	// Resolve which peers are due BEFORE the per-entity state read below: on a tick where every
 	// peer is throttled (all of them on a slower cadence than the server's) this costs nothing.
 	// last_sent_ms == 0 always sends — a peer's first snapshot must not wait out an interval.
+	// A slower peer is due half a tick early, so clock jitter can't push it a whole tick late.
+	const double slack_ms = snapshot_rate_ > 0.0 ? 500.0 / snapshot_rate_ : 0.0;
 	std::vector<int32_t> due;
 	for (int32_t peer : p_peers) {
 		PeerRing &pr = rings_[peer]; // default-constructs on first use
-		if (pr.interval_ms > 0 && pr.last_sent_ms != 0 && p_now - pr.last_sent_ms < pr.interval_ms) {
+		const double hz = grant(pr);
+		pr.update_rate = (uint32_t)std::lround(hz);
+		const bool gated = hz > 0.0 && !(snapshot_rate_ > 0.0 && hz >= snapshot_rate_);
+		if (gated && pr.last_sent_ms != 0 && (double)(p_now - pr.last_sent_ms) + slack_ms < 1000.0 / hz) {
 			continue;
 		}
 		if (pr.rate_bps > 0 && pr.clear_at_ms > (double)p_now) {
@@ -773,6 +816,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(pr.cmd_ack);
 		put_uvarint(&packet, pr.uplink_lag_ms);
 		put_uvarint(&packet, pr.uplink_pps);
+		put_uvarint(&packet, pr.update_rate);
 		put_channel(packet, up, block_flags, block, datagram);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);

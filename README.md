@@ -432,7 +432,7 @@ something false.
 5. (Optional) Tune the installed API and opt into lossy per-property quantization:
    ```gdscript
    var gn := ClassDB.instantiate(&"GoldNetMultiplayer")
-   gn.snapshot_interval_ms = 33   # 0 = derive from synchronizers' replication_interval
+   gn.snapshot_rate = 30.0   # snapshots/sec; 0 = derive from synchronizers' replication_interval
    get_tree().set_multiplayer(gn)
 
    # Per property, keyed by the sync property's leaf name. Set before the sync enters
@@ -489,15 +489,18 @@ something false.
    arrives, by the server's send time: no limit until the downlink queues, then a limit just under
    what is arriving, a sharp cut while it still queues and a slow climb while it doesn't. A queue full
    from the first snapshot shows no lag, so before the first limit, lost snapshots count as queueing
-   too. The server applies at least 1000 B/s and emits `peer_rate_changed(peer, rate)` when a client's
-   rate changes, for a game that sizes a peer's cadence by it.
+   too. The server applies at least 1000 B/s.
 
-   A peer can also be served less often than the server ticks (GoldSrc's `cl_updaterate`),
-   without slowing anyone else: the tick still runs at full rate and only skips that peer until
-   its interval has passed. It is dropped with the peer on disconnect, so set it again on
-   reconnect.
+   A client can also ask to be served less often than the server ticks, with its **update rate**
+   (GoldSrc's `cl_updaterate`), without slowing anyone else: the tick still runs at full rate and
+   only skips that peer. The server grants it under its `snapshot_rate`, rounded down to every nth
+   tick, and under what the client's rate can carry: idle snapshots may take at most 30% of it, so
+   a slow link is served at a lower, steady rate rather than choking unevenly. It grants at least
+   10. Each snapshot tells the client what it was granted, which is what to size an
+   interpolation delay by.
    ```gdscript
-   gn.set_peer_snapshot_interval_ms(peer, 50)  # 20 Hz for this peer; 0 = every tick (the default)
+   gn.update_rate = 20               # client, snapshots/sec; 0 = as many as the server sends (the default)
+   gn.update_rate_granted.connect(func(hz: int) -> void: interp_delay = 2.0 / hz)
    ```
 
    By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
@@ -506,8 +509,10 @@ something false.
    end of `SV_Frame`. A timer that isn't locked to the tick drifts against it: some ticks go
    out twice (the second with nothing new) and some never go out on their own, which a
    client sees as uneven gaps. Per-peer intervals and rates still apply.
+   Set `snapshot_rate` to that tick's rate, so goldnet knows what it can grant.
    ```gdscript
    gn.manual_send = true             # goldnet's timer sends nothing
+   gn.snapshot_rate = 60.0           # the rate send_snapshots() is called at
    gn.send_snapshots()               # call once per server tick, after the tick's writes
    ```
 
@@ -613,9 +618,12 @@ something false.
    #         commands_pending, commands_dropped, recv_sim_bytes, recv_sim_packets (what
    #         recv_sim_config let through; count these, not the transport's counters, while it is on)
    # current values:
-   # both:   rate (bytes/sec in force), uplink_lag_ms, uplink_pps (measured by the server)
+   # both:   rate (bytes/sec in force), update_rate (snapshots/sec granted),
+   #         uplink_lag_ms, uplink_pps (measured by the server)
    # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
    ```
+12. Two builds with different wire versions can't talk: each drops the other's packets. `get_protocol_version()`
+   returns the version, for a game's own join handshake to compare and refuse with a reason.
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
@@ -658,7 +666,7 @@ server.on_ack(peer, seq);           // each ack the client sends
 server.remove_peer(peer);           // on disconnect
 ```
 
-Per-peer cadence and rate are `set_peer_interval_ms` and `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`. `CommandReceiver` reads each client's rate (`rate(peer)`) and meters its uplink (`uplink_lag_ms(peer)`, `uplink_pps(peer)`) for `server.set_uplink_report`. `auto_rate.h` has the meters and controllers a client runs to pick its rate and command rate (`DownlinkMeter`, `CmdRateAuto`).
+Per-peer update rate and rate are `set_peer_update_rate` and `set_peer_rate`, granted under `set_snapshot_rate`; anything else you send a peer counts against its rate through `charge()`. `CommandReceiver` reads each client's rate and update rate (`rate(peer)`, `update_rate(peer)`) and meters its uplink (`uplink_lag_ms(peer)`, `uplink_pps(peer)`) for `server.set_uplink_report`. `auto_rate.h` has the meters and controllers a client runs to pick its rate and command rate (`DownlinkMeter`, `CmdRateAuto`).
 
 On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
 for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink
@@ -695,8 +703,6 @@ path; its header shows the calls.
   every run drops different packets and draws different delays — fine for poking at
   self-heal, useless for a regression test you need to re-run or bisect. Also settable as
   the `seed` key of the `sim_config` property.
-- `GOLDNET_RPC_NETCHAN=0` — send this end's RPCs through the inner `SceneMultiplayer` instead of
-  the netchan, to compare the two.
 
 ## License
 

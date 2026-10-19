@@ -6,7 +6,8 @@ extends "res://test_case.gd"
 ##
 ## Without them, both queues fill to the sim's 1000 ms buffer and stay there. With them:
 ##
-##   - the rate settles under the link, and the server hears it (peer_rate_changed)
+##   - the rate settles under the link, and the server hears it
+##   - the update rate the server grants falls with it, under the server's 30 Hz
 ##   - the command rate settles under 60
 ##   - neither link holds a standing queue once they have
 ##
@@ -33,6 +34,7 @@ const WRAP := 100000  # wall ms, folded so a float32 position holds it exactly
 var _t := 0.0
 var _cmds_sent := 0
 var _rate_changes := 0  # server
+var _rate_seen := 0     # server
 var _delay_sum := 0.0
 var _delay_n := 0
 var _report: Variant = null
@@ -50,7 +52,6 @@ static func _since(stamp: int) -> int:
 func setup(is_server: bool) -> void:
 	timeout_s = 45.0
 	if is_server:
-		goldnet().peer_rate_changed.connect(func(_peer: int, _rate: int) -> void: _rate_changes += 1)
 		return
 	goldnet().sim_config = LINK
 	goldnet().recv_sim_config = LINK
@@ -60,6 +61,12 @@ func setup(is_server: bool) -> void:
 
 func server_step(t: float) -> void:
 	_t = t
+	var peers: PackedInt32Array = main.multiplayer.get_peers()
+	if not peers.is_empty():
+		var rate: int = goldnet().get_peer_stats(peers[0])["rate"]
+		if rate != _rate_seen:
+			_rate_seen = rate
+			_rate_changes += 1
 	if not spawn_once(t, ENTITIES):
 		return
 	var ents: Dictionary = main.entities()
@@ -108,6 +115,7 @@ func client_step(t: float) -> void:
 	check(rate > 0 and rate <= LINK["link_bps"], "the rate settled under the link (%d)" % rate)
 	check(_report["changes"] > 0 and _report["rate"] > 0, "the server applied it (%s)" % _report)
 	check(cmd_rate > 0.0 and cmd_rate < CMD_RATE, "the command rate settled under %d (%.1f)" % [CMD_RATE, cmd_rate])
+	check(stats["update_rate"] >= 10 and stats["update_rate"] < 30, "the update rate fell with it (%d)" % stats["update_rate"])
 	check(down < MAX_MEAN_DELAY_MS, "no standing queue on the downlink (mean %.0f ms)" % down)
 	check(_report["up"] < MAX_MEAN_DELAY_MS, "no standing queue on the uplink (mean %.0f ms)" % _report["up"])
 	finish()
