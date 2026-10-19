@@ -134,7 +134,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<StringName, RpcStat> rpc_stats_methods;
 	void _rpc_stats_count(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
 	void _rpc_stats_print(uint64_t p_now);
-	// --- Network-condition simulation (send-side) — see docs/netsim_plan.md ---
+	// --- Network-condition simulation (send-side) ---
 	// Applied at the two send funnels goldnet owns: _rpc (every game @rpc) and the snapshot send in
 	// ServerHost::send. Loss drops a packet; latency and spikes defer it. Configured through
 	// sim_config, or at startup by GOLDNET_LOSS / GOLDNET_SIM_SEED / GOLDNET_LATENCY / GOLDNET_SPIKE /
