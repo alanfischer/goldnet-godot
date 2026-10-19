@@ -1,6 +1,7 @@
 // GoldSrc's netchan (netchan.h) between two ends over a link that can lose and reorder packets: the
 // reliable stream arrives once, in order, and is resent only on an ack that proves it lost; a big
-// message moves one fragment per round trip; the datagram is all-or-nothing and never plays late.
+// message moves in a window of fragments, one per packet; the datagram is all-or-nothing and never
+// plays late.
 
 #include "test_support.h"
 
@@ -30,22 +31,24 @@ struct End {
 	ChannelReceiver in;
 	DatagramSender dg;
 	uint16_t seq = 1;
+	uint32_t now = 1000;
 	Msgs got_rel, got_unrel;
 	int blocks_sent = 0;
+	int fragments_sent = 0;
 
 	std::vector<uint8_t> packet() {
 		const uint16_t s = seq;
 		seq = command_seq_next(seq);
-		std::vector<uint8_t> block;
-		const uint8_t flags = rel.write(s, block);
-		if (flags) {
-			blocks_sent++;
-		}
+		now += 16;
+		std::vector<uint8_t> part;
+		const uint8_t flags = rel.write(s, part);
+		blocks_sent += (flags & CHAN_RELIABLE) ? 1 : 0;
+		fragments_sent += (flags & CHAN_FRAGMENT) ? 1 : 0;
 		std::vector<uint8_t> datagram;
 		dg.take(SAFE_PACKET_BYTES, datagram);
 		Writer w;
 		w.put_u16(s);
-		put_channel(w, in.received(), in.bit(), flags, block, datagram);
+		put_channel(w, in.ack_source().at(now), flags, part, datagram);
 		return std::vector<uint8_t>(w.data(), w.data() + w.size());
 	}
 
@@ -58,8 +61,8 @@ struct End {
 		if (!in.accept(s)) {
 			return;
 		}
-		rel.on_ack(c.ack, c.ack_bit());
-		CHECK(c.take(in, got_rel, got_unrel));
+		rel.on_ack(c.ack);
+		CHECK(c.take(in, now, got_rel, got_unrel));
 	}
 };
 
@@ -170,33 +173,98 @@ static void test_reordered_packets_never_deliver_twice_or_late() {
 	printf("  a late packet's messages never play, and nothing plays twice: ok\n");
 }
 
-static void test_fragments_one_per_round_trip() {
-	Link l;
-	std::vector<uint8_t> big(10000);
+// A link whose packets take p_delay exchanges to arrive, so several are in flight at once.
+struct SlowLink {
+	End a, b;
+	int delay = 6;
+	uint32_t rng = 99;
+	int loss = 0;
+	std::deque<std::pair<int, std::vector<uint8_t>>> ab, ba; // arrival step, packet
+	int t = 0;
+	void step() {
+		t++;
+		std::vector<uint8_t> p = a.packet();
+		if (!(loss > 0 && (int)(xorshift32(rng) % 100) < loss)) {
+			ab.push_back({ t + delay, std::move(p) });
+		}
+		std::vector<uint8_t> q = b.packet();
+		if (!(loss > 0 && (int)(xorshift32(rng) % 100) < loss)) {
+			ba.push_back({ t + delay, std::move(q) });
+		}
+		while (!ab.empty() && ab.front().first <= t) {
+			b.receive(ab.front().second);
+			ab.pop_front();
+		}
+		while (!ba.empty() && ba.front().first <= t) {
+			a.receive(ba.front().second);
+			ba.pop_front();
+		}
+	}
+};
+
+static std::vector<uint8_t> big_message() {
+	std::vector<uint8_t> big(20000);
 	for (size_t i = 0; i < big.size(); i++) {
 		big[i] = (uint8_t)(i * 7);
 	}
-	std::vector<uint8_t> small = msg(5);
+	return big;
+}
+
+static void test_fragments_fill_the_window() {
+	SlowLink l;
+	const std::vector<uint8_t> big = big_message();
+	std::vector<uint8_t> before = msg(4), after = msg(5);
+	l.a.rel.queue(before.data(), before.size());
 	l.a.rel.queue(big.data(), big.size());
-	l.a.rel.queue(small.data(), small.size());
+	l.a.rel.queue(after.data(), after.size());
 	CHECK(!l.a.rel.overflowed()); // a fragmented message doesn't count toward the overflow
-	int exchanges = 0;
-	while (l.b.got_rel.size() < 2 && exchanges < 1000) {
+	int steps = 0;
+	while (l.b.got_rel.size() < 3 && steps < 1000) {
 		l.step();
-		exchanges++;
+		steps++;
 	}
-	CHECK(l.b.got_rel.size() == 2 && l.b.got_rel[0] == big && msg_id(l.b.got_rel[1]) == 5);
-	const int fragments = (10000 + 2 + RELIABLE_BLOCK_BYTES - 1) / RELIABLE_BLOCK_BYTES; // its 2-byte length too
-	CHECK(l.a.blocks_sent == fragments + 1);
-	CHECK(exchanges >= fragments); // one fragment per round trip
+	CHECK(l.b.got_rel.size() == 3 && msg_id(l.b.got_rel[0]) == 4 && l.b.got_rel[1] == big && msg_id(l.b.got_rel[2]) == 5);
+	const int fragments = (20000 + 3 + RELIABLE_BLOCK_BYTES - 1) / RELIABLE_BLOCK_BYTES; // its 3-byte length too
+	CHECK(l.a.fragments_sent == fragments); // none twice on a lossless link
+	// One fragment per packet, not one per round trip (which would be fragments * 2 * delay): the
+	// fragments, plus a round trip each for the block before, the last fragment and the block after.
+	CHECK(steps <= fragments + 6 * l.delay + 3);
+	printf("  a big message fills the window, one fragment per packet, in order: ok (%d fragments, %d steps)\n",
+			fragments, steps);
+}
+
+static void test_fragments_survive_loss_and_reorder() {
+	SlowLink l;
 	l.loss = 25;
-	l.a.rel.queue(big.data(), big.size());
-	while (l.b.got_rel.size() < 3 && exchanges < 5000) {
-		l.step();
-		exchanges++;
+	const std::vector<uint8_t> big = big_message();
+	for (int i = 0; i < 3; i++) {
+		l.a.rel.queue(big.data(), big.size());
+		std::vector<uint8_t> m = msg(i);
+		l.a.rel.queue(m.data(), m.size());
 	}
-	CHECK(l.b.got_rel.size() == 3 && l.b.got_rel[2] == big);
-	printf("  a big message moves one fragment per round trip, and survives loss: ok (%d fragments)\n", fragments);
+	int steps = 0;
+	while ((l.b.got_rel.size() < 6 || !l.a.rel.idle()) && steps < 5000) {
+		l.step();
+		steps++;
+	}
+	CHECK(l.b.got_rel.size() == 6);
+	for (int i = 0; i < 3; i++) {
+		CHECK(l.b.got_rel[2 * i] == big && msg_id(l.b.got_rel[2 * i + 1]) == (uint32_t)i);
+	}
+	CHECK(l.a.rel.idle() && l.a.rel.delivered() == 6);
+	printf("  fragments survive 25%% loss, each message whole and in order: ok (%d steps)\n", steps);
+}
+
+static void test_fragment_ack_goes_quiet() {
+	ChannelReceiver in;
+	std::vector<std::vector<uint8_t>> got;
+	const uint8_t d[] = { 1, 7 };
+	CHECK(!in.ack_source().at(100).fragments); // never had one: says nothing
+	CHECK(in.take_fragment(0, 0, d, 2, 100, got) && got.size() == 1);
+	CHECK(in.ack_source().at(100 + FRAGMENT_ACK_MS - 1).fragments);
+	CHECK(in.ack_source().at(100 + FRAGMENT_ACK_MS - 1).next_fragment == 1);
+	CHECK(!in.ack_source().at(100 + FRAGMENT_ACK_MS).fragments);
+	printf("  the fragment ack goes quiet a while after the last fragment: ok\n");
 }
 
 static void test_overflow() {
@@ -231,7 +299,7 @@ struct UpHost {
 	std::vector<std::string> log;
 	void protocol_mismatch(int32_t) {}
 	void snapshot_ack(int32_t, uint16_t) {}
-	void channel_ack(int32_t, uint16_t, bool) {}
+	void channel_ack(int32_t, const ChannelAck &) {}
 	void command(int32_t, uint32_t, const uint8_t *data, size_t) { log.push_back("c" + std::to_string(data[0])); }
 	void message(int32_t, const uint8_t *data, size_t, bool reliable) {
 		log.push_back((reliable ? "r" : "u") + std::to_string(data[0]));
@@ -246,13 +314,13 @@ static void test_uplink_order() {
 	s.queue_reliable(r.data(), r.size());
 	CHECK(s.due(10));
 	Writer w;
-	s.write(10, 0, 0, false, w);
+	s.write(10, 0, ChannelAckSource(), w);
 	CommandReceiver recv;
 	UpHost h;
-	CHECK(recv.receive(2, w.data(), w.size(), h));
+	CHECK(recv.receive(2, w.data(), w.size(), h, 10));
 	CHECK((h.log == std::vector<std::string>{ "r2", "c1", "u3" }));
-	CHECK(recv.channel_bit(2)); // took the block
-	CHECK(recv.channel_received(2) == 1);
+	CHECK(recv.channel_ack(2).bit); // took the block
+	CHECK(recv.channel_ack(2).received == 1);
 	printf("  uplink: the reliable block, then the commands, then the datagram: ok\n");
 }
 
@@ -262,7 +330,9 @@ int main() {
 	test_one_block_in_flight();
 	test_resent_only_on_proof_of_loss();
 	test_reordered_packets_never_deliver_twice_or_late();
-	test_fragments_one_per_round_trip();
+	test_fragments_fill_the_window();
+	test_fragments_survive_loss_and_reorder();
+	test_fragment_ack_goes_quiet();
 	test_overflow();
 	test_datagram_all_or_nothing();
 	test_uplink_order();

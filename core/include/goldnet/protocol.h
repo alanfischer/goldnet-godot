@@ -56,8 +56,17 @@ static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 2 + 2 +
 
 // Largest reliable block (netchan.h), the GoldSrc fragment size scaled to SAFE_PACKET_BYTES: a block
 // leaves a third of the packet for the datagram and the entities, and a bigger message is cut into
-// fragments of this size, one per round trip.
+// fragments of this size.
 static const int RELIABLE_BLOCK_BYTES = 800;
+
+// Fragments of one message in flight at once (netchan.h). GoldSrc sent one per round trip, which a
+// message the size of a resource list turns into a long join; a window lets the link's rate set the
+// pace instead, while each fragment is still resent only on proof of its loss.
+static const int RELIABLE_FRAGMENT_WINDOW = 32;
+
+// How long after its last fragment arrived an end keeps telling the other which fragment it needs
+// next. Past that it says nothing, and the two bytes stop going in every packet.
+static const uint32_t FRAGMENT_ACK_MS = 1000;
 
 // Pending reliable data past this, not counting messages big enough to fragment, is an overflow:
 // the other end isn't taking it. GoldSrc dropped the client ("reliable channel overflowed").

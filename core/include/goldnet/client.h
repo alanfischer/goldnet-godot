@@ -8,7 +8,7 @@
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
 //   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
-//   void channel_ack(uint16_t received, bool bit)  and what the server took from our uplink
+//   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
 //                                                  (CommandSender::on_channel_ack)
 //   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
 //   void message(const uint8_t *data, size_t size, bool reliable)   one netchan message (netchan.h)
@@ -80,12 +80,12 @@ public:
 		chan_ = ChannelReceiver();
 	}
 
-	// For the uplink: the newest snapshot received, and the bit of the last reliable block taken.
-	uint16_t channel_received() const { return chan_.received(); }
-	bool channel_bit() const { return chan_.bit(); }
+	// For the uplink: what this end has received of the server's channel.
+	const ChannelAckSource &channel_ack() const { return chan_.ack_source(); }
 
+	// p_now: the host's clock, the same one it writes its uplink packets by (see channel_ack).
 	template <class Host>
-	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host);
+	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
 private:
 	// A frame is { net_id -> its slot values, in slot order }.
@@ -113,7 +113,7 @@ private:
 
 template <class V>
 template <class Host>
-typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_size, Host &p_host) {
+typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	ApplyInfo info;
 	Reader r(p_data, p_size);
 
@@ -146,10 +146,10 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
 		return info;
 	}
-	p_host.channel_ack(chan.ack, chan.ack_bit());
+	p_host.channel_ack(chan.ack);
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
-	if (!chan.take(chan_, reliable, unreliable)) {
+	if (!chan.take(chan_, p_now, reliable, unreliable)) {
 		return info;
 	}
 	auto deliver = [&p_host](std::vector<std::vector<uint8_t>> &p_msgs, bool p_reliable) {

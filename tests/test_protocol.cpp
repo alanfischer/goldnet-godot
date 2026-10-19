@@ -104,7 +104,7 @@ struct TestClientHost {
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
 	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
-	void channel_ack(uint16_t received, bool bit) { p->chan_acks.push_back({ received, bit }); }
+	void channel_ack(const ChannelAck &a) { p->chan_acks.push_back({ a.received, a.bit }); }
 	void message(const uint8_t *data, size_t size, bool reliable) {
 		p->messages.push_back({ std::vector<uint8_t>(data, data + size), reliable });
 		p->events.push_back((reliable ? "r" : "u") + std::to_string(data[0]));
@@ -198,12 +198,12 @@ struct Net {
 				}
 				size_t acks_before = p.acks.size();
 				TestClientHost ch{ &p };
-				p.client.apply(pkt.data(), pkt.size(), ch);
+				p.client.apply(pkt.data(), pkt.size(), ch, now);
 				if (!drop_acks.count(p.id)) {
 					for (size_t i = acks_before; i < p.acks.size(); i++) {
 						server.on_ack(p.id, p.acks[i], now);
 					}
-					server.on_channel_ack(p.id, p.client.channel_received(), p.client.channel_bit());
+					server.on_channel_ack(p.id, p.client.channel_ack().at(now));
 				}
 			}
 		}
@@ -328,7 +328,7 @@ static void test_reordered_snapshot_is_dropped() {
 	n.world.ents[10].vals[0] = 2;
 	n.tick();
 	TestClientHost ch{ &p };
-	p.client.apply(old_pkt.data(), old_pkt.size(), ch);
+	p.client.apply(old_pkt.data(), old_pkt.size(), ch, n.now);
 	CHECK(p.vals[100][0] == 2);
 	printf("  reordered snapshot is dropped: ok\n");
 }
@@ -344,7 +344,7 @@ static void test_truncated_packet_not_committed() {
 	std::vector<uint8_t> pkt = n.last_packet(2);
 	size_t acks = p.acks.size();
 	TestClientHost ch{ &p };
-	Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size() - 1, ch);
+	Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size() - 1, ch, n.now);
 	CHECK(!info.committed);
 	CHECK(p.acks.size() == acks);
 	printf("  truncated packet is not committed or acked: ok\n");
@@ -354,8 +354,8 @@ static void test_protocol_mismatch_warns_once() {
 	Peer p;
 	uint8_t bad[] = { (uint8_t)(SNAPSHOT_VERSION + 1), 0, 0, 0, 0 };
 	TestClientHost ch{ &p };
-	p.client.apply(bad, sizeof(bad), ch);
-	p.client.apply(bad, sizeof(bad), ch);
+	p.client.apply(bad, sizeof(bad), ch, 0);
+	p.client.apply(bad, sizeof(bad), ch, 0);
 	CHECK(p.mismatches == 1);
 	CHECK(p.acks.empty());
 	printf("  protocol mismatch warns once: ok\n");
@@ -795,7 +795,7 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.world.ents[10].vals[0] = 11;
 	n.tick();
 	TestClientHost ch{ &p };
-	p.client.apply(late.data(), late.size(), ch);
+	p.client.apply(late.data(), late.size(), ch, n.now);
 	s = p.client.pop_arrival_stats();
 	CHECK(s.received == 2);
 	CHECK(s.lost == 0);

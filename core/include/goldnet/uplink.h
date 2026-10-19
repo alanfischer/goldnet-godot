@@ -37,7 +37,7 @@
 // The host passed to CommandReceiver::receive() provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
 //   void snapshot_ack(int32_t peer, uint16_t seq)   pass to Server::on_ack
-//   void channel_ack(int32_t peer, uint16_t received, bool bit)   pass to Server::on_channel_ack
+//   void channel_ack(int32_t peer, const ChannelAck &ack)   pass to Server::on_channel_ack
 //   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
@@ -155,8 +155,8 @@ public:
 	bool overflowed() const { return rel_.overflowed(); }
 	uint64_t reliable_queued() const { return rel_.queued(); }
 	uint64_t reliable_delivered() const { return rel_.delivered(); }
-	// From a snapshot header: the newest uplink packet the server received, and the bit of the last block.
-	void on_channel_ack(uint16_t p_received, bool p_bit) { rel_.on_ack(p_received, p_bit); }
+	// From a snapshot header: what the server has received of this channel.
+	void on_channel_ack(const ChannelAck &p_ack) { rel_.on_ack(p_ack); }
 
 	// Whether a packet should go now: a command not sent yet, or one overdue, or a message, and the
 	// interval is up.
@@ -178,15 +178,17 @@ public:
 	// How long ago the last command was pushed, so a host can tell an active stream from an idle one.
 	uint32_t idle_ms(uint32_t p_now) const { return pushed_ ? p_now - last_push_ms_ : 0xFFFFFFFFu; }
 
-	// Build the next uplink packet, carrying p_snapshot_ack, the channel's ack (p_received, the newest
-	// snapshot received, and p_bit, the bit of the last block taken), and whatever is due.
-	void write(uint32_t p_now, uint16_t p_snapshot_ack, uint16_t p_received, bool p_bit, Writer &r_out) {
+	// Build the next uplink packet, carrying p_snapshot_ack, what this end has received of the server's
+	// channel (Client::channel_ack), and whatever is due.
+	void write(uint32_t p_now, uint16_t p_snapshot_ack, const ChannelAckSource &p_received, Writer &r_out) {
 		const uint16_t seq = seq_;
 		seq_ = command_seq_next(seq_);
+		const ChannelAck ack = p_received.at(p_now);
 		std::vector<uint8_t> block;
 		const uint8_t block_flags = rel_.write(seq, block);
+		const int channel_bytes = (int)block.size() + (ack.fragments ? 2 : 0);
 		std::vector<uint8_t> datagram;
-		dgram_.take(SAFE_PACKET_BYTES - 16 - (block_flags ? 2 + (int)block.size() : 0), datagram);
+		dgram_.take(SAFE_PACKET_BYTES - 16 - channel_bytes, datagram);
 
 		const size_t size = ring_.size();
 		size_t first_new = size;
@@ -210,8 +212,7 @@ public:
 			picks.push_back(i);
 		}
 
-		const int budget = SAFE_PACKET_BYTES - 16 - 4 * (int)streams.size() - (int)datagram.size()
-				- (block_flags ? 2 + (int)block.size() : 0);
+		const int budget = SAFE_PACKET_BYTES - 16 - 4 * (int)streams.size() - (int)datagram.size() - channel_bytes;
 		Writer body;
 		std::vector<const std::vector<uint8_t> *> prev(streams.size(), nullptr);
 		std::vector<size_t> sent;
@@ -241,7 +242,7 @@ public:
 		r_out.put_u8(SNAPSHOT_VERSION);
 		r_out.put_u16(seq);
 		r_out.put_u16(p_snapshot_ack);
-		put_channel(r_out, p_received, p_bit, block_flags, block, datagram);
+		put_channel(r_out, ack, block_flags, block, datagram);
 		r_out.put_u16(ring_.empty() ? next_seq_ : ring_.front().seq);
 		r_out.put_u8((uint8_t)streams.size());
 		for (uint32_t s : streams) {
@@ -309,9 +310,10 @@ private:
 // The server end: one sequence per peer, delivered in order.
 class CommandReceiver {
 public:
-	// One uplink packet from p_peer. False if it was malformed or from a mismatched build.
+	// One uplink packet from p_peer. False if it was malformed or from a mismatched build. p_now: the
+	// host's clock, the one it writes its snapshots by.
 	template <class Host>
-	bool receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host);
+	bool receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
 	// The newest command from p_peer delivered with none missing before it. 0 = none yet.
 	uint16_t ack(int32_t p_peer) const {
@@ -319,14 +321,10 @@ public:
 		return it == peers_.end() || !it->second.delivered ? 0 : command_seq_prev(it->second.next);
 	}
 
-	// What the server took from p_peer's channel, for Server::set_uplink_ack.
-	uint16_t channel_received(int32_t p_peer) const {
+	// What the server has received of p_peer's channel, for Server::set_uplink_ack.
+	ChannelAckSource channel_ack(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
-		return it == peers_.end() ? 0 : it->second.chan.received();
-	}
-	bool channel_bit(int32_t p_peer) const {
-		auto it = peers_.find(p_peer);
-		return it != peers_.end() && it->second.chan.bit();
+		return it == peers_.end() ? ChannelAckSource() : it->second.chan.ack_source();
 	}
 
 	// Commands p_peer gave up on before they arrived.
@@ -357,7 +355,7 @@ private:
 };
 
 template <class Host>
-bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host) {
+bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	Reader r(p_data, p_size);
 	const uint8_t version = r.get_u8();
 	if (r.failed()) {
@@ -415,8 +413,8 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
 	if (p.chan.accept(packet_seq)) {
-		p_host.channel_ack(p_peer, chan.ack, chan.ack_bit());
-		if (!chan.take(p.chan, reliable, unreliable)) {
+		p_host.channel_ack(p_peer, chan.ack);
+		if (!chan.take(p.chan, p_now, reliable, unreliable)) {
 			return false;
 		}
 	}

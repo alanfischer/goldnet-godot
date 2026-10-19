@@ -214,7 +214,7 @@ struct ServerApp {
 	// The host interface CommandReceiver::receive() calls back into.
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
 	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq, now_ms()); }
-	void channel_ack(int32_t peer, uint16_t received, bool bit) { server.on_channel_ack(peer, received, bit); }
+	void channel_ack(int32_t peer, const ChannelAck &ack) { server.on_channel_ack(peer, ack); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
 	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
 		PeerInfo &p = peers[peer];
@@ -295,9 +295,9 @@ struct ServerApp {
 				printf("[server] peer %d joined from %s\n", id, key.c_str());
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
-				commands.receive(it->second, buf + 1, (size_t)n - 1, *this);
+				commands.receive(it->second, buf + 1, (size_t)n - 1, *this, now_ms());
 				server.set_command_ack(it->second, commands.ack(it->second));
-				server.set_uplink_ack(it->second, commands.channel_received(it->second), commands.channel_bit(it->second));
+				server.set_uplink_ack(it->second, commands.channel_ack(it->second));
 			}
 			len = sizeof(from);
 		}
@@ -397,7 +397,7 @@ struct ClientApp {
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
 	void command_ack(uint16_t seq) { commands.on_ack(seq, now_ms()); }
-	void channel_ack(uint16_t received, bool bit) { commands.on_channel_ack(received, bit); }
+	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack); }
 	void message(const uint8_t *, size_t, bool) {}
 	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
@@ -438,7 +438,7 @@ struct ClientApp {
 		}
 		Writer w;
 		w.put_u8('U');
-		commands.write(now, snapshot_ack, client.channel_received(), client.channel_bit(), w);
+		commands.write(now, snapshot_ack, client.channel_ack(), w);
 		if (sim.loss_roll()) {
 			return;
 		}
@@ -543,7 +543,7 @@ struct ClientApp {
 				last_heard = now_ms();
 				snapshots++;
 				bytes_in += (size_t)n;
-				if (client.apply(buf, (size_t)n, *this).committed) {
+				if (client.apply(buf, (size_t)n, *this, now_ms()).committed) {
 					committed++;
 				}
 			}

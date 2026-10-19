@@ -81,8 +81,8 @@ reliable RPC it was declared as. See **Usage** and [`docs/protocol.md`](docs/pro
 packets too, the way GoldSrc's user messages rode its netchan: a reliable RPC in the packet's
 reliable block, an unreliable one in its datagram, in both directions. One reliable block is in
 flight at a time and goes again only when an ack proves it lost; a call bigger than a block moves
-in fragments, one per round trip; the datagram goes whole or not at all, and never plays after a
-newer packet's. So state and events share one ordered stream: a death RPC can't be overtaken by
+in fragments, up to 32 in flight, one per packet (GoldSrc sent one per round trip); the datagram
+goes whole or not at all, and never plays after a newer packet's. So state and events share one ordered stream: a death RPC can't be overtaken by
 the snapshot that hides the body, and the peer's rate counts every byte. `call_local` and
 `get_remote_sender_id()` behave as with the inner. What stays on the inner: a client's call to
 another client, an unreliable call bigger than 512 bytes, and any method a node lists in its

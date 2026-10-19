@@ -1357,7 +1357,7 @@ struct GoldNetMultiplayer::ClientHost {
 
 	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq, (uint32_t)Time::get_singleton()->get_ticks_msec()); }
 
-	void channel_ack(uint16_t received, bool bit) { gn->commands_out.on_channel_ack(received, bit); }
+	void channel_ack(const goldnet::ChannelAck &ack) { gn->commands_out.on_channel_ack(ack); }
 
 	void message(const uint8_t *data, size_t size, bool) { gn->_deliver_message(1, data, size); }
 
@@ -1432,7 +1432,8 @@ struct GoldNetMultiplayer::ClientHost {
 
 void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	ClientHost host{ this };
-	goldnet::Client<Variant>::ApplyInfo info = client.apply(p_bytes.ptr(), (size_t)p_bytes.size(), host);
+	goldnet::Client<Variant>::ApplyInfo info = client.apply(p_bytes.ptr(), (size_t)p_bytes.size(), host,
+			(uint32_t)Time::get_singleton()->get_ticks_msec());
 	if (dbg && info.committed) {
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (now - dbg_last_ms > 2000) {
@@ -1459,7 +1460,7 @@ struct GoldNetMultiplayer::UplinkHost {
 	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
 		gn->_deliver_command(peer, stream, data, size);
 	}
-	void channel_ack(int32_t peer, uint16_t received, bool bit) { gn->server.on_channel_ack(peer, received, bit); }
+	void channel_ack(int32_t peer, const goldnet::ChannelAck &ack) { gn->server.on_channel_ack(peer, ack); }
 	void message(int32_t peer, const uint8_t *data, size_t size, bool) { gn->_deliver_message(peer, data, size); }
 };
 
@@ -1468,9 +1469,9 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 		return;
 	}
 	UplinkHost host{ this };
-	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host);
+	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
 	server.set_command_ack(p_peer, commands_in.ack(p_peer));
-	server.set_uplink_ack(p_peer, commands_in.channel_received(p_peer), commands_in.channel_bit(p_peer));
+	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
@@ -1824,7 +1825,7 @@ void GoldNetMultiplayer::_send_uplink() {
 		return;
 	}
 	goldnet::Writer w;
-	commands_out.write(now, snapshot_ack, client.channel_received(), client.channel_bit(), w);
+	commands_out.write(now, snapshot_ack, client.channel_ack(), w);
 	snapshot_ack_new = false;
 	if (sim.loss_percent() > 0 && sim.loss_roll()) {
 		return; // simulated drop

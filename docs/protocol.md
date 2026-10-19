@@ -135,22 +135,35 @@ GoldSrc's netchan: both packets, the snapshot and the uplink packet, carry a **r
 u16  ack            the newest packet received from the other end (its seq), committed or not
 u8   flags          bit 0: a reliable block follows
                     bit 1: that block's alternating bit
-                    bit 2: the block is a fragment of a message
-                    bit 3: the last fragment
+                    bit 2: a fragment follows
+                    bit 3: next_fragment follows
                     bit 4: the bit of the last block this end took from the other
+u16  next_fragment  only with bit 3: the fragment this end needs next
 u16  block_len      only with bit 0, then block_len bytes
+u16  fragment       only with bit 2: its number, then u16 remaining (how many more of its message
+                    follow it), u16 len and len bytes
 u16  datagram_len   then datagram_len bytes
 ```
 
-A block (its fragments joined) and a datagram are each a run of messages: `uvarint len`, then
-`len` bytes.
+A block, a message's fragments joined, and a datagram are each a run of messages: `uvarint len`,
+then `len` bytes.
 
 **Reliable.** One block is in flight at a time. A new one starts only once the other end's ack
 bit equals the in-flight block's bit, and flips the bit; messages queued meanwhile wait. Each block
-holds as many whole messages as fit in `RELIABLE_BLOCK_BYTES` = 800. A message too big for that
-goes alone, cut into fragments of that size, one block each. A block goes again when an ack names a
-packet newer than the one that last carried it and the bit hasn't flipped: the other end received
-something later and not the block. There is no timer: a block that arrived is never sent twice.
+holds as many whole messages as fit in `RELIABLE_BLOCK_BYTES` = 800. A block goes again when an ack
+names a packet newer than the one that last carried it and the bit hasn't flipped: the other end
+received something later and not the block. There is no timer: a block that arrived is never sent
+twice.
+
+**Fragments.** A message too big for a block is cut into fragments of that size, numbered on from
+the last message's (a `u16` that wraps), and takes the block's turn: nothing else reliable goes
+until the other end has all of it, and it waits for the block before it. GoldSrc sent one fragment
+per round trip; here up to `RELIABLE_FRAGMENT_WINDOW` = 32 are in flight, one per packet, so the
+link's rate sets the pace. The receiver joins them in order, holding any past a missing one, and
+says which it needs next in every packet it sends for `FRAGMENT_ACK_MS` = 1000 after the last one
+arrived. The sender drops the fragments before that number, and sends the one at it again when an
+ack names a packet newer than the one that carried it: the block's rule, applied to the first
+fragment missing.
 Pending data past `RELIABLE_OVERFLOW_BYTES` = 64 KB, not counting messages big enough to fragment,
 is an overflow, and the sender drops the other end, as GoldSrc did ("reliable channel overflowed").
 

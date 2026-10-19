@@ -272,20 +272,16 @@ public:
 		auto it = rings_.find(p_peer);
 		return it == rings_.end() ? 0 : it->second.dgram.dropped();
 	}
-	// From the peer's uplink: the newest snapshot it received, and the bit of the last block it took.
-	void on_channel_ack(int32_t p_peer, uint16_t p_received, bool p_bit) {
+	// From the peer's uplink: what it has received of the server's channel.
+	void on_channel_ack(int32_t p_peer, const ChannelAck &p_ack) {
 		auto it = rings_.find(p_peer);
 		if (it != rings_.end()) {
-			it->second.rel.on_ack(p_received, p_bit);
+			it->second.rel.on_ack(p_ack);
 		}
 	}
-	// What the server took from the peer's uplink, for its next header: the newest uplink packet and the
-	// bit of the last block. A new bit earns a snapshot of its own, as it is what lets the peer send on.
-	void set_uplink_ack(int32_t p_peer, uint16_t p_received, bool p_bit) {
-		PeerRing &pr = rings_[p_peer];
-		pr.chan_ack = p_received;
-		pr.chan_ack_bit = p_bit;
-	}
+	// What the server has received of the peer's channel (CommandReceiver::channel_ack), for its next
+	// header. A new block bit or fragment earns a snapshot of its own: it is what lets the peer send on.
+	void set_uplink_ack(int32_t p_peer, const ChannelAckSource &p_src) { rings_[p_peer].uplink = p_src; }
 
 	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
 	uint32_t chokes(int32_t p_peer) const {
@@ -425,9 +421,8 @@ private:
 		uint32_t chokes = 0;
 		ReliableSender rel;
 		DatagramSender dgram;
-		uint16_t chan_ack = 0;          // see set_uplink_ack
-		bool chan_ack_bit = false;
-		bool chan_ack_bit_sent = false; // what the last snapshot told the peer
+		ChannelAckSource uplink; // see set_uplink_ack
+		ChannelAck uplink_sent;  // what the last snapshot told the peer
 	};
 
 	struct Candidate {
@@ -542,6 +537,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// goes, since it makes the snapshot non-empty.
 		std::vector<uint8_t> block;
 		const uint8_t block_flags = pr.rel.write(seq, block);
+		const ChannelAck up = pr.uplink.at(p_now);
 
 		// Spawns owed to this peer, reliable-until-acked.
 		Writer spawn_body;
@@ -704,9 +700,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// server's cadence for an unthrottled peer, which sends every tick).
 		int peer_budget = SAFE_PACKET_BYTES - SNAPSHOT_HEADER_BYTES - (int)spawn_body.size()
 				- (int)despawn_body.size() - (int)leave_body.size();
-		if (block_flags) {
-			peer_budget -= 2 + (int)block.size();
-		}
+		peer_budget -= (int)block.size() + (up.fragments ? 2 : 0);
 		// Then the datagram, all of it or none, and the entities get the rest.
 		std::vector<uint8_t> datagram;
 		pr.dgram.take(peer_budget, datagram);
@@ -756,13 +750,14 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// unless something went in the packet, so the next snapshot reuses it.
 		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
 		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
-				&& block_flags == 0 && datagram.empty() && pr.chan_ack_bit == pr.chan_ack_bit_sent
+				&& block_flags == 0 && datagram.empty() && up.bit == pr.uplink_sent.bit
+				&& (!up.fragments || up.next_fragment == pr.uplink_sent.next_fragment)
 				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
 		pr.last_packet_ms = p_now;
 		pr.cmd_ack_sent = pr.cmd_ack;
-		pr.chan_ack_bit_sent = pr.chan_ack_bit;
+		pr.uplink_sent = up;
 		pr.next_seq++;
 		if (pr.next_seq == 0) {
 			pr.next_seq = 1; // 0 is reserved for "no baseline"
@@ -780,7 +775,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);
 		packet.put_u16(pr.cmd_ack);
-		put_channel(packet, pr.chan_ack, pr.chan_ack_bit, block_flags, block, datagram);
+		put_channel(packet, up, block_flags, block, datagram);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);
 		packet.put_u16(despawn_ct);
