@@ -72,7 +72,7 @@ func client_step(t: float) -> void:
 			b.encode_u16(0, _sent)
 			main._case_raw.rpc_id(1, b)
 		_sent += 1
-	_max_pending = maxi(_max_pending, goldnet().get_command_stats()["pending"])
+	_max_pending = maxi(_max_pending, goldnet().get_peer_stats(1)["commands_pending"])
 	if at(t, ASK_AT, "ask"):
 		main._case_ask.rpc_id(1)
 	if _report != null:
@@ -84,11 +84,11 @@ func client_step(t: float) -> void:
 				in_order = false
 				break
 		check(in_order, "commands arrived in the order they were made")
-		var stats: Dictionary = goldnet().get_command_stats()
+		var stats: Dictionary = goldnet().get_peer_stats(1)
 		check(_max_pending > 10, "goldnet carried them: up to %d unacked at once" % _max_pending)
-		check_eq(stats["pending"], 0, "all acked by the end")
-		check_eq(stats["dropped"], 0, "none given up on")
-		check(stats["rtt_ms"] >= 50, "the command round trip includes both legs (%d ms)" % stats["rtt_ms"])
+		check_eq(stats["commands_pending"], 0, "all acked by the end")
+		check_eq(stats["commands_dropped"], 0, "none given up on")
+		check(stats["command_rtt_ms"] >= 50, "the command round trip includes both legs (%d ms)" % stats["command_rtt_ms"])
 		finish()
 
 

@@ -8,6 +8,8 @@
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
 //   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
+//   void uplink_report(uint32_t lag_ms, uint32_t pps)   and the server's measure of our uplink
+//                                                  (CmdRateAuto)
 //   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
 //                                                  (CommandSender::on_channel_ack)
 //   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
@@ -52,18 +54,14 @@ public:
 		bool committed = false;
 	};
 
-	// Snapshots that arrived, and seqs skipped on the way to them, since the last call. The server
+	// Snapshots that arrived, and seqs skipped on the way to them, this session. The server
 	// spends a seq only on a snapshot it sends, so a skipped one was lost (or is late, and is taken
 	// back off when it lands). Counted before any check that could still drop the snapshot.
 	struct ArrivalStats {
 		uint32_t received = 0;
 		uint32_t lost = 0;
 	};
-	ArrivalStats pop_arrival_stats() {
-		ArrivalStats s = arrivals_;
-		arrivals_ = ArrivalStats();
-		return s;
-	}
+	const ArrivalStats &arrival_stats() const { return arrivals_; }
 
 	// A fresh session: old baselines are meaningless.
 	void reset() {
@@ -131,6 +129,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const uint16_t base_seq = r.get_u16();
 	const uint32_t server_time = r.get_u32();
 	const uint16_t command_ack = r.get_u16();
+	const uint32_t uplink_lag_ms = get_uvarint(&r);
+	const uint32_t uplink_pps = get_uvarint(&r);
 	ChannelPart chan;
 	chan.read(r);
 	info.seq = seq;
@@ -165,6 +165,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
 	p_host.server_time(server_time);
 	p_host.command_ack(command_ack);
+	p_host.uplink_report(uplink_lag_ms, uplink_pps);
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means full state. If
 	// the server diffed against a frame we no longer hold, we can't reconstruct unchanged fields —

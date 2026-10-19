@@ -201,10 +201,10 @@ static void test_repeated_bytes_cost_their_changes() {
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
 	s.write(10, 0, ChannelAckSource(), w);
-	// Header 20 (incl. an empty channel part, one stream and first_seq), then the first command against
-	// zeros: len 1, mask 4, 32 bytes. Then an identical one: gap 1, len 1, mask 4. Then one changed
-	// byte: gap, len, mask, 1.
-	CHECK(w.size() == 20 + 37 + 6 + 7);
+	// Header 23 (incl. the send time, a zero rate, an empty channel part, one stream and first_seq),
+	// then the first command against zeros: len 1, mask 4, 32 bytes. Then an identical one: gap 1,
+	// len 1, mask 4. Then one changed byte: gap, len, mask, 1.
+	CHECK(w.size() == 23 + 37 + 6 + 7);
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h, 0));
@@ -288,7 +288,7 @@ static void test_rtt_is_learned_past_the_first_overdue() {
 		Writer w;
 		s.write(now, 0, ChannelAckSource(), w);
 		if (i >= 150) {
-			late_cmds += w.data()[17]; // cmd_ct, after an empty channel part and one stream id
+			late_cmds += w.data()[20]; // cmd_ct, after the send time, a zero rate, an empty channel part and one stream id
 		}
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > 10) {
@@ -322,7 +322,7 @@ static void test_rtt_longer_than_the_ring_is_learned() {
 		Writer w;
 		s.write(now, 0, ChannelAckSource(), w);
 		if (i >= 350) {
-			late_cmds += w.data()[17]; // cmd_ct, after an empty channel part and one stream id
+			late_cmds += w.data()[20]; // cmd_ct, after the send time, a zero rate, an empty channel part and one stream id
 		}
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > trip) {
@@ -411,6 +411,46 @@ static void test_a_repeat_earns_the_ack_again() {
 	printf("  a repeated command earns the ack again: ok\n");
 }
 
+// The rate rides every packet, rounded up to 100 B/s; 0 is no limit.
+static void test_rate_rides_along() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	Writer w;
+	s.write(10, 0, ChannelAckSource(), w);
+	CHECK(r.receive(2, w.data(), w.size(), h, 10));
+	CHECK(r.rate(2) == 0);
+	s.set_rate(2750);
+	Writer w2;
+	s.write(26, 0, ChannelAckSource(), w2);
+	CHECK(r.receive(2, w2.data(), w2.size(), h, 26));
+	CHECK(r.rate(2) == 2800);
+	printf("  the rate rides every packet: ok\n");
+}
+
+// The server meters the uplink from each packet's 16-bit send time: a steady trip reads as no lag, a
+// queue building on the way as its extra wait, across the stamp's wrap.
+static void test_uplink_lag_is_metered_across_the_wrap() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	uint32_t now = 65536 - 500; // the client's clock wraps 16 bits half a second in
+	for (int i = 0; i < 120; i++, now += 16) {
+		Writer w;
+		s.write(now, 0, ChannelAckSource(), w);
+		CHECK(r.receive(2, w.data(), w.size(), h, now + 1000040)); // another clock, a 40 ms trip
+	}
+	CHECK(r.uplink_lag_ms(2) <= 1);
+	CHECK(r.uplink_pps(2) >= 60 && r.uplink_pps(2) <= 64);
+	for (int k = 0; k < 60; k++, now += 16) {
+		Writer w;
+		s.write(now, 0, ChannelAckSource(), w);
+		CHECK(r.receive(2, w.data(), w.size(), h, now + 1000040 + 5 * k));
+	}
+	CHECK(r.uplink_lag_ms(2) >= 290 && r.uplink_lag_ms(2) <= 300);
+	printf("  the uplink's queue is metered from send times, across the wrap (%u ms): ok\n", r.uplink_lag_ms(2));
+}
+
 int main() {
 	printf("uplink:\n");
 	test_lossless_delivers_each_once_in_order();
@@ -429,6 +469,8 @@ int main() {
 	test_interval_paces_packets();
 	test_proven_lost_command_goes_at_once();
 	test_a_repeat_earns_the_ack_again();
+	test_rate_rides_along();
+	test_uplink_lag_is_metered_across_the_wrap();
 	printf("uplink: %d checks passed\n", checks);
 	return 0;
 }

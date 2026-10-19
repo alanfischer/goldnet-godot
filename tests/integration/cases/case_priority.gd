@@ -1,5 +1,5 @@
 extends "res://test_case.gd"
-## Priority-ordered overflow (`gn_priority`) and the per-peer bandwidth budget.
+## Priority-ordered overflow (`gn_priority`) against the packet budget.
 ##
 ## When more entities change than the budget covers, `_server_tick` sorts the candidates by
 ## (ticks waited) x (gn_priority) and writes the highest first, so a game can say "the
@@ -14,10 +14,9 @@ extends "res://test_case.gd"
 ##      is the half a naive "sort by priority" implementation gets wrong, and it fails
 ##      silently: the game looks fine until the one entity you didn't look at is frozen.
 ##
-## Budget pressure is created rather than waited for: `bandwidth_bps` is set low enough that
-## only ~3 entities fit per snapshot, so 21 entities changing every frame overflow it
-## permanently. That also exercises the rate budget itself, including that a tight one
-## still makes forward progress instead of stalling the stream.
+## Budget pressure is created rather than waited for: each entity also replicates a
+## BLOB_BYTES payload that changes every frame, so only ~3 fit in a packet and 21 of them
+## overflow it permanently.
 ##
 ## Timeline (server drives state, client asserts):
 ##
@@ -36,8 +35,8 @@ extends "res://test_case.gd"
 const FILLERS := 20
 const PRIORITY := 50.0
 
-## ~39 B of entity body per snapshot at a 33 ms tick — room for about three entities.
-const BANDWIDTH_BPS := 1200
+## Big enough that a packet holds about three entities.
+const BLOB_BYTES := 300
 
 const COUNT_FROM := 3.0
 const COUNT_TO := 7.0
@@ -55,19 +54,31 @@ var _counts := {}  # entity name -> distinct values observed in the counting win
 var _primed := false
 
 
+class Heavy extends Node3D:
+	var blob := PackedByteArray()
+
+
 func make_entity(data: Variant) -> Node:
-	var n: Node = super.make_entity(data)
+	var n := Heavy.new()
+	n.name = "Ent%d" % int(data)
+	var cfg := SceneReplicationConfig.new()
+	for path in [^".:position", ^".:blob"]:
+		cfg.add_property(path)
+		cfg.property_set_sync(path, true)
+	var sync := MultiplayerSynchronizer.new()
+	sync.name = "Sync"
+	sync.replication_config = cfg
+	sync.replication_interval = 1.0 / 30.0
+	sync.set_visibility_public(public_visibility)
+	n.add_child(sync)
 	if int(data) == 0:
 		# Read once, on this entity's first tick — set it before the sync enters the tree.
 		n.get_node("Sync").set_meta("gn_priority", PRIORITY)
 	return n
 
 
-func setup(is_server: bool) -> void:
+func setup(_is_server: bool) -> void:
 	timeout_s = 20.0
-	if is_server:
-		# Squeeze the entity-delta body so overflow is the steady state, not a rare burst.
-		goldnet().set_bandwidth_bps(BANDWIDTH_BPS)
 
 
 func server_step(t: float) -> void:
@@ -76,10 +87,14 @@ func server_step(t: float) -> void:
 	var ents: Dictionary = main.entities()
 	# Everything changes every frame, so the budget is always oversubscribed and the sort
 	# is always deciding who gets through.
+	var blob := PackedByteArray()
+	blob.resize(BLOB_BYTES)
+	blob.encode_u32(0, Engine.get_process_frames())
 	for i in FILLERS + 1:
 		var e: Node3D = ents.get("Ent%d" % i)
 		if e != null:
 			e.position = Vector3(float(i) + 1.0, 0.0, t * 10.0)
+			e.blob = blob
 
 
 func client_step(t: float) -> void:

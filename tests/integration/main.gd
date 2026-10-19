@@ -88,9 +88,6 @@ func _ready() -> void:
 
 	CommandStream.mark(self, &"_case_command")
 	CommandStream.mark(self, &"_case_raw")
-	# The harness's own ask and report stay on the inner: recv_sim times them as ENet's reliable
-	# traffic, which a receive sim's loss doesn't drop. case_messages covers the netchan.
-	set_meta(&"gn_bypass", [&"_case_ask", &"_case_report"])
 
 	print("[%s] case=%s ready on udp:%d" % ["server" if _is_server else "client", _case_name, PORT])
 
@@ -149,14 +146,16 @@ func _case_raw(bytes: PackedByteArray) -> void:
 	_case.on_command(multiplayer.get_remote_sender_id(), [bytes])
 
 
-## Client → server: ask the case for its report.
-@rpc("any_peer", "call_remote", "reliable")
+## Client → server: ask the case for its report. The ask and the report are on channel 1, which
+## keeps them on the inner: recv_sim times them as ENet's reliable traffic, which a receive sim's
+## loss doesn't drop. case_messages covers the netchan.
+@rpc("any_peer", "call_remote", "reliable", 1)
 func _case_ask() -> void:
 	_case_report.rpc_id(multiplayer.get_remote_sender_id(), _case.report())
 
 
 ## Server → client, for a case to send back what it saw.
-@rpc("authority", "call_remote", "reliable")
+@rpc("authority", "call_remote", "reliable", 1)
 func _case_report(data: Variant) -> void:
 	_case.on_report(data)
 
@@ -194,6 +193,12 @@ func _case_msg_up(n: int, x: float) -> void:
 @rpc("any_peer", "call_remote", "unreliable")
 func _case_msg_up_unrel(n: int) -> void:
 	_case.on_message(multiplayer.get_remote_sender_id(), "up_unrel", [n])
+
+
+## On channel 1, so off the netchan.
+@rpc("authority", "call_remote", "reliable", 1)
+func _case_msg_side(n: int) -> void:
+	_case.on_message(multiplayer.get_remote_sender_id(), "side", [n])
 
 
 ## The replicated entities this peer currently has, by name.

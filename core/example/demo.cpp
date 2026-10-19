@@ -314,7 +314,6 @@ struct ServerApp {
 
 	int run(uint16_t port) {
 		fd = open_socket(port);
-		server.set_tick_interval_ms(TICK_MS);
 		server.set_packet_overhead(28); // IPv4 + UDP headers
 		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID);
 		printf("[server] listening on udp %d (loss %d%%, latency %d ms, rate %u B/s)\n", port,
@@ -397,6 +396,7 @@ struct ClientApp {
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
 	void command_ack(uint16_t seq) { commands.on_ack(seq); }
+	void uplink_report(uint32_t, uint32_t) {}
 	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack, now_ms()); }
 	void message(const uint8_t *, size_t, bool) {}
 	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet

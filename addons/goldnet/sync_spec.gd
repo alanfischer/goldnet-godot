@@ -8,7 +8,7 @@ extends RefCounted
 ##
 ## Why it exists: goldnet's per-slot hints ride node metas (`gn_quant`, `gn_push`, `gn_priority`)
 ## keyed by a property's LEAF name, because SceneReplicationConfig has nowhere to put per-property
-## metadata (see README, "What we wish Godot had" #5). Written by hand those metas are a second
+## metadata (see README, "What we wish Godot had" #4). Written by hand those metas are a second
 ## list to keep aligned with the config, and the failure is quiet in both directions: a name that
 ## matches no slot is ignored, so the hint simply never applies. Deriving both from one table
 ## removes the alignment problem rather than documenting it.
@@ -36,8 +36,8 @@ extends RefCounted
 ##
 ## For a synchronizer BAKED into a .tscn, the scene owns the config, so declare the same table and
 ## call apply() instead. (Baking is not a transport requirement: goldnet pairs a runtime-built sync
-## by scene path, and stock pairs one too — measured on 4.7, see the README's retracted gap #4.) It stamps the metas
-## and reports any drift between the table and the config the scene actually shipped:
+## by scene path, and stock pairs one too, measured on 4.7.) It stamps the metas and reports
+## any drift between the table and the config the scene actually shipped:
 ##
 ##   SyncSpec.apply($NetSync, SPEC)
 ##

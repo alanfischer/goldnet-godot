@@ -21,10 +21,16 @@
 // queue_unreliable put the host's other messages in it, delivered to the server's host ahead of the
 // commands (reliable) and after them (datagram), as GoldSrc ran a string command before a move.
 //
+// Each packet also carries its send time and the client's rate (GoldSrc `rate`). The server meters
+// the uplink from the send times (auto_rate.h) and reports it back in the snapshot header, where the
+// client's CmdRateAuto reads it.
+//
 // Uplink packet:
 //   u8   version          SNAPSHOT_VERSION
 //   u16  seq              this packet's, counting up from 1 and skipping 0 like a snapshot's
 //   u16  snapshot_ack     the newest snapshot the client committed; 0 = none
+//   u16  send_time        the client's clock at send, ms, low 16 bits
+//   uvarint rate          the rate the client asks for, in units of 100 bytes/sec; 0 = no limit
 //   ...  channel part     (netchan.h) its ack is the newest snapshot received, committed or not
 //   u16  floor            the oldest command the client still holds; its next seq if it holds none
 //   u8   stream_ct        then stream_ct × u32 stream_id
@@ -41,6 +47,7 @@
 //   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
+#include "goldnet/auto_rate.h"
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
 #include "goldnet/netchan.h"
@@ -129,6 +136,9 @@ public:
 	void set_interval_ms(uint32_t p_ms) { interval_ms_ = p_ms; }
 	uint32_t interval_ms() const { return interval_ms_; }
 	void set_backup(int p_backup) { backup_ = p_backup < 0 ? 0 : p_backup; }
+	// The rate this client asks the server for, in bytes/sec (GoldSrc `rate`). 0 = no limit.
+	void set_rate(uint32_t p_bytes_per_sec) { rate_ = p_bytes_per_sec; }
+	uint32_t rate() const { return rate_; }
 
 	// The client's other messages (netchan.h).
 	void queue_reliable(const uint8_t *p_data, size_t p_size) { rel_.queue(p_data, p_size); }
@@ -184,7 +194,7 @@ public:
 		const uint8_t block_flags = rel_.write(seq, block);
 		const int channel_bytes = (int)block.size() + (ack.fragments ? 2 : 0);
 		std::vector<uint8_t> datagram;
-		dgram_.take(SAFE_PACKET_BYTES - 16 - channel_bytes, datagram);
+		dgram_.take(SAFE_PACKET_BYTES - HEADER_BYTES - channel_bytes, datagram);
 
 		const size_t size = ring_.size();
 		size_t first_new = size;
@@ -208,7 +218,7 @@ public:
 			picks.push_back(i);
 		}
 
-		const int budget = SAFE_PACKET_BYTES - 16 - 4 * (int)streams.size() - (int)datagram.size() - channel_bytes;
+		const int budget = SAFE_PACKET_BYTES - HEADER_BYTES - 4 * (int)streams.size() - (int)datagram.size() - channel_bytes;
 		Writer body;
 		std::vector<const std::vector<uint8_t> *> prev(streams.size(), nullptr);
 		std::vector<size_t> sent;
@@ -238,6 +248,8 @@ public:
 		r_out.put_u8(SNAPSHOT_VERSION);
 		r_out.put_u16(seq);
 		r_out.put_u16(p_snapshot_ack);
+		r_out.put_u16((uint16_t)p_now);
+		put_uvarint(&r_out, (rate_ + 99) / 100);
 		put_channel(r_out, ack, block_flags, block, datagram);
 		r_out.put_u16(ring_.empty() ? next_seq_ : ring_.front().seq);
 		r_out.put_u8((uint8_t)streams.size());
@@ -289,10 +301,13 @@ private:
 
 	// Packets whose send time is kept for timing their ack: about 8 s at one packet a tick.
 	static constexpr int SENT_RING = 512;
+	// The packet's fixed part, with the rate at its widest and an empty channel part.
+	static constexpr int HEADER_BYTES = 21;
 
 	std::deque<Cmd> ring_; // unacked, oldest first
 	uint16_t next_seq_ = 1;
 	uint32_t interval_ms_ = 0;
+	uint32_t rate_ = 0;
 	int backup_ = COMMAND_BACKUP_DEFAULT;
 	uint32_t last_send_ms_ = 0;
 	bool sent_any_ = false;
@@ -342,6 +357,23 @@ public:
 		return true;
 	}
 
+	// How far behind its best p_peer's uplink is arriving, ms, and its packets arriving per second
+	// (auto_rate.h): for the peer's snapshot header (Server::set_uplink_report).
+	uint32_t uplink_lag_ms(int32_t p_peer) const {
+		auto it = peers_.find(p_peer);
+		return it == peers_.end() ? 0 : it->second.lag_ms;
+	}
+	uint32_t uplink_pps(int32_t p_peer) const {
+		auto it = peers_.find(p_peer);
+		return it == peers_.end() ? 0 : it->second.arrivals.pps();
+	}
+
+	// The rate p_peer asks for, bytes/sec; 0 = no limit.
+	uint32_t rate(int32_t p_peer) const {
+		auto it = peers_.find(p_peer);
+		return it == peers_.end() ? 0 : it->second.rate;
+	}
+
 	// Commands p_peer gave up on before they arrived.
 	uint32_t skipped(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
@@ -364,6 +396,14 @@ private:
 		bool warned = false;
 		bool news = false; // see take_news
 		ChannelReceiver chan;
+		// The client's 16-bit send times, unwrapped against the newest seen.
+		bool stamped = false;
+		uint16_t stamp_last = 0;
+		int64_t stamp_ms = 0;
+		QueueMeter queue;
+		ArrivalMeter arrivals;
+		uint32_t lag_ms = 0;
+		uint32_t rate = 0;
 	};
 	// Commands held for a gap to fill are bounded by what a client can have unacked.
 	static const int MAX_AHEAD = COMMAND_RING * 2;
@@ -387,6 +427,8 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	}
 	const uint16_t packet_seq = r.get_u16();
 	const uint16_t snapshot_ack = r.get_u16();
+	const uint16_t send_time = r.get_u16();
+	const uint32_t rate = get_uvarint(&r);
 	ChannelPart chan;
 	chan.read(r);
 	uint16_t floor = r.get_u16();
@@ -424,6 +466,18 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		p_host.snapshot_ack(p_peer, snapshot_ack);
 	}
 	Peer &p = peers_[p_peer];
+	int64_t sent_ms = send_time;
+	if (p.stamped) {
+		sent_ms = p.stamp_ms + (int16_t)(uint16_t)(send_time - p.stamp_last);
+	}
+	if (!p.stamped || sent_ms > p.stamp_ms) {
+		p.stamped = true;
+		p.stamp_last = send_time;
+		p.stamp_ms = sent_ms;
+	}
+	p.lag_ms = p.queue.note(p_now, sent_ms);
+	p.arrivals.note(p_now);
+	p.rate = rate > 0xFFFFFFFFu / 100 ? 0xFFFFFFFFu : rate * 100;
 	// The channel only from a packet newer than every one before it. Commands carry their own seqs,
 	// so a reordered packet still delivers those.
 	std::vector<std::vector<uint8_t>> reliable;

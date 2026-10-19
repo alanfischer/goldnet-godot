@@ -89,6 +89,7 @@ struct Peer {
 	std::vector<uint16_t> acks;
 	std::vector<uint32_t> times;
 	std::vector<uint16_t> command_acks;
+	std::vector<std::pair<uint32_t, uint32_t>> uplink_reports; // lag_ms, pps
 	std::vector<std::pair<uint16_t, bool>> chan_acks;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
@@ -103,6 +104,7 @@ struct TestClientHost {
 	void protocol_mismatch() { p->mismatches++; }
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
 	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
+	void uplink_report(uint32_t lag_ms, uint32_t pps) { p->uplink_reports.push_back({ lag_ms, pps }); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
 	void channel_ack(const ChannelAck &a) { p->chan_acks.push_back({ a.received, a.bit }); }
 	void message(const uint8_t *data, size_t size, bool reliable) {
@@ -214,8 +216,9 @@ struct Net {
 };
 
 static uint16_t base_seq_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[3] | (pkt[4] << 8)); }
-// With an empty channel part, the spawn count follows the 11-byte header and its 5 bytes.
-static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[16] | (pkt[17] << 8)); }
+// With an empty channel part and no uplink report, the spawn count follows the 11-byte header, the
+// report's two 1-byte zeros and the channel part's 5 bytes.
+static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[18] | (pkt[19] << 8)); }
 
 // --- tests ---
 
@@ -603,23 +606,24 @@ static void test_reentry_before_leave_acked() {
 static void test_budget_overflow_drains_by_priority() {
 	Net n;
 	Peer &p = n.add_peer(2);
-	n.server.set_tick_interval_ms(16);
-	for (int i = 0; i < 20; i++) {
+	const int count = 400; // 7 bytes each, so a packet carries well under half of them
+	for (int i = 0; i < count; i++) {
 		n.add_entity(10 + i, 100 + i, { 0 });
 	}
-	n.world.ents[29].priority = 50.0f;
-	n.tick();
-	n.server.set_bandwidth_bps(600); // 9 bytes a packet: two 7-byte entities a tick
-	for (int i = 0; i < 20; i++) {
+	n.world.ents[10 + count - 1].priority = 50.0f;
+	for (int i = 0; i < 10; i++) {
+		n.tick(); // the first full baseline overflows too; let it drain
+	}
+	for (int i = 0; i < count; i++) {
 		n.world.ents[10 + i].vals[0] = 1;
 	}
 	n.tick();
-	CHECK(p.vals[119][0] == 1); // the heavy one goes first, though it registered last
-	CHECK(p.vals[118][0] == 0);
+	CHECK(p.vals[100 + count - 1][0] == 1); // the heavy one goes first, though it registered last
+	CHECK(p.vals[100 + count - 2][0] == 0);
 	for (int i = 0; i < 40; i++) {
 		n.tick();
 	}
-	for (int i = 0; i < 20; i++) {
+	for (int i = 0; i < count; i++) {
 		CHECK(p.vals[100 + i][0] == 1); // nothing starves
 	}
 	printf("  budget overflow drains, highest priority first: ok\n");
@@ -761,8 +765,19 @@ static void test_command_ack_rides_the_header() {
 	printf("  the command ack rides the header and earns a send when new: ok\n");
 }
 
+// The server's measure of a client's uplink rides the header of that client's snapshots.
+static void test_uplink_report_rides_the_header() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.set_uplink_report(2, 340, 44);
+	n.tick();
+	CHECK(!p.uplink_reports.empty() && p.uplink_reports.back() == std::make_pair(340u, 44u));
+	printf("  the uplink report rides the snapshot header: ok\n");
+}
+
 // A gap in the seqs a client receives is a lost snapshot. Idle ticks send nothing and take no
-// seq, so they read as no loss at all, and a late snapshot is taken back off the count.
+// seq, so they read as no loss at all, and a late snapshot is taken back off the running total.
 static void test_arrival_stats_count_only_real_loss() {
 	Net n;
 	Peer &p = n.add_peer(2);
@@ -771,7 +786,7 @@ static void test_arrival_stats_count_only_real_loss() {
 	for (int i = 0; i < 40; i++) { // 640 ms idle: two keepalives, ~38 skipped ticks
 		n.tick();
 	}
-	auto s = p.client.pop_arrival_stats();
+	auto s = p.client.arrival_stats();
 	CHECK(s.received == 3);
 	CHECK(s.lost == 0);
 
@@ -783,8 +798,8 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.drop_snapshots.clear();
 	n.world.ents[10].vals[0] = 9;
 	n.tick();
-	s = p.client.pop_arrival_stats();
-	CHECK(s.received == 1);
+	s = p.client.arrival_stats();
+	CHECK(s.received == 4);
 	CHECK(s.lost == 3);
 
 	n.world.ents[10].vals[0] = 10;
@@ -796,9 +811,9 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.tick();
 	TestClientHost ch{ &p };
 	p.client.apply(late.data(), late.size(), ch, n.now);
-	s = p.client.pop_arrival_stats();
-	CHECK(s.received == 2);
-	CHECK(s.lost == 0);
+	s = p.client.arrival_stats();
+	CHECK(s.received == 6);
+	CHECK(s.lost == 3); // the late one took its loss back off
 	printf("  arrival stats count only real loss: ok\n");
 }
 
@@ -875,6 +890,7 @@ int main() {
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
 	test_arrival_stats_count_only_real_loss();
+	test_uplink_report_rides_the_header();
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	printf("%d checks passed\n", checks);

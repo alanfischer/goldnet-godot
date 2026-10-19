@@ -52,9 +52,10 @@ public:
 	Ref<MultiplayerPeer> get_wrapped() const { return wrapped; }
 	Sim &get_sim() { return sim; }
 	const Sim &get_sim() const { return sim; }
-	// What the sim has let through since the last call, as {bytes, packets}: what a meter on the
-	// far side of a slow link would see, where the transport's own counters see it all arrive.
-	Dictionary pop_delivered();
+	// What the sim has let through, in total: what a meter on the far side of a slow link would
+	// see, where the transport's own counters see it all arrive.
+	int64_t get_delivered_bytes() const { return delivered_bytes; }
+	int64_t get_delivered_packets() const { return delivered_packets; }
 	~GoldNetSimPeer();
 
 	virtual Error _get_packet(const uint8_t **r_buffer, int32_t *r_buffer_size) override;

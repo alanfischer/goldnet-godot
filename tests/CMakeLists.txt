@@ -32,7 +32,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     add_link_options(-fsanitize=undefined)
 endif()
 
-foreach(test_name test_codec test_seq test_protocol test_netsim test_uplink test_netchan)
+foreach(test_name test_codec test_seq test_protocol test_netsim test_uplink test_netchan test_auto_rate)
     add_executable(${test_name} ${test_name}.cpp)
     target_include_directories(${test_name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

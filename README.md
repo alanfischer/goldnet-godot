@@ -67,6 +67,11 @@ pipeline. A node lands in:
   A→B→A between two acked frames, the peer sees only the final A. That holds for
   every slot; goldnet carries *state*, not events. Put events on `@rpc`.
 
+- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
+  Map-static entities load with the map (both peers already have them) so they need
+  no spawn record; runtime entities do, because the client has no other way to know
+  they should exist.
+
 **Commands, the other way.** A client's input to the server (Quake's usercmds) is a stream
 in which every element matters, so it can't converge the way state does. Mark the `@rpc` a
 client calls once per command with `CommandStream.mark(node, &"method")`. Its contract is a
@@ -85,12 +90,8 @@ in fragments, up to 32 in flight, one per packet (GoldSrc sent one per round tri
 goes whole or not at all, and never plays after a newer packet's. So state and events share one ordered stream: a death RPC can't be overtaken by
 the snapshot that hides the body, and the peer's rate counts every byte. `call_local` and
 `get_remote_sender_id()` behave as with the inner. What stays on the inner: a client's call to
-another client, an unreliable call bigger than 512 bytes, and any method a node lists in its
-`gn_bypass` meta.
-- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
-  Map-static entities load with the map (both peers already have them) so they need
-  no spawn record; runtime entities do, because the client has no other way to know
-  they should exist.
+another client, an unreliable call bigger than 512 bytes, and any RPC declared on a channel other
+than 0.
 
 **The snapshot protocol (delta against acked baseline).** Each tick, per peer, the
 server emits one unreliable snapshot:
@@ -124,8 +125,7 @@ snapshot — is in [`docs/protocol.md`](docs/protocol.md).
   changed-since-baseline compare re-offers it next tick — no retransmit bookkeeping.
   Which entities win the budget is ordered by how long each has been waiting for
   *this* peer, times an optional per-entity `gn_priority` weight (see **Usage**), so
-  the most-overdue entity goes first and nothing starves. `bandwidth_bps` tightens
-  the budget further; it never relaxes the MTU ceiling.
+  the most-overdue entity goes first and nothing starves.
 - A snapshot with nothing to report — no changed entity, no spawn, despawn, or leave
   — **isn't sent at all**, so a fully static world costs nothing per tick. The one
   exception is the clock feed below.
@@ -201,11 +201,6 @@ Measured in WizardWars (ww_2fort + 4 bots, stationary headless clients, server�
 egress at the ENet socket), goldnet vs the **stock `MultiplayerSynchronizer`** path
 on the same build with the same PVS:
 
-> **The table predates the wire-format v4 work** (uvarint mask, empty-snapshot skip,
-> entity budget, `angle8`/`time_delta`), so read it as goldnet's floor rather than its
-> current cost. What that work bought is measured separately below — the shape this
-> table is really for (parity on bandwidth, divergence under loss) is unaffected.
-
 | Condition | goldnet | stock |
 | --- | --- | --- |
 | 1 / 4 / 8 clients, no loss (per-client) | ~26–29 KB/s | ~27–29 KB/s |
@@ -224,41 +219,15 @@ reliable-ordered replication for real-time state on adverse networks.
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
 
-### What the v4 wire work bought
+### The snapshot stream alone
 
-Same WizardWars scenario (ww_2fort, 4 AI bots, 4 stationary headless clients, 190 s
-runs), comparing this build against the pre-v4 one with the *game* held constant. The
-figure below is the **snapshot stream alone** — goldnet's own `dbg_bytes` under
-`GOLDNET_DEBUG=1`, not the ENet socket total. That distinction matters: snapshots are
-only about half of server egress here, the rest being ENet acks and the game's own
-`@rpc` traffic, so measuring at the socket dilutes the effect by roughly half.
-
-| | snapshot stream | total socket egress | over-MTU sends |
-| --- | --- | --- | --- |
-| pre-v4 | 12.4 KB/s (11.3–13.2) | 26.9 KB/s | 7 of 7 runs |
-| v4 | 6.2 KB/s (1.8–10.5) | ~21.8 KB/s | 0 of 14 runs |
-
-n=5 runs pre-v4, n=10 v4, averaged over each run's steady-state tail. **Roughly half
-the snapshot bytes**, and every v4 run came in below every pre-v4 run (10.5 < 11.3).
-
-Read the spread, not just the mean. Pre-v4 is tight because it pays a floor: a snapshot
-per peer per tick whether or not anything changed. v4's cost tracks actual change, so it
-ranges from near the pre-v4 figure when a peer's PVS is busy down to **0.2–0.3 KB/s when
-it is idle** — which is the clock keepalive and nothing else (17 B header x 4 Hz x 4
-peers = 272 B/s, and that is what the log shows). Most of the win is that floor
-disappearing; the rest is the uvarint mask. A busy server should expect the low end of
-the improvement, an idle or lightly-populated one the high end.
-
-Two caveats worth keeping. Adopting the *game-side* quantization hints on top
-(`vec3_half`/`angle8`/`time_delta` — the consumer's own change, not goldnet's) did not
-separate from goldnet's schema-agnostic wins at this sample size: 6.2 vs 6.1 KB/s, well
-inside the run-to-run spread. And this ran on a 4-core container with server, bots, and
-clients on one box, so the absolute numbers are not comparable to the table above —
-only the paired comparison is.
-
-The over-MTU column is the entity budget doing its job, and it is the least ambiguous
-result here: pre-v4 emitted `Sending 1991 bytes unreliably which is above the MTU (1392)`
-on a joining client's first full baseline in **every** run. With the budget, never.
+Same scenario on a 4-client run, measured as goldnet's own `dbg_bytes` under `GOLDNET_DEBUG=1`
+rather than at the socket, where ENet acks and the game's own `@rpc` traffic make up about half of
+egress. The snapshot stream averages **~6 KB/s in total (1.8–10.5 across runs)**, and its cost
+tracks change: a peer whose PVS is busy costs the most, an idle one **0.2–0.3 KB/s**, which is the
+clock keepalive and nothing else (17 B header x 4 Hz x 4 peers = 272 B/s). Game-side quantization
+hints (`vec3_half`/`angle8`/`time_delta`) did not separate from that at this sample size. The entity
+budget keeps every send under the MTU, including a joining client's first full baseline.
 
 ## What we wish Godot had
 
@@ -301,23 +270,7 @@ and replaces the spawner's `spawn_function` with a trampoline purely to capture 
 data. A `spawner_registered` hook, or spawn data available on the configuration callback, would
 delete all of it.
 
-**4. Runtime-added synchronizers that actually pair — RETRACTED, this is not a gap.** This entry
-used to claim that a `MultiplayerSynchronizer` created in code gets no replication-ID handshake,
-never pairs with its remote counterpart, and therefore has to be baked into a `.tscn` for stock
-SceneMultiplayer. Measured on Godot 4.7 and it is false: a headless host+client run on
-WizardWars' `--stock` fallback paired both of its runtime-built synchronizers — one built on a
-map-static node, one built inside a spawner-instantiated entity — and movers, dynamic entities
-and player puppets all arrived, with no errors on either side.
-
-*Forces:* nothing, either way. goldnet keys a synchronizer by the hash of its scene path
-(`net_id_for`), so a code-built sync pairs exactly like a baked one as long as both peers build it
-at the same path; stock, on 4.7, pairs them too. The entry is kept rather than deleted because the
-numbering is cited from elsewhere — and because a reader who has met the same lore should be able
-to find the retraction. If your runtime-built sync does not pair under stock, the difference is
-likely that the two peers build it at different paths, which is worth checking before baking a
-scene you would not otherwise need.
-
-**5. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
+**4. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
 metadata, so an extension that wants a hint per slot (goldnet's quantization tags: `angle16`,
 `half`, `vec3_half`) has nowhere in the config to put it.
 
@@ -384,6 +337,8 @@ Standalone — no godot-cpp, no engine, runs in about a second. It covers the co
   re-entry before the leave is acked), the packet budget and its priority order,
   per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
   reordered, truncated or mismatched packets.
+- `test_auto_rate`: the queue and arrival meters, and the controllers that pick a client's rate and
+  command rate from them.
 - `test_netsim`: config clamping, one seed replaying loss and latency together, the
   latency range and loss rate, the in-order delay pipe, the spike cycle, and the link
   cap (serialization, overhead, per-link independence, the full-buffer drop rule).
@@ -432,8 +387,7 @@ client, where it passes while testing nothing.
 
 Covers the three helpers the addon ships alongside the extension — the client-side
 `InterpolationBuffer` and `ServerClock`, plus `SyncSpec`, which builds a synchronizer's config and
-goldnet's metas from one declaration. (Local prediction, once `PredictedBody` here, moved out to
-pmove-godot — its only consumer — and is not part of this addon.) They're pure GDScript with no
+goldnet's metas from one declaration. They're pure GDScript with no
 dependency on goldnet's wire protocol, so this needs no built extension, no peer and no
 second process; the whole thing runs in one headless process in well under a second.
 
@@ -493,7 +447,7 @@ something false.
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
    ```
    The hints and the replication config are two lists that have to agree (see **What we
-   wish Godot had** #5), so prefer declaring them together and letting `SyncSpec` — the
+   wish Godot had** #4), so prefer declaring them together and letting `SyncSpec` — the
    addon's GDScript helper — derive both. A hint keyed to a property the config does not
    replicate is ignored in silence; a table cannot make that mistake, and `SyncSpec`
    reports the ones it cannot rule out (an unrecognised hint name, two properties sharing
@@ -517,19 +471,9 @@ something false.
    ```gdscript
    sync.set_meta("gn_priority", 4.0)   # players over debris
    ```
-7. (Optional) Cap per-peer entity-delta bandwidth in bytes/sec, converted to a
-   per-packet allowance via that peer's snapshot interval. Only ever tightens the
-   built-in MTU ceiling. 0 (default) leaves the MTU ceiling as the only limit.
-   ```gdscript
-   gn.bandwidth_bps = 32000              # every peer
-   gn.set_peer_bandwidth_bps(peer, 8000) # or per peer, which wins where set
-   ```
-   Note this budgets the entity-delta section only — the header, the netchan's messages and the
-   spawn/despawn/leave sections are accounted against the MTU ceiling but are not
-   rate-limited. It is a replication throttle, not a link-wide one.
-
-   For a link-wide limit, set the peer's **rate** (GoldSrc's `rate`): the most bytes per
-   second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
+7. (Optional) Limit a client's downlink with its **rate** (GoldSrc's `rate`): the most bytes per
+   second the server may send it, snapshots and `@rpc` traffic both counted. The client sets it,
+   and every uplink packet tells the server. Each send pushes the peer's
    clear time out by its size over the rate; while that's in the future the peer is
    **choked** — it gets no snapshot that tick, and the next one it does get deltas against
    its acked baseline, so it carries the latest state rather than a backlog. A slow link
@@ -537,9 +481,16 @@ something false.
    netchan wait for the peer's next snapshot like everything else; ones on the inner (see
    **RPCs on the netchan**) still go out when choked, but they count.
    ```gdscript
-   gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
-   gn.get_peer_chokes(peer)          # snapshots withheld so far
+   gn.rate = 5000                    # client, bytes/sec; 0 = unlimited (the default)
+   gn.auto_rate = true               # or let goldnet pick it
    ```
+
+   With `auto_rate` on, the client picks its rate from how far behind its best each snapshot
+   arrives, by the server's send time: no limit until the downlink queues, then a limit just under
+   what is arriving, a sharp cut while it still queues and a slow climb while it doesn't. A queue full
+   from the first snapshot shows no lag, so before the first limit, lost snapshots count as queueing
+   too. The server applies at least 1000 B/s and emits `peer_rate_changed(peer, rate)` when a client's
+   rate changes, for a game that sizes a peer's cadence by it.
 
    A peer can also be served less often than the server ticks (GoldSrc's `cl_updaterate`),
    without slowing anyone else: the tick still runs at full rate and only skips that peer until
@@ -636,16 +587,34 @@ something false.
    delta-coded bytewise against the previous one, so a fixed layout compresses best.
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
-   gn.get_command_stats()        # {pending, dropped, rtt_ms}
+   gn.auto_command_rate = true   # or let goldnet pick it
    ```
-10. (Optional) Keep an RPC off the netchan. A method a node lists in its `gn_bypass` meta goes
-   through the inner `SceneMultiplayer`, with no ordering against the netchan's: for traffic with
-   its own pacing, like voice, that shouldn't compete with the snapshot's budget. `rpc_netchan`
-   turns the netchan off for this end's sends.
+10. (Optional) Keep an RPC off the netchan by declaring it on a channel other than 0. It goes
+   through the inner `SceneMultiplayer` straight away, ordered only against its own channel, as stock
+   orders each channel apart. That suits traffic with its own pacing, like voice, which shouldn't
+   compete with the snapshot's budget, and a call that can't wait for the next snapshot, like a
+   kick reason sent just before the disconnect.
    ```gdscript
-   set_meta("gn_bypass", [&"sync_voice"])
-   gn.rpc_netchan = false        # every RPC through the inner, as before v6 (or GOLDNET_RPC_NETCHAN=0)
-   gn.get_message_stats(peer)    # {queued, delivered} reliable messages; a client passes 1
+   @rpc("authority", "call_remote", "unreliable", 1)
+   func sync_voice(packet: PackedByteArray) -> void: ...
+   ```
+   With `auto_command_rate` on, the client picks its command rate from the server's report of how
+   far behind its uplink packets arrive, carried in each snapshot header. It starts at 20 packets a
+   second and climbs quickly until the uplink first queues, so a slow link isn't flooded before a
+   report can say so; then it cuts under the rate the server sees packets arrive at, and climbs
+   slowly. It never goes past the physics tick rate.
+11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). Every key is present on both
+   ends and 0 where it doesn't apply.
+   ```gdscript
+   gn.get_peer_stats(peer)
+   # running totals, so diff two reads for a rate:
+   # server: chokes (snapshots withheld by the rate), messages_queued, messages_delivered
+   # client: snapshots_received, snapshots_lost, messages_queued, messages_delivered,
+   #         commands_pending, commands_dropped, recv_sim_bytes, recv_sim_packets (what
+   #         recv_sim_config let through; count these, not the transport's counters, while it is on)
+   # current values:
+   # both:   rate (bytes/sec in force), uplink_lag_ms, uplink_pps (measured by the server)
+   # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
    ```
 
 > **Headless note:** Godot registers `.gdextension` files via
@@ -678,7 +647,6 @@ On the server:
 
 ```cpp
 goldnet::Server<MyValue> server;
-server.set_tick_interval_ms(33);
 server.set_packet_overhead(28);     // what your link adds per packet, for rate budgets
 
 server.add_entity(key, net_id);     // an entity starts replicating; remove_entity(key)
@@ -690,8 +658,7 @@ server.on_ack(peer, seq);           // each ack the client sends
 server.remove_peer(peer);           // on disconnect
 ```
 
-Per-peer cadence, budget and rate are `set_peer_interval_ms`, `set_peer_bandwidth_bps` and
-`set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
+Per-peer cadence and rate are `set_peer_interval_ms` and `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`. `CommandReceiver` reads each client's rate (`rate(peer)`) and meters its uplink (`uplink_lag_ms(peer)`, `uplink_pps(peer)`) for `server.set_uplink_report`. `auto_rate.h` has the meters and controllers a client runs to pick its rate and command rate (`DownlinkMeter`, `CmdRateAuto`).
 
 On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
 for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink
@@ -705,6 +672,7 @@ if (commands.due(now)) {                      // or whenever an ack is waiting
     commands.write(now, snapshot_ack, w);     // send w to the server
 }
 commands.on_ack(seq, now);                    // from the client host's command_ack(seq)
+commands.set_rate(bytes_per_sec);             // the rate to ask the server for; 0 = no limit
 
 goldnet::CommandReceiver receiver;            // server
 receiver.receive(peer, bytes, size, host);    // host gets snapshot_ack() and each command() in order

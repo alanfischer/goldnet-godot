@@ -39,6 +39,8 @@ static const int RPC_HEADER_EST = 12;
 static const int SNAPSHOT_WIRE_OVERHEAD = 50;
 // The same for a game RPC, whose own header rpc_wire_bytes already counts.
 static const int RPC_WIRE_OVERHEAD = 38;
+// The least rate a client may ask for: below this a snapshot a second hardly fits.
+static const uint32_t MIN_PEER_RATE = 1000;
 
 // An entity's cross-peer identity: a hash of the node's scene path. Server and client
 // derive it the same way from the same path, so it matches without a handshake. Used for
@@ -444,6 +446,11 @@ void GoldNetMultiplayer::_reset_client_state() {
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
 	commands_out.reset();
+	downlink = goldnet::DownlinkMeter();
+	cmd_auto = goldnet::CmdRateAuto();
+	uplink_lag_ms = 0;
+	uplink_pps = 0;
+	_apply_link_settings();
 	snapshot_ack = 0;
 	snapshot_ack_new = false;
 	msg_registered.clear();
@@ -742,10 +749,9 @@ void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
 	node->queue_free();
 }
 
-// The send cadence in MICROSECONDS. Derived here rather than from _min_interval_ms() so the
-// synchronizers' interval (a double, in seconds) survives at full precision: truncating 1/60 s to
-// whole milliseconds gave 16 ms, and rounding gives 17 — a 60 Hz game got 62.5 or 58.8 Hz before
-// any jitter. Only the explicit override, which the config surface takes in whole ms, is coarse.
+// The send cadence in MICROSECONDS, so the synchronizers' interval (a double, in seconds) survives
+// at full precision: whole milliseconds would turn 60 Hz into 62.5 or 58.8. Only the explicit
+// override, which the config surface takes in whole ms, is coarse.
 uint64_t GoldNetMultiplayer::_min_interval_us() const {
 	if (snapshot_interval_override > 0) {
 		return (uint64_t)snapshot_interval_override * 1000ULL;
@@ -768,18 +774,8 @@ uint64_t GoldNetMultiplayer::_min_interval_us() const {
 	return best == 0 ? (uint64_t)DEFAULT_INTERVAL_MS * 1000ULL : best;
 }
 
-uint32_t GoldNetMultiplayer::_min_interval_ms() const {
-	// Millisecond view of the same cadence, for the byte-budget conversion (which is per-packet and
-	// coarse). Rounds rather than truncates so it can't claim a faster rate than we actually send at.
-	uint64_t us = _min_interval_us();
-	uint32_t ms = (uint32_t)((us + 500ULL) / 1000ULL);
-	return ms == 0 ? 1 : ms;
-}
-
 void GoldNetMultiplayer::_refresh_interval() {
-	cached_min_interval_ms = _min_interval_ms();
 	cached_min_interval_us = _min_interval_us();
-	server.set_tick_interval_ms(cached_min_interval_ms);
 }
 
 // --- Config surface (Phase 5) ---
@@ -800,16 +796,6 @@ void GoldNetMultiplayer::set_peer_snapshot_interval_ms(int p_peer, int p_ms) {
 	server.set_peer_interval_ms(p_peer, p_ms > 0 ? (uint32_t)p_ms : 0); // a rate may be set before the first tick
 }
 
-void GoldNetMultiplayer::set_bandwidth_bps(int p_bps) {
-	server.set_bandwidth_bps(p_bps > 0 ? (uint32_t)p_bps : 0);
-}
-int GoldNetMultiplayer::get_bandwidth_bps() const {
-	return (int)server.bandwidth_bps();
-}
-int GoldNetMultiplayer::get_peer_chokes(int p_peer) const {
-	return (int)server.chokes(p_peer);
-}
-
 void GoldNetMultiplayer::set_manual_send(bool p_manual) {
 	manual_send = p_manual;
 }
@@ -826,8 +812,56 @@ void GoldNetMultiplayer::send_snapshots() {
 	_server_tick();
 }
 
-void GoldNetMultiplayer::set_peer_rate(int p_peer, int p_bps) {
-	server.set_peer_rate(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0);
+void GoldNetMultiplayer::set_rate(int p_bps) {
+	rate_setting = p_bps > 0 ? p_bps : 0;
+	_apply_link_settings();
+}
+int GoldNetMultiplayer::get_rate() const {
+	return rate_setting;
+}
+void GoldNetMultiplayer::set_auto_rate(bool p_enabled) {
+	auto_rate = p_enabled;
+	_apply_link_settings();
+}
+bool GoldNetMultiplayer::get_auto_rate() const {
+	return auto_rate;
+}
+
+// The rate and command rate commands_out goes by: the game's settings, or the automatic ones.
+void GoldNetMultiplayer::_apply_link_settings() {
+	commands_out.set_rate((uint32_t)(auto_rate ? downlink.rate() : rate_setting));
+	const double hz = auto_command_rate ? cmd_auto.rate() : command_rate_setting;
+	const double ceiling = (double)Engine::get_singleton()->get_physics_ticks_per_second();
+	commands_out.set_interval_ms(hz > 0.0 && !(auto_command_rate && hz >= ceiling) ? (uint32_t)std::lround(1000.0 / hz) : 0);
+}
+
+// Client: each snapshot's server send time, for the downlink's meter.
+void GoldNetMultiplayer::_on_server_time(uint32_t p_ms) {
+	const uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
+	if (downlink.sample_due(now)) {
+		const goldnet::Client<Variant>::ArrivalStats arrivals = client.arrival_stats();
+		uint64_t bytes = 0;
+		if (recv_peer.is_valid()) {
+			// What reached us past the receive sim, with what the transport adds per packet.
+			bytes = (uint64_t)recv_peer->get_delivered_bytes() + (uint64_t)recv_peer->get_delivered_packets() * RPC_WIRE_OVERHEAD;
+		}
+		downlink.sample(now, bytes, arrivals.received, arrivals.lost);
+	}
+	downlink.note(now, p_ms);
+	if (auto_rate) {
+		_apply_link_settings();
+	}
+}
+
+// Client: the server's measure of our uplink, from a snapshot header.
+void GoldNetMultiplayer::_on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps) {
+	uplink_lag_ms = p_lag_ms;
+	uplink_pps = p_pps;
+	if (auto_command_rate) {
+		cmd_auto.note((uint32_t)Time::get_singleton()->get_ticks_msec(), (double)p_lag_ms, (double)p_pps,
+				(double)Engine::get_singleton()->get_physics_ticks_per_second());
+		_apply_link_settings();
+	}
 }
 
 // Charge a game RPC to each recipient's rate (see goldnet::Server::set_peer_rate). Its size is only
@@ -858,10 +892,6 @@ void GoldNetMultiplayer::_charge_rpc(int32_t p_peer, const Array &p_args) {
 		}
 		server.charge(targets[i], now, (size_t)bytes);
 	}
-}
-
-void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
-	server.set_peer_bandwidth_bps(p_peer, p_bps > 0 ? (uint32_t)p_bps : 0); // may be set before the first tick
 }
 
 
@@ -933,21 +963,28 @@ Dictionary GoldNetMultiplayer::get_recv_sim_config() const {
 	return read_sim_config(recv_sim);
 }
 
-Dictionary GoldNetMultiplayer::pop_snapshot_stats() {
-	const goldnet::Client<Variant>::ArrivalStats st = client.pop_arrival_stats();
+Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
+	const bool on_server = inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() == 1;
+	const goldnet::Client<Variant>::ArrivalStats arrivals = on_server ? goldnet::Client<Variant>::ArrivalStats() : client.arrival_stats();
+	const bool sim_peer = !on_server && recv_peer.is_valid();
 	Dictionary d;
-	d["received"] = (int64_t)st.received;
-	d["lost"] = (int64_t)st.lost;
-	return d;
-}
-
-Dictionary GoldNetMultiplayer::pop_recv_sim_delivered() {
-	if (recv_peer.is_valid()) {
-		return recv_peer->pop_delivered();
-	}
-	Dictionary d;
-	d["bytes"] = 0;
-	d["packets"] = 0;
+	d["chokes"] = (int64_t)(on_server ? server.chokes(p_peer) : 0);
+	d["snapshots_received"] = (int64_t)arrivals.received;
+	d["snapshots_lost"] = (int64_t)arrivals.lost;
+	d["messages_queued"] = (int64_t)(on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued());
+	d["messages_delivered"] = (int64_t)(on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered());
+	d["commands_pending"] = (int64_t)(on_server ? 0 : commands_out.pending());
+	d["commands_dropped"] = (int64_t)(on_server ? 0 : commands_out.dropped());
+	d["command_rtt_ms"] = (int64_t)(on_server ? 0 : commands_out.rtt_ms());
+	d["recv_sim_bytes"] = sim_peer ? recv_peer->get_delivered_bytes() : (int64_t)0;
+	d["recv_sim_packets"] = sim_peer ? recv_peer->get_delivered_packets() : (int64_t)0;
+	const uint32_t iv = commands_out.interval_ms();
+	d["rate"] = (int64_t)(on_server ? server.peer_rate(p_peer) : commands_out.rate());
+	d["command_rate"] = on_server || iv == 0 ? 0.0 : 1000.0 / (double)iv;
+	d["downlink_lag_ms"] = (int64_t)(on_server ? 0 : downlink.lag_ms());
+	d["uplink_lag_ms"] = (int64_t)(on_server ? commands_in.uplink_lag_ms(p_peer) : uplink_lag_ms);
+	d["uplink_pps"] = (int64_t)(on_server ? commands_in.uplink_pps(p_peer) : uplink_pps);
+	d["delivered_bps"] = on_server ? 0.0 : downlink.delivered_bps();
 	return d;
 }
 
@@ -1088,34 +1125,31 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_snapshot_interval_ms"), &GoldNetMultiplayer::get_snapshot_interval_ms);
 	ClassDB::bind_method(D_METHOD("set_peer_snapshot_interval_ms", "peer", "ms"), &GoldNetMultiplayer::set_peer_snapshot_interval_ms);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "snapshot_interval_ms"), "set_snapshot_interval_ms", "get_snapshot_interval_ms");
-	ClassDB::bind_method(D_METHOD("set_bandwidth_bps", "bps"), &GoldNetMultiplayer::set_bandwidth_bps);
-	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
-	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
-	ClassDB::bind_method(D_METHOD("set_peer_rate", "peer", "bytes_per_sec"), &GoldNetMultiplayer::set_peer_rate);
-	ClassDB::bind_method(D_METHOD("set_rpc_netchan", "enabled"), &GoldNetMultiplayer::set_rpc_netchan);
-	ClassDB::bind_method(D_METHOD("get_rpc_netchan"), &GoldNetMultiplayer::get_rpc_netchan);
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "rpc_netchan"), "set_rpc_netchan", "get_rpc_netchan");
-	ClassDB::bind_method(D_METHOD("get_message_stats", "peer"), &GoldNetMultiplayer::get_message_stats);
+	ClassDB::bind_method(D_METHOD("set_rate", "bytes_per_sec"), &GoldNetMultiplayer::set_rate);
+	ClassDB::bind_method(D_METHOD("get_rate"), &GoldNetMultiplayer::get_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "rate"), "set_rate", "get_rate");
+	ClassDB::bind_method(D_METHOD("set_auto_rate", "enabled"), &GoldNetMultiplayer::set_auto_rate);
+	ClassDB::bind_method(D_METHOD("get_auto_rate"), &GoldNetMultiplayer::get_auto_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_rate"), "set_auto_rate", "get_auto_rate");
+	ClassDB::bind_method(D_METHOD("set_auto_command_rate", "enabled"), &GoldNetMultiplayer::set_auto_command_rate);
+	ClassDB::bind_method(D_METHOD("get_auto_command_rate"), &GoldNetMultiplayer::get_auto_command_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_command_rate"), "set_auto_command_rate", "get_auto_command_rate");
 	ClassDB::bind_method(D_METHOD("set_manual_send", "manual"), &GoldNetMultiplayer::set_manual_send);
 	ClassDB::bind_method(D_METHOD("get_manual_send"), &GoldNetMultiplayer::get_manual_send);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "manual_send"), "set_manual_send", "get_manual_send");
 	ClassDB::bind_method(D_METHOD("send_snapshots"), &GoldNetMultiplayer::send_snapshots);
-	ClassDB::bind_method(D_METHOD("get_peer_chokes", "peer"), &GoldNetMultiplayer::get_peer_chokes);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "bandwidth_bps"), "set_bandwidth_bps", "get_bandwidth_bps");
 	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
 	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
 	ClassDB::bind_method(D_METHOD("set_recv_sim_config", "config"), &GoldNetMultiplayer::set_recv_sim_config);
 	ClassDB::bind_method(D_METHOD("get_recv_sim_config"), &GoldNetMultiplayer::get_recv_sim_config);
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "recv_sim_config"), "set_recv_sim_config", "get_recv_sim_config");
-	ClassDB::bind_method(D_METHOD("pop_recv_sim_delivered"), &GoldNetMultiplayer::pop_recv_sim_delivered);
-	ClassDB::bind_method(D_METHOD("pop_snapshot_stats"), &GoldNetMultiplayer::pop_snapshot_stats);
+	ClassDB::bind_method(D_METHOD("get_peer_stats", "peer"), &GoldNetMultiplayer::get_peer_stats);
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ClassDB::bind_method(D_METHOD("set_command_rate", "hz"), &GoldNetMultiplayer::set_command_rate);
 	ClassDB::bind_method(D_METHOD("get_command_rate"), &GoldNetMultiplayer::get_command_rate);
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "command_rate"), "set_command_rate", "get_command_rate");
-	ClassDB::bind_method(D_METHOD("get_command_stats"), &GoldNetMultiplayer::get_command_stats);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
@@ -1125,6 +1159,9 @@ void GoldNetMultiplayer::_bind_methods() {
 	// clock). An always-on server-time feed regardless of entity traffic — feed it to a clock estimator
 	// (see the ServerClock addon helper) instead of running a separate server-time beacon RPC.
 	ADD_SIGNAL(MethodInfo("server_time_received", PropertyInfo(Variant::INT, "server_time_ms")));
+	// Emitted on the server when a client's rate in force changes (it asked for another), so a game
+	// that sizes the peer's snapshot cadence by its rate can follow it.
+	ADD_SIGNAL(MethodInfo("peer_rate_changed", PropertyInfo(Variant::INT, "peer"), PropertyInfo(Variant::INT, "rate")));
 }
 
 // The ordered list of a synchronizer's *synced* replication-config property paths.
@@ -1353,7 +1390,12 @@ struct GoldNetMultiplayer::ClientHost {
 	}
 
 	// Every snapshot's header clock, as an always-on server-time feed (see ServerClock).
-	void server_time(uint32_t ms) { gn->emit_signal("server_time_received", (int64_t)ms); }
+	void server_time(uint32_t ms) {
+		gn->_on_server_time(ms);
+		gn->emit_signal("server_time_received", (int64_t)ms);
+	}
+
+	void uplink_report(uint32_t lag_ms, uint32_t pps) { gn->_on_uplink_report(lag_ms, pps); }
 
 	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq); }
 
@@ -1474,6 +1516,15 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
 	server.set_command_ack(p_peer, commands_in.ack(p_peer), commands_in.take_news(p_peer));
 	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
+	server.set_uplink_report(p_peer, commands_in.uplink_lag_ms(p_peer), commands_in.uplink_pps(p_peer));
+	uint32_t rate = commands_in.rate(p_peer);
+	if (rate > 0 && rate < MIN_PEER_RATE) {
+		rate = MIN_PEER_RATE;
+	}
+	if (rate != server.peer_rate(p_peer)) {
+		server.set_peer_rate(p_peer, rate);
+		emit_signal("peer_rate_changed", p_peer, (int64_t)rate);
+	}
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
@@ -1731,8 +1782,9 @@ void GoldNetMultiplayer::_deliver_message(int32_t p_from, const uint8_t *p_data,
 	command_sender = outer_sender;
 }
 
-// The RPC on the netchan, if it can go there: every call between the server and a client, but not one
-// a node lists in its gn_bypass meta, or a client's to another client (the inner relays those).
+// The RPC on the netchan, if it can go there: every call between the server and a client on channel 0.
+// A call declared on another channel goes through the inner, unordered against the netchan, as stock
+// orders each channel apart; so does a client's call to another client (the inner relays those).
 bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
 	if (!rpc_netchan) {
 		return false;
@@ -1745,12 +1797,12 @@ bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const St
 	if (!n || !n->is_inside_tree()) {
 		return false;
 	}
-	if (n->has_meta("gn_bypass") && Array(n->get_meta("gn_bypass")).has(p_method)) {
-		return false;
-	}
 	Dictionary cfg;
 	if (!rpc_method_config(p_object, p_method, cfg)) {
 		return false; // not an @rpc: the inner says so
+	}
+	if ((int)cfg.get("channel", 0) != 0) {
+		return false;
 	}
 	const bool reliable = (int)cfg.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE) ==
 			MultiplayerPeer::TRANSFER_MODE_RELIABLE;
@@ -1792,22 +1844,6 @@ bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const St
 	return true;
 }
 
-void GoldNetMultiplayer::set_rpc_netchan(bool p_enabled) {
-	rpc_netchan = p_enabled;
-}
-
-bool GoldNetMultiplayer::get_rpc_netchan() const {
-	return rpc_netchan;
-}
-
-Dictionary GoldNetMultiplayer::get_message_stats(int p_peer) const {
-	const bool on_server = inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() == 1;
-	Dictionary d;
-	d["queued"] = (int64_t)(on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued());
-	d["delivered"] = (int64_t)(on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered());
-	return d;
-}
-
 // Client: one uplink packet, when there are commands due or a snapshot ack to send. While a stream
 // is active the ack waits for the next command packet (which comes within the command interval)
 // rather than costing a packet of its own.
@@ -1839,20 +1875,21 @@ void GoldNetMultiplayer::_send_uplink() {
 }
 
 void GoldNetMultiplayer::set_command_rate(double p_hz) {
-	commands_out.set_interval_ms(p_hz > 0.0 ? (uint32_t)std::lround(1000.0 / p_hz) : 0);
+	command_rate_setting = p_hz > 0.0 ? p_hz : 0.0;
+	_apply_link_settings();
 }
 
 double GoldNetMultiplayer::get_command_rate() const {
-	const uint32_t iv = commands_out.interval_ms();
-	return iv > 0 ? 1000.0 / (double)iv : 0.0;
+	return command_rate_setting;
 }
 
-Dictionary GoldNetMultiplayer::get_command_stats() const {
-	Dictionary d;
-	d["pending"] = (int)commands_out.pending();
-	d["dropped"] = (int)commands_out.dropped();
-	d["rtt_ms"] = (int)commands_out.rtt_ms();
-	return d;
+void GoldNetMultiplayer::set_auto_command_rate(bool p_enabled) {
+	auto_command_rate = p_enabled;
+	_apply_link_settings();
+}
+
+bool GoldNetMultiplayer::get_auto_command_rate() const {
+	return auto_command_rate;
 }
 
 Error GoldNetMultiplayer::_poll() {
