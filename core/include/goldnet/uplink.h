@@ -116,30 +116,11 @@ public:
 	}
 
 	// The command ack from a snapshot header: everything up to p_seq arrived.
-	void on_ack(uint16_t p_seq, uint32_t p_now) {
+	void on_ack(uint16_t p_seq) {
 		if (p_seq == 0 || ring_.empty() || !seq_le(ring_.front().seq, p_seq) || seq_newer(p_seq, ring_.back().seq)) {
 			return; // nothing new, or not something we sent
 		}
 		while (!ring_.empty() && seq_le(ring_.front().seq, p_seq)) {
-			const Cmd &c = ring_.front();
-			// Timed from the first send. Backups go within a tick of it, so the error is that tick at most;
-			// a command resent for being overdue can't say which send arrived, so it isn't timed. Unless
-			// none can be: a round trip longer than overdue_ms resends every command before its ack, and
-			// would never be measured. A streak of untimed acks means that, not loss, and the original
-			// send is then what arrived, so the streak's shortest sample becomes the round trip.
-			if (c.seq == p_seq) {
-				const uint32_t sample = p_now - c.first_sent_ms;
-				if (!c.resent) {
-					srtt_ms_ = srtt_ms_ == 0 ? sample : (srtt_ms_ * 7 + sample) / 8;
-					untimed_ = 0;
-				} else {
-					untimed_min_ms_ = untimed_ == 0 ? sample : std::min(untimed_min_ms_, sample);
-					if (++untimed_ == UNTIMED_STREAK) {
-						srtt_ms_ = untimed_min_ms_;
-						untimed_ = 0;
-					}
-				}
-			}
 			ring_.pop_front();
 		}
 	}
@@ -155,12 +136,21 @@ public:
 	bool overflowed() const { return rel_.overflowed(); }
 	uint64_t reliable_queued() const { return rel_.queued(); }
 	uint64_t reliable_delivered() const { return rel_.delivered(); }
-	// From a snapshot header: what the server has received of this channel.
-	void on_channel_ack(const ChannelAck &p_ack) {
+	// From a snapshot header: what the server has received of this channel. The round trip is timed
+	// here, from the newest packet received, the first time it is named: a packet goes once, so its ack
+	// says which send arrived, however often the commands in it went again. Timed from commands, a
+	// round trip longer than the ring was never measured, and every packet then resent all of it.
+	// p_now: the clock write() is given.
+	void on_channel_ack(const ChannelAck &p_ack, uint32_t p_now) {
 		rel_.on_ack(p_ack);
 		if (!chan_acked_ || seq_newer(p_ack.received, chan_received_)) {
 			chan_acked_ = true;
 			chan_received_ = p_ack.received;
+			const int slot = p_ack.received & (SENT_RING - 1);
+			if (sent_seq_[slot] == p_ack.received) {
+				const uint32_t sample = p_now - sent_ms_[slot];
+				srtt_ms_ = srtt_ms_ == 0 ? sample : (srtt_ms_ * 7 + sample) / 8;
+			}
 		}
 	}
 
@@ -261,15 +251,12 @@ public:
 		}
 		for (size_t i : sent) {
 			Cmd &c = ring_[i];
-			if (c.sends++ == 0) {
-				c.first_sent_ms = p_now;
-			}
-			if (i < fresh_from) {
-				c.resent = true;
-			}
+			c.sends++;
 			c.last_sent_ms = p_now;
 			c.last_packet = seq;
 		}
+		sent_seq_[seq & (SENT_RING - 1)] = seq;
+		sent_ms_[seq & (SENT_RING - 1)] = p_now;
 		last_send_ms_ = p_now;
 		sent_any_ = true;
 	}
@@ -287,8 +274,6 @@ private:
 		uint32_t stream = 0;
 		std::vector<uint8_t> bytes;
 		uint32_t sends = 0;
-		bool resent = false; // went again for being overdue
-		uint32_t first_sent_ms = 0;
 		uint32_t last_sent_ms = 0;
 		uint16_t last_packet = 0; // the uplink packet that last carried it
 	};
@@ -302,8 +287,8 @@ private:
 		return p_c.sends > 0 && chan_acked_ && seq_newer(chan_received_, p_c.last_packet);
 	}
 
-	// Untimed acks in a row that mean the round trip is longer than overdue_ms (see on_ack).
-	static constexpr int UNTIMED_STREAK = 8;
+	// Packets whose send time is kept for timing their ack: about 8 s at one packet a tick.
+	static constexpr int SENT_RING = 512;
 
 	std::deque<Cmd> ring_; // unacked, oldest first
 	uint16_t next_seq_ = 1;
@@ -314,8 +299,8 @@ private:
 	uint32_t last_push_ms_ = 0;
 	bool pushed_ = false;
 	uint32_t srtt_ms_ = 0;
-	int untimed_ = 0;
-	uint32_t untimed_min_ms_ = 0;
+	uint16_t sent_seq_[SENT_RING] = {};
+	uint32_t sent_ms_[SENT_RING] = {};
 	uint32_t dropped_ = 0;
 	uint16_t seq_ = 1;
 	bool chan_acked_ = false;

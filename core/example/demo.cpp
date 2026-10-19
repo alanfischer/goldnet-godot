@@ -396,8 +396,8 @@ struct ClientApp {
 	// The host interface Client::apply() calls back into.
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
-	void command_ack(uint16_t seq) { commands.on_ack(seq, now_ms()); }
-	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack); }
+	void command_ack(uint16_t seq) { commands.on_ack(seq); }
+	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack, now_ms()); }
 	void message(const uint8_t *, size_t, bool) {}
 	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
