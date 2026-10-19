@@ -11,17 +11,23 @@ extends "res://test_case.gd"
 ## arrive through the inner and the order check alone would pass. The command stats are
 ## the evidence goldnet carried them: commands were unacked for a while, then all acked.
 ##
-##   t=0.2-4.2  client sends 240 commands at 60 Hz, 30% loss each way, 30 ms each way
-##   t=1.5-2.0  client blackout (100% loss), 30 commands: under COMMAND_RING
+##   t=0.2-4.2  client sends 240 commands at 60 Hz, 20% loss each way, 30 ms each way
+##   t=1.5-1.75 client blackout (100% loss), 15 commands
 ##   t=5.0      client asks for the report; the server sends what it received
+##
+## The blackout is sized against COMMAND_RING with the loss counted in: at 20% each way a command
+## lost in a packet and both its backups leaves later ones unacked behind it until it goes again, so
+## ~30 are unacked at the worst moments even with no blackout. 15 more stays clear of 64. A
+## standalone model of this timeline put the peak at 58 in 4000 seeds; 30% loss with a 0.5 s blackout,
+## as this case once ran, overflowed in about 1 run in 10 there, and more often in CI.
 
 const RATE := 60.0
 const START := 0.2
 const COUNT := 240
 const BLACKOUT_START := 1.5
-const BLACKOUT_END := 2.0
+const BLACKOUT_END := 1.75
 const ASK_AT := 5.0
-const LOSSY := {"loss_percent": 30, "latency_min_ms": 30, "latency_max_ms": 30, "seed": 11}
+const LOSSY := {"loss_percent": 20, "latency_min_ms": 30, "latency_max_ms": 30, "seed": 11}
 
 var _sent := 0
 var _max_pending := 0

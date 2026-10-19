@@ -317,6 +317,64 @@ static void test_interval_paces_packets() {
 	printf("  an interval paces packets, each carrying what was made since: ok\n");
 }
 
+// A command the server's channel ack proves lost (a later packet arrived, its ack hasn't) goes again in
+// the next packet, not when its overdue time runs out; the server says so though its ack is stuck.
+static void test_proven_lost_command_goes_at_once() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	s.set_backup(0);
+	uint32_t now = 1000;
+	auto send = [&](bool deliver) {
+		Writer w;
+		s.write(now, 0, ChannelAckSource(), w);
+		if (deliver) {
+			CHECK(r.receive(2, w.data(), w.size(), h, now));
+		}
+	};
+	std::vector<uint8_t> a = cmd_bytes(0), b = cmd_bytes(1);
+	s.push(1, a.data(), a.size(), now);
+	send(false); // command 0 is lost
+	now += 16;
+	s.push(1, b.data(), b.size(), now);
+	send(true); // command 1 arrives and is held behind it
+	CHECK(r.ack(2) == 0 && h.got.empty());
+	CHECK(r.take_news(2)); // the server has something to say though its ack hasn't moved
+	CHECK(!r.take_news(2));
+	ChannelAck ack = r.channel_ack(2).at(now);
+	now += 16;
+	s.on_channel_ack(ack); // it received packet 2, not packet 1
+	CHECK(s.due(now));     // long before command 0 is overdue
+	send(true);
+	CHECK(h.got.size() == 2 && cmd_id(h.got[0].bytes) == 0 && cmd_id(h.got[1].bytes) == 1);
+	printf("  a command the server's ack proves lost goes again at once: ok\n");
+}
+
+// A client resending commands the server already delivered never heard the ack: that earns a snapshot.
+static void test_a_repeat_earns_the_ack_again() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	std::vector<uint8_t> a = cmd_bytes(0);
+	s.push(1, a.data(), a.size(), 10);
+	Writer w;
+	s.write(10, 0, ChannelAckSource(), w);
+	CHECK(r.receive(2, w.data(), w.size(), h, 10));
+	CHECK(!r.take_news(2)); // delivered, and the ack moved: the ack itself is the news
+	CHECK(r.receive(2, w.data(), w.size(), h, 20)); // the same packet again
+	CHECK(r.take_news(2));
+	CHECK(h.got.size() == 1);
+	std::vector<uint8_t> b = cmd_bytes(1);
+	s.on_ack(r.ack(2), 30);
+	s.push(1, b.data(), b.size(), 30);
+	Writer w2;
+	s.write(30, 0, ChannelAckSource(), w2); // a new command, with the old one riding as a backup
+	CHECK(r.receive(2, w2.data(), w2.size(), h, 30));
+	CHECK(!r.take_news(2)); // routine backups are no reason to send
+	CHECK(h.got.size() == 2);
+	printf("  a repeated command earns the ack again: ok\n");
+}
+
 int main() {
 	printf("uplink:\n");
 	test_lossless_delivers_each_once_in_order();
@@ -332,6 +390,8 @@ int main() {
 	test_rtt_is_measured_through_backups();
 	test_rtt_is_learned_past_the_first_overdue();
 	test_interval_paces_packets();
+	test_proven_lost_command_goes_at_once();
+	test_a_repeat_earns_the_ack_again();
 	printf("uplink: %d checks passed\n", checks);
 	return 0;
 }

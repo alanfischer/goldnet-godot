@@ -156,7 +156,13 @@ public:
 	uint64_t reliable_queued() const { return rel_.queued(); }
 	uint64_t reliable_delivered() const { return rel_.delivered(); }
 	// From a snapshot header: what the server has received of this channel.
-	void on_channel_ack(const ChannelAck &p_ack) { rel_.on_ack(p_ack); }
+	void on_channel_ack(const ChannelAck &p_ack) {
+		rel_.on_ack(p_ack);
+		if (!chan_acked_ || seq_newer(p_ack.received, chan_received_)) {
+			chan_acked_ = true;
+			chan_received_ = p_ack.received;
+		}
+	}
 
 	// Whether a packet should go now: a command not sent yet, or one overdue, or a message, and the
 	// interval is up.
@@ -168,7 +174,7 @@ public:
 			return true;
 		}
 		for (const Cmd &c : ring_) {
-			if (c.sends == 0 || p_now - c.last_sent_ms >= overdue_ms()) {
+			if (c.sends == 0 || p_now - c.last_sent_ms >= overdue_ms() || proven_lost(c)) {
 				return true;
 			}
 		}
@@ -200,7 +206,7 @@ public:
 		std::vector<size_t> picks;
 		std::vector<uint32_t> streams;
 		for (size_t i = 0; i < size; i++) {
-			if (i < fresh_from && p_now - ring_[i].last_sent_ms < overdue) {
+			if (i < fresh_from && p_now - ring_[i].last_sent_ms < overdue && !proven_lost(ring_[i])) {
 				continue;
 			}
 			if (std::find(streams.begin(), streams.end(), ring_[i].stream) == streams.end()) {
@@ -262,6 +268,7 @@ public:
 				c.resent = true;
 			}
 			c.last_sent_ms = p_now;
+			c.last_packet = seq;
 		}
 		last_send_ms_ = p_now;
 		sent_any_ = true;
@@ -283,9 +290,17 @@ private:
 		bool resent = false; // went again for being overdue
 		uint32_t first_sent_ms = 0;
 		uint32_t last_sent_ms = 0;
+		uint16_t last_packet = 0; // the uplink packet that last carried it
 	};
 
 	uint32_t overdue_ms() const { return goldnet::overdue_ms(srtt_ms_); }
+
+	// The server has a packet newer than the one that last carried this command and still hasn't acked
+	// it: lost, or held behind one that was. Either way it goes again now rather than when overdue,
+	// the netchan's rule for a block. A held one arrives twice, which the server ignores.
+	bool proven_lost(const Cmd &p_c) const {
+		return p_c.sends > 0 && chan_acked_ && seq_newer(chan_received_, p_c.last_packet);
+	}
 
 	// Untimed acks in a row that mean the round trip is longer than overdue_ms (see on_ack).
 	static constexpr int UNTIMED_STREAK = 8;
@@ -303,6 +318,8 @@ private:
 	uint32_t untimed_min_ms_ = 0;
 	uint32_t dropped_ = 0;
 	uint16_t seq_ = 1;
+	bool chan_acked_ = false;
+	uint16_t chan_received_ = 0; // the newest uplink packet the server has received
 	ReliableSender rel_;
 	DatagramSender dgram_;
 };
@@ -327,6 +344,19 @@ public:
 		return it == peers_.end() ? ChannelAckSource() : it->second.chan.ack_source();
 	}
 
+	// Whether p_peer should hear from the server though its command ack hasn't moved (Server's
+	// set_command_ack): it sent commands the server already had, so it lacks the ack, or the server is
+	// holding commands behind a lost one and the peer needs to see which packets arrived to send it
+	// again (CommandSender::proven_lost). Cleared by the call.
+	bool take_news(int32_t p_peer) {
+		auto it = peers_.find(p_peer);
+		if (it == peers_.end() || !it->second.news) {
+			return false;
+		}
+		it->second.news = false;
+		return true;
+	}
+
 	// Commands p_peer gave up on before they arrived.
 	uint32_t skipped(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
@@ -347,6 +377,7 @@ private:
 		std::unordered_map<uint16_t, Held> held;
 		uint32_t skipped = 0;
 		bool warned = false;
+		bool news = false; // see take_news
 		ChannelReceiver chan;
 	};
 	// Commands held for a gap to fill are bounded by what a client can have unacked.
@@ -436,10 +467,12 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		p.next = floor;
 		p.delivered = true;
 	}
+	bool any_new = false;
 	for (In &c : cmds) {
-		if (seq_newer(p.next, c.seq) || (uint16_t)(c.seq - p.next) >= MAX_AHEAD || p.held.count(c.seq)) {
-			continue; // delivered already, implausibly far ahead, or a repeat
+		if (seq_newer(p.next, c.seq) || p.held.count(c.seq) || (uint16_t)(c.seq - p.next) >= MAX_AHEAD) {
+			continue; // delivered already, a repeat, or implausibly far ahead
 		}
+		any_new = true;
 		p.held[c.seq] = Held{ streams[c.stream], std::move(c.bytes) };
 	}
 	for (auto it = p.held.find(p.next); it != p.held.end(); it = p.held.find(p.next)) {
@@ -448,6 +481,11 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		p.next = command_seq_next(p.next);
 		p.delivered = true;
 		p_host.command(p_peer, h.stream, h.bytes.data(), h.bytes.size());
+	}
+	// Nothing new in a packet of commands: backups ride with new ones, so this is the client resending
+	// for want of our ack. Or the server is stuck behind a lost one.
+	if ((!cmds.empty() && !any_new) || !p.held.empty()) {
+		p.news = true;
 	}
 	for (const std::vector<uint8_t> &m : unreliable) {
 		p_host.message(p_peer, m.data(), m.size(), false);
