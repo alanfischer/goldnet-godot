@@ -13,10 +13,16 @@
 // against the last frame it acked, and a full frame only on its first send or when that
 // ack has aged out. Spawn-only configs are left to the inner. MultiplayerSpawners are
 // wrapped so their spawns and despawns are streamed through the same path.
+//
+// Upstream, an @rpc a node lists in its "gn_commands" meta is a command stream (see
+// addons/goldnet/command_stream.gd): a client's calls to the server are carried by
+// goldnet::CommandSender instead of the inner, and the server's CommandReceiver calls the method
+// once per call, in order, the way a reliable RPC would.
 
 #include "goldnet/client.h"
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
+#include "goldnet/uplink.h"
 
 #include <vector>
 
@@ -156,6 +162,30 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 
 	void _reset_client_state();
 
+	// --- Command streams (uplink) ---
+	goldnet::CommandSender commands_out;  // client
+	goldnet::CommandReceiver commands_in; // server
+	// Client: the snapshot ack for the next uplink packet. While a command stream is active it waits
+	// for the next command packet rather than going alone, as GoldSrc's acks ride clc_move.
+	uint16_t snapshot_ack = 0;
+	bool snapshot_ack_new = false;
+	// Client: object -> method -> stream id, 0 = an ordinary RPC. Resolved on the first call.
+	HashMap<uint64_t, HashMap<StringName, uint32_t>> command_stream_cache;
+	// Server: stream id -> the method it calls, found by scanning the tree for gn_commands metas.
+	struct CommandTarget {
+		uint64_t object_id = 0;
+		StringName method;
+	};
+	HashMap<uint32_t, CommandTarget> command_targets;
+	uint64_t command_scan_ms = 0;
+	// Server: the peer whose command is being delivered, for get_remote_sender_id().
+	int32_t command_sender = 0;
+	uint32_t _command_stream_id(Object *p_object, const StringName &p_method);
+	void _scan_command_targets(Node *p_node);
+	void _deliver_command(int32_t p_peer, uint32_t p_stream, const uint8_t *p_data, size_t p_size);
+	void _send_uplink();
+	struct UplinkHost;
+
 	// Re-emit the inner API's lifecycle signals on ourselves (the game listens on us).
 	void _relay_peer_connected(int64_t p_id);
 	void _relay_peer_disconnected(int64_t p_id);
@@ -252,14 +282,21 @@ public:
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
 	void set_relevance_events(bool p_enabled);
 	bool get_relevance_events() const;
+
+	// Client: command packets per second (GoldSrc cl_cmdrate). 0 (the default) sends whenever there
+	// is a command to send, which a game calling its command RPC once per tick makes once per tick.
+	void set_command_rate(double p_hz);
+	double get_command_rate() const;
+	// Client: {pending: unacked commands, dropped: given up on, rtt_ms: the command round trip}.
+	Dictionary get_command_stats() const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).
 	void apply_snapshot(const PackedByteArray &p_bytes);
 
-	// Server-side: a client acked the newest frame it received (called by
-	// GoldNetLink::_gn_ack). Advances that peer's delta baseline.
-	void on_ack(int32_t p_peer, int32_t p_seq);
+	// Server-side: one uplink packet from a client (called by GoldNetLink::_gn_up) — its snapshot
+	// ack and its commands.
+	void on_uplink(int32_t p_peer, const PackedByteArray &p_bytes);
 
 	// MultiplayerAPIExtension virtuals.
 	virtual Error _poll() override;

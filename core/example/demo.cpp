@@ -1,15 +1,19 @@
 // goldnet's core over plain UDP, no Godot: a server bounces balls around a box, spawning and
-// despawning them, and any number of clients draw what the snapshot stream tells them.
+// despawning them, and any number of clients draw what the snapshot stream tells them. Each client
+// also sends the server a command every 16 ms over the uplink, the way Quake sends usercmds, and
+// the server reports whether every one arrived in order.
 //
 //   ./goldnet_demo server [--port 27500] [--loss PCT] [--latency MS] [--rate BYTES_PER_SEC]
-//   ./goldnet_demo client [--host 127.0.0.1] [--port 27500]
+//   ./goldnet_demo client [--host 127.0.0.1] [--port 27500] [--loss PCT] [--latency MS]
 //
-// Client -> server datagrams are 'H' (hello: start a session) or 'A' + u16 seq (ack). Server ->
-// client datagrams are goldnet snapshots, unframed.
+// --loss and --latency apply to whichever end they're given to: the server's snapshots, or the
+// client's uplink. Client -> server datagrams are 'H' (hello: start a session) or 'U' + an uplink
+// packet (snapshot ack and commands). Server -> client datagrams are goldnet snapshots, unframed.
 
 #include "goldnet/client.h"
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
+#include "goldnet/uplink.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -36,6 +40,8 @@ static const int H = 18;
 static const uint32_t TICK_MS = 33;
 static const uint32_t TIMEOUT_MS = 3000;
 static const uint32_t SCOREBOARD_ID = 1; // a map-static entity: both ends know it, no spawn needed
+static const uint32_t CMD_MS = 16;
+static const uint32_t CMD_STREAM = 1;
 
 // Ball slots: x, y, heading, bounces.
 static const int BALL_SLOTS = 4;
@@ -151,7 +157,11 @@ struct ServerApp {
 	struct PeerInfo {
 		sockaddr_in addr;
 		uint32_t last_heard;
+		uint32_t commands = 0;     // since the last report
+		uint32_t out_of_order = 0; // ever: should stay 0
+		uint32_t expect = 0;
 	};
+	CommandReceiver commands;
 	std::map<int32_t, PeerInfo> peers;
 	std::map<std::string, int32_t> by_addr;
 	int32_t next_peer = 1;
@@ -199,6 +209,19 @@ struct ServerApp {
 		} else {
 			sim.enqueue(now, peer, delay, std::move(o));
 		}
+	}
+
+	// The host interface CommandReceiver::receive() calls back into.
+	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
+	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq); }
+	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
+		PeerInfo &p = peers[peer];
+		const uint32_t n = size >= 4 ? data[0] | (data[1] << 8) | (data[2] << 16) | ((uint32_t)data[3] << 24) : 0;
+		if (p.commands + p.out_of_order > 0 && n != p.expect) {
+			p.out_of_order++;
+		}
+		p.expect = n + 1;
+		p.commands++;
 	}
 
 	void transmit(const Outgoing &o) {
@@ -268,9 +291,10 @@ struct ServerApp {
 					server.set_peer_rate(id, rate);
 				}
 				printf("[server] peer %d joined from %s\n", id, key.c_str());
-			} else if (buf[0] == 'A' && n >= 3 && it != by_addr.end()) {
+			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
-				server.on_ack(it->second, (uint16_t)(buf[1] | (buf[2] << 8)));
+				commands.receive(it->second, buf + 1, (size_t)n - 1, *this);
+				server.set_command_ack(it->second, commands.ack(it->second));
 			}
 			len = sizeof(from);
 		}
@@ -281,6 +305,7 @@ struct ServerApp {
 		by_addr.erase(addr_key(peers[id].addr));
 		peers.erase(id);
 		server.remove_peer(id);
+		commands.remove_peer(id);
 		sim.forget_link(id);
 	}
 
@@ -327,9 +352,13 @@ struct ServerApp {
 				printf("[server] %zu peers, %zu balls, %d snapshots/s, %.1f KB/s out\n", peers.size(),
 						balls.size(), packets_out, bytes_out / 1024.0);
 				for (auto &kv : peers) {
+					printf("[server]   peer %d: %u commands/s, %u out of order, %u given up on", kv.first,
+							kv.second.commands, kv.second.out_of_order, commands.skipped(kv.first));
 					if (rate) {
-						printf("[server]   peer %d choked %u times\n", kv.first, server.chokes(kv.first));
+						printf(", choked %u times", server.chokes(kv.first));
 					}
+					printf("\n");
+					kv.second.commands = 0;
 				}
 				bytes_out = 0;
 				packets_out = 0;
@@ -346,6 +375,10 @@ struct ClientApp {
 	int fd = -1;
 	sockaddr_in server_addr = {};
 	Client<Value> client;
+	CommandSender commands;
+	NetSim<std::vector<uint8_t>> sim; // on the uplink
+	uint16_t snapshot_ack = 0;
+	uint32_t next_command = 0;
 
 	struct Ent {
 		char letter;
@@ -360,10 +393,8 @@ struct ClientApp {
 	// The host interface Client::apply() calls back into.
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
-	void send_ack(uint16_t seq) {
-		const uint8_t pkt[3] = { 'A', (uint8_t)(seq & 0xFF), (uint8_t)(seq >> 8) };
-		sendto(fd, pkt, sizeof(pkt), 0, (sockaddr *)&server_addr, sizeof(server_addr));
-	}
+	void command_ack(uint16_t seq) { commands.on_ack(seq, now_ms()); }
+	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
 		spawns++;
@@ -387,8 +418,39 @@ struct ClientApp {
 	void end_entity(bool) {}
 	Value decode(Reader &r, uint32_t ref_time_ms) { return decode_value(r, ref_time_ms); }
 
+	void transmit(const std::vector<uint8_t> &pkt) {
+		sendto(fd, pkt.data(), pkt.size(), 0, (sockaddr *)&server_addr, sizeof(server_addr));
+	}
+
+	// This tick's command: its number and a few bytes that rarely change, which the uplink's
+	// delta coding makes nearly free.
+	void make_command(uint32_t now) {
+		const uint32_t n = next_command++;
+		const uint8_t cmd[8] = { (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24), 1, 2, 3, 4 };
+		commands.push(CMD_STREAM, cmd, sizeof(cmd), now);
+		if (!commands.due(now)) {
+			return;
+		}
+		Writer w;
+		w.put_u8('U');
+		commands.write(now, snapshot_ack, w);
+		if (sim.loss_roll()) {
+			return;
+		}
+		std::vector<uint8_t> pkt(w.data(), w.data() + w.size());
+		const int delay = sim.schedule(now, 0, pkt.size(), true);
+		if (delay == 0) {
+			transmit(pkt);
+		} else if (delay > 0) {
+			sim.enqueue(now, 0, delay, std::move(pkt));
+		}
+	}
+
 	void new_session() {
 		client.reset();
+		commands.reset();
+		snapshot_ack = 0;
+		next_command = 0;
 		ents.clear();
 		ents[SCOREBOARD_ID] = Ent{ '#', std::vector<Value>(2) };
 		const uint8_t hello = 'H';
@@ -408,11 +470,14 @@ struct ClientApp {
 			}
 		}
 		const Ent &score = ents[SCOREBOARD_ID];
+		char cmds[96];
+		snprintf(cmds, sizeof(cmds), "%u commands sent, %zu unacked, rtt %u ms", next_command, commands.pending(),
+				commands.rtt_ms());
 		if (!tty) {
 			printf("[client] t=%.1fs %d snapshots (%d committed), %.1f KB/s, %d spawns, %d despawns, "
-				   "%lld balls, %lld bounces\n",
+				   "%lld balls, %lld bounces; %s\n",
 					server_ms / 1000.0, snapshots, committed, bytes_in / 1024.0, spawns, despawns,
-					(long long)as_int(score.vals[0]), (long long)as_int(score.vals[1]));
+					(long long)as_int(score.vals[0]), (long long)as_int(score.vals[1]), cmds);
 			return;
 		}
 		std::string out = "\x1b[H\x1b[2J";
@@ -426,6 +491,7 @@ struct ClientApp {
 				server_ms / 1000.0, (long long)as_int(score.vals[0]), (long long)as_int(score.vals[1]), spawns,
 				despawns);
 		out += line;
+		out += std::string("uplink: ") + cmds + "\n";
 		for (auto &kv : ents) {
 			if (kv.first == SCOREBOARD_ID) {
 				continue;
@@ -458,6 +524,7 @@ struct ClientApp {
 		uint32_t last_heard = 0;
 		uint32_t next_hello = now_ms() + 500;
 		uint32_t next_draw = now_ms() + draw_ms;
+		uint32_t next_cmd = now_ms();
 		new_session();
 		printf("[client] saying hello to %s:%d\n", host, port);
 
@@ -476,6 +543,14 @@ struct ClientApp {
 				}
 			}
 			const uint32_t now = now_ms();
+			sim.pump(now, [&](std::vector<uint8_t> &pkt) { transmit(pkt); });
+			if (last_heard != 0 && (int32_t)(now - next_cmd) >= 0) {
+				make_command(now);
+				next_cmd += CMD_MS;
+				if ((int32_t)(now - next_cmd) >= 0) {
+					next_cmd = now + CMD_MS; // stalled: don't burst to catch up
+				}
+			}
 			if (last_heard == 0 && (int32_t)(now - next_hello) >= 0) {
 				new_session(); // no server yet: keep knocking
 				next_hello = now + 500;
@@ -489,7 +564,8 @@ struct ClientApp {
 				bytes_in = 0;
 				next_draw += draw_ms;
 			}
-			wait_readable(fd, (int)(int32_t)(next_draw - now_ms()));
+			const uint32_t wake = (int32_t)(next_cmd - next_draw) < 0 && last_heard != 0 ? next_cmd : next_draw;
+			wait_readable(fd, (int)(int32_t)(wake - now_ms()));
 		}
 	}
 };
@@ -497,7 +573,7 @@ struct ClientApp {
 static void usage() {
 	fprintf(stderr,
 			"usage: goldnet_demo server [--port N] [--loss PCT] [--latency MS] [--rate BYTES_PER_SEC]\n"
-			"       goldnet_demo client [--host H] [--port N]\n");
+			"       goldnet_demo client [--host H] [--port N] [--loss PCT] [--latency MS]\n");
 	exit(2);
 }
 
@@ -510,6 +586,7 @@ int main(int argc, char **argv) {
 	uint16_t port = 27500;
 	const char *host = "127.0.0.1";
 	static ServerApp srv;
+	static ClientApp cl;
 	for (int i = 2; i < argc; i++) {
 		const std::string a = argv[i];
 		if (i + 1 >= argc) {
@@ -522,9 +599,12 @@ int main(int argc, char **argv) {
 			host = v;
 		} else if (a == "--loss") {
 			srv.sim.set_loss_percent(atoi(v));
+			cl.sim.set_loss_percent(atoi(v));
 		} else if (a == "--latency") {
 			srv.sim.set_latency_min_ms(atoi(v));
 			srv.sim.set_latency_max_ms(atoi(v));
+			cl.sim.set_latency_min_ms(atoi(v));
+			cl.sim.set_latency_max_ms(atoi(v));
 		} else if (a == "--rate") {
 			srv.rate = (uint32_t)atoi(v);
 		} else {
@@ -535,7 +615,6 @@ int main(int argc, char **argv) {
 		return srv.run(port);
 	}
 	if (mode == "client") {
-		static ClientApp cl;
 		return cl.run(host, port);
 	}
 	usage();

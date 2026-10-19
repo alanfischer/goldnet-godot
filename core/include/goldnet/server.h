@@ -232,6 +232,10 @@ public:
 		const double start = pr.clear_at_ms > (double)p_now ? pr.clear_at_ms : (double)p_now;
 		pr.clear_at_ms = start + (double)p_bytes * 1000.0 / (double)pr.rate_bps;
 	}
+	// The newest command this peer sent that the host has delivered with none missing before it
+	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none.
+	void set_command_ack(int32_t p_peer, uint16_t p_seq) { rings_[p_peer].cmd_ack = p_seq; }
+
 	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
 	uint32_t chokes(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
@@ -358,6 +362,8 @@ private:
 		// merely a later tick touching it again.
 		std::unordered_map<uint32_t, uint32_t> stale_since;
 		uint32_t bandwidth_bps = 0;
+		uint16_t cmd_ack = 0;      // see set_command_ack
+		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
 		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
@@ -666,11 +672,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// server_time, the client's only clock feed, so "nothing to report" only earns a skip while
 		// that feed is still fresh. last_packet_ms == 0 is a peer never sent anything — its first
 		// snapshot must go out regardless, or the clock never starts. `seq` is simply left unused.
-		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.last_packet_ms != 0
-				&& p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
+		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
+				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
 		pr.last_packet_ms = p_now;
+		pr.cmd_ack_sent = pr.cmd_ack;
 
 		const int slot = seq & (RING - 1);
 		pr.frames[slot] = std::move(included);
@@ -682,6 +690,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(seq);
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);
+		packet.put_u16(pr.cmd_ack);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);
 		packet.put_u16(despawn_ct);

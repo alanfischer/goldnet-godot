@@ -7,7 +7,8 @@
 // The host passed to apply() provides:
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
-//   void send_ack(uint16_t seq)
+//   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
+//   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
 //        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
@@ -96,6 +97,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const uint16_t seq = r.get_u16();
 	const uint16_t base_seq = r.get_u16();
 	const uint32_t server_time = r.get_u32();
+	const uint16_t command_ack = r.get_u16();
 	info.seq = seq;
 	info.base_seq = base_seq;
 	if (r.failed()) {
@@ -112,6 +114,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// snapshot's time is <= one already fed) but before the baseline-resolution drop below, so a
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
 	p_host.server_time(server_time);
+	p_host.command_ack(command_ack);
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means full state. If
 	// the server diffed against a frame we no longer hold, we can't reconstruct unchanged fields —

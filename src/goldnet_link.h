@@ -25,8 +25,8 @@ public:
 	// Unreliable RPC target: server → client snapshot delivery.
 	void _gn_recv(const PackedByteArray &p_bytes);
 
-	// Unreliable_ordered RPC target: client → server frame ack (newest wins).
-	void _gn_ack(int p_seq);
+	// Unreliable RPC target: client → server uplink packet (snapshot ack and commands).
+	void _gn_up(const PackedByteArray &p_bytes);
 };
 
 } // namespace godot

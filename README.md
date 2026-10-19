@@ -65,6 +65,16 @@ pipeline. A node lands in:
   every transition is observed. goldnet converges instead — if a property goes
   A→B→A between two acked frames, the peer sees only the final A. That holds for
   every slot; goldnet carries *state*, not events. Put events on `@rpc`.
+
+**Commands, the other way.** A client's input to the server (Quake's usercmds) is a stream
+in which every element matters, so it can't converge the way state does. Mark the `@rpc` a
+client calls once per command with `CommandStream.mark(node, &"method")`. Its contract is a
+reliable RPC's — every call reaches the server once, in order — and goldnet keeps it the way
+Quake does instead of with ENet's reliable channel: each unreliable uplink packet carries the
+commands not sent yet, two backups, and any unacked one out longer than a round trip and a half,
+delta-coded against the command before it. The server's ack rides each snapshot header, and the
+client's snapshot ack rides each uplink packet. Without goldnet the marked method is just the
+reliable RPC it was declared as. See **Usage** and [`docs/protocol.md`](docs/protocol.md).
 - **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
   Map-static entities load with the map (both peers already have them) so they need
   no spawn record; runtime entities do, because the client has no other way to know
@@ -75,7 +85,7 @@ server emits one unreliable snapshot:
 
 ```
 [u8 version]     wire version — a mismatched build is dropped, not misparsed
-[u16 seq][u16 base_seq][u32 server_time]
+[u16 seq][u16 base_seq][u32 server_time][u16 command_ack]
 [u16 spawn_ct]   { [u32 net_id][u32 spawner_net_id][var data] } *   (reliable-until-acked)
 [u16 despawn_ct] { [u32 net_id] } *                                 (reliable-until-acked)
 [u16 leave_ct]   { [u32 net_id] } *                                 (reliable-until-acked, opt-in — see PVS below)
@@ -579,6 +589,29 @@ something false.
    cap applies to each client's link separately, a client's to its one uplink. Headless,
    `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
    `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
+9. (Optional) Send client input as a **command stream**. Declare the method a client calls once
+   per command as a reliable `@rpc`, and mark it before the first call:
+   ```gdscript
+   @rpc("any_peer", "call_remote", "reliable")
+   func submit_input(cmd: PackedByteArray) -> void:
+       var sender := multiplayer.get_remote_sender_id()
+       ...
+
+   func _ready() -> void:
+       CommandStream.mark(self, &"submit_input")
+   ```
+   The game code is the same with goldnet or without: every `submit_input.rpc_id(1, cmd)` runs
+   once on the server, in order, with the right sender. goldnet carries it over the uplink (see
+   **How it works**) instead of ENet's reliable channel, so a lost packet costs nothing while
+   the next one is on its way, and a long loss costs at most a round trip and a half. Only a
+   client's calls to the server are carried this way. A command still unacked after
+   `COMMAND_RING` (about a second at 60 Hz) is given up on, the one way it is weaker than the
+   reliable RPC. A lone `PackedByteArray` argument goes as its own bytes; each command is
+   delta-coded bytewise against the previous one, so a fixed layout compresses best.
+   ```gdscript
+   gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
+   gn.get_command_stats()        # {pending, dropped, rtt_ms}
+   ```
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
@@ -597,13 +630,13 @@ runtime entity's spawn and its state stream fit together. `tests/test_protocol.c
 complete minimal pair, `TestServerHost` and `TestClientHost`, over plain ints.
 
 `core/example/demo.cpp` is a runnable one over real UDP (macOS / Linux): a server bouncing
-balls that spawn and despawn, and clients that draw them, with `NetSim` loss/latency and a
-per-peer rate on the server's command line.
+balls that spawn and despawn, and clients that draw them and send it a command every tick over
+the uplink, with `NetSim` loss/latency on either end and a per-peer rate on the server.
 
 ```bash
 cmake -S core/example -B core/example/build && cmake --build core/example/build
 core/example/build/goldnet_demo server --loss 20 --latency 60
-core/example/build/goldnet_demo client      # another terminal; as many as you like
+core/example/build/goldnet_demo client --loss 20 --latency 60   # another terminal; as many as you like
 ```
 
 On the server:
@@ -626,8 +659,25 @@ Per-peer cadence, budget and rate are `set_peer_interval_ms`, `set_peer_bandwidt
 `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
 
 On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
-for a new session. The host's `send_ack(seq)` must reach the server's `on_ack`. Both directions
-expect an unreliable datagram link; the wire format is in [`docs/protocol.md`](docs/protocol.md).
+for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink
+packet carries. The uplink (`uplink.h`) is the other direction:
+
+```cpp
+goldnet::CommandSender commands;              // client
+commands.push(stream_id, bytes, size, now);   // one command
+if (commands.due(now)) {                      // or whenever an ack is waiting
+    goldnet::Writer w;
+    commands.write(now, snapshot_ack, w);     // send w to the server
+}
+commands.on_ack(seq, now);                    // from the client host's command_ack(seq)
+
+goldnet::CommandReceiver receiver;            // server
+receiver.receive(peer, bytes, size, host);    // host gets snapshot_ack() and each command() in order
+server.set_command_ack(peer, receiver.ack(peer));
+```
+
+Both directions expect an unreliable datagram link; the wire format is in
+[`docs/protocol.md`](docs/protocol.md).
 `goldnet::NetSim` (`netsim.h`) adds simulated loss, latency, spikes and a slow link to your send
 path; its header shows the calls.
 

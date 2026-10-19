@@ -86,6 +86,9 @@ func _ready() -> void:
 		multiplayer.connection_failed.connect(func(): _bail("connection failed"))
 		multiplayer.server_disconnected.connect(func(): _bail("server disconnected"))
 
+	CommandStream.mark(self, &"_case_command")
+	CommandStream.mark(self, &"_case_raw")
+
 	print("[%s] case=%s ready on udp:%d" % ["server" if _is_server else "client", _case_name, PORT])
 
 
@@ -123,6 +126,36 @@ func peer_for_index(idx: int) -> int:
 ## How many clients have reported in. Cases wait on this before acting asymmetrically.
 func registered_count() -> int:
 	return _peer_index.size()
+
+
+# --- command streams ---
+#
+# Two marked RPCs (see CommandStream), one taking ordinary arguments and one a lone
+# PackedByteArray, so both payload forms are covered. Server-side they forward to the case.
+
+const CommandStream = preload("res://addons/goldnet/command_stream.gd")
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _case_command(n: int, tag: String) -> void:
+	_case.on_command(multiplayer.get_remote_sender_id(), [n, tag])
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _case_raw(bytes: PackedByteArray) -> void:
+	_case.on_command(multiplayer.get_remote_sender_id(), [bytes])
+
+
+## Client → server: ask the case for its report.
+@rpc("any_peer", "call_remote", "reliable")
+func _case_ask() -> void:
+	_case_report.rpc_id(multiplayer.get_remote_sender_id(), _case.report())
+
+
+## Server → client, for a case to send back what it saw.
+@rpc("authority", "call_remote", "reliable")
+func _case_report(data: Variant) -> void:
+	_case.on_report(data)
 
 
 ## The replicated entities this peer currently has, by name.
