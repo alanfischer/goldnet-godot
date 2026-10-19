@@ -1,8 +1,8 @@
 #pragma once
 //
-// Send-side network-condition simulation: loss, latency, periodic latency spikes, and a bandwidth
-// cap, applied at a host's send funnels. All send-side: the receiver runs its handler on arrival,
-// so no receive hook is needed. Latency is the full per-leg delay, configured at each sender.
+// Network-condition simulation: loss, latency, periodic latency spikes, and a bandwidth cap. A
+// host runs it at its send funnels, where latency is the full per-leg delay; the Godot binding
+// also runs a second one on what a client receives, so a client alone can simulate its downlink.
 //
 // P is whatever the host needs to replay a deferred send. The sim decides; the host sends:
 //

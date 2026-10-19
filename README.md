@@ -589,6 +589,19 @@ something false.
    cap applies to each client's link separately, a client's to its one uplink. Headless,
    `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
    `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
+
+   `sim_config` is this endpoint's send leg, so on its own a client can only slow its uplink.
+   `recv_sim_config` takes the same keys and applies them to what a client **receives**, so a
+   client alone can play over a slow, lossy downlink with nothing set on the server: loss
+   drops unreliable packets, latency and spikes delay every packet, and `link_bps` queues
+   them. goldnet puts a client's peer behind a wrapper that holds arriving packets in the
+   same sim, and `multiplayer_peer` still returns the peer the game installed. It applies
+   live at any point in a session, and passes packets straight through while it is off.
+   ```gdscript
+   # 28.8k modem, both legs, from the client alone
+   gn.sim_config      = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
+   gn.recv_sim_config = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
+   ```
 9. (Optional) Send client input as a **command stream**. Declare the method a client calls once
    per command as a reliable `@rpc`, and mark it before the first call:
    ```gdscript

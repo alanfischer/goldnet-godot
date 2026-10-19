@@ -9,6 +9,7 @@
 
 #include "goldnet_link.h"
 #include "goldnet_multiplayer.h"
+#include "goldnet_sim_peer.h"
 
 using namespace godot;
 
@@ -18,6 +19,7 @@ void initialize_goldnet_module(ModuleInitializationLevel p_level) {
 	}
 	ClassDB::register_class<GoldNetLink>();
 	ClassDB::register_class<GoldNetMultiplayer>();
+	GDREGISTER_INTERNAL_CLASS(GoldNetSimPeer);
 
 	// godot-cpp only pre-registers instance-binding callbacks for classes it explicitly touches.
 	// Marshaling an object whose nearest native class is bare Node/Object — e.g. an @rpc on a
