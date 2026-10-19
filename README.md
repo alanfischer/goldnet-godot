@@ -23,8 +23,8 @@ loss levels where reliable replication drops clients (see **Performance** below)
 
 ## How it works
 
-**An engine-agnostic core, adapted to Godot.** The protocol itself lives in
-`core/include/goldnet/` as header-only C++ with no Godot dependency: `goldnet::Server`
+**An engine-agnostic core, adapted to Godot.** The protocol itself is
+[goldnet](https://github.com/alanfischer/goldnet), header-only C++ with no Godot dependency, at `extern/goldnet`: `goldnet::Server`
 (change tracking, per-peer deltas against the acked frame, acks, spawns, leaves, the
 packet budget) and `goldnet::Client` (baseline reconstruction and apply), over the
 byte-level wire in `buffer.h` / `codec.h` / `protocol.h`, plus `goldnet::NetSim`, the
@@ -80,7 +80,7 @@ Quake does instead of with ENet's reliable channel: each unreliable uplink packe
 commands not sent yet, two backups, and any unacked one out longer than a round trip and a half,
 delta-coded against the command before it. The server's ack rides each snapshot header, and the
 client's snapshot ack rides each uplink packet. Without goldnet the marked method is just the
-reliable RPC it was declared as. See **Usage** and [`docs/protocol.md`](docs/protocol.md).
+reliable RPC it was declared as. See **Usage** and goldnet's [`docs/protocol.md`](https://github.com/alanfischer/goldnet/blob/main/docs/protocol.md).
 
 **RPCs on the netchan.** Every other `@rpc` between the server and a client rides goldnet's
 packets too, the way GoldSrc's user messages rode its netchan: a reliable RPC in the packet's
@@ -106,7 +106,7 @@ server emits one unreliable snapshot:
 ```
 
 The byte-level contract — primitives, every value tag, the ack, and what each end does with a
-snapshot — is in [`docs/protocol.md`](docs/protocol.md).
+snapshot — is in goldnet's [`docs/protocol.md`](https://github.com/alanfischer/goldnet/blob/main/docs/protocol.md).
 
 - `base_seq` is the frame this peer last acked (0 = full state). The server keeps a
   per-peer ring of recent frames; the client keeps a matching ring and acks the
@@ -295,9 +295,12 @@ Part of a set of Godot 4 libraries for GoldSrc-style games:
 - [pmove-godot](https://github.com/alanfischer/pmove-godot): GoldSrc player movement and client prediction
 - **goldnet-godot**: snapshot replication behind Godot's `MultiplayerAPI`
 
+The protocol under it is [goldnet](https://github.com/alanfischer/goldnet), which has no engine dependency.
+
 ## Building
 
 ```bash
+git submodule update --init      # godot-cpp and goldnet
 ./build.sh            # all platforms (macos linux windows android)
 ./build.sh macos      # just one
 ```
@@ -314,39 +317,10 @@ In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
 
 ## Testing
 
-```bash
-cmake -S tests -B tests/build
-cmake --build tests/build
-ctest --test-dir tests/build --output-on-failure
-```
-
-Standalone — no godot-cpp, no engine, runs in about a second. It covers the core in
-`core/include/goldnet/`:
-
-- `test_codec`: the zig-zag and unsigned varint codecs (round-trip, encoded widths, and
-  malformed over-long streams, which are reachable from the wire), the angle16/angle8
-  quantizers (round-trip, wraparound, non-finite input), the half-float codec (every
-  non-NaN value, and the round-to-nearest-even edges), the bounds-checked `Reader`, and
-  the seeded loss PRNG.
-- `test_seq`: uint16 sequence comparison across rollover and the reliable-until-acked
-  bookkeeping.
-- `test_protocol`: a real `goldnet::Server` feeding real `goldnet::Client`s over a fake
-  link that drops snapshots or acks, with plain ints as values — deltas against the
-  acked baseline, self-heal after a lost snapshot or ack, ack aging into a full frame,
-  lazy and reliable spawns, despawns scoped to holders, derived PVS leaves (including
-  re-entry before the leave is acked), the packet budget and its priority order,
-  per-peer cadence, push-declared slots, the clock keepalive, warmup defer, and
-  reordered, truncated or mismatched packets.
-- `test_auto_rate`: the queue and arrival meters, and the controllers that pick a client's rate and
-  command rate from them.
-- `test_netsim`: config clamping, one seed replaying loss and latency together, the
-  latency range and loss rate, the in-order delay pipe, the spike cycle, and the link
-  cap (serialization, overhead, per-link independence, the full-buffer drop rule).
-
-Scope is deliberate. godot-cpp's engine classes call through GDExtension function
-pointers that only exist inside a running Godot process, so the Godot adapter in `src/`
-— synchronizers, spawners, `Variant` encoding — is covered by the integration suite
-below instead.
+The protocol core is tested in [goldnet](https://github.com/alanfischer/goldnet) itself, without an engine. godot-cpp's engine
+classes call through GDExtension function pointers that only exist inside a running Godot
+process, so the Godot adapter in `src/` (synchronizers, spawners, `Variant` encoding) is covered
+by the integration suite instead.
 
 ### Integration tests
 
@@ -402,7 +376,7 @@ on the *ratio* between successive steps), and the rest carry an explicit slop to
 
 ### Mutation
 
-All three suites are worth running under mutation — break the thing a test claims to cover
+All the suites, goldnet's included, are worth running under mutation — break the thing a test claims to cover
 and confirm it goes red. A test that can't fail is worse than no test, because it reads
 like coverage.
 
@@ -633,64 +607,8 @@ something false.
 
 ## Using the core without Godot
 
-`core/include/goldnet/` is header-only C++17 with no dependency beyond the standard library: add
-it to the include path. `goldnet::Server<V, X>` and `goldnet::Client<V>` are templates over your
-engine's value type `V` (default-constructible, copyable, comparable with `!=`) and optional
-per-entity storage `X`. They reach the engine only through a host object you pass in, whose
-methods are listed at the top of `server.h` and `client.h`, and `server.h` also explains how a
-runtime entity's spawn and its state stream fit together. `tests/test_protocol.cpp` has a
-complete minimal pair, `TestServerHost` and `TestClientHost`, over plain ints.
-
-`core/example/demo.cpp` is a runnable one over real UDP (macOS / Linux): a server bouncing
-balls that spawn and despawn, and clients that draw them and send it a command every tick over
-the uplink, with `NetSim` loss/latency on either end and a per-peer rate on the server.
-
-```bash
-cmake -S core/example -B core/example/build && cmake --build core/example/build
-core/example/build/goldnet_demo server --loss 20 --latency 60
-core/example/build/goldnet_demo client --loss 20 --latency 60   # another terminal; as many as you like
-```
-
-On the server:
-
-```cpp
-goldnet::Server<MyValue> server;
-server.set_packet_overhead(28);     // what your link adds per packet, for rate budgets
-
-server.add_entity(key, net_id);     // an entity starts replicating; remove_entity(key)
-server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
-server.mark_dirty(key);             // a pushed slot was written (see gn_push)
-
-server.tick(now_ms, peers, host);   // every tick: reads state, sends each due peer a snapshot
-server.on_ack(peer, seq);           // each ack the client sends
-server.remove_peer(peer);           // on disconnect
-```
-
-Per-peer update rate and rate are `set_peer_update_rate` and `set_peer_rate`, granted under `set_snapshot_rate`; anything else you send a peer counts against its rate through `charge()`. `CommandReceiver` reads each client's rate and update rate (`rate(peer)`, `update_rate(peer)`) and meters its uplink (`uplink_lag_ms(peer)`, `uplink_pps(peer)`) for `server.set_uplink_report`. `auto_rate.h` has the meters and controllers a client runs to pick its rate and command rate (`DownlinkMeter`, `CmdRateAuto`).
-
-On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
-for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink
-packet carries. The uplink (`uplink.h`) is the other direction:
-
-```cpp
-goldnet::CommandSender commands;              // client
-commands.push(stream_id, bytes, size, now);   // one command
-if (commands.due(now)) {                      // or whenever an ack is waiting
-    goldnet::Writer w;
-    commands.write(now, snapshot_ack, w);     // send w to the server
-}
-commands.on_ack(seq, now);                    // from the client host's command_ack(seq)
-commands.set_rate(bytes_per_sec);             // the rate to ask the server for; 0 = no limit
-
-goldnet::CommandReceiver receiver;            // server
-receiver.receive(peer, bytes, size, host);    // host gets snapshot_ack() and each command() in order
-server.set_command_ack(peer, receiver.ack(peer));
-```
-
-Both directions expect an unreliable datagram link; the wire format is in
-[`docs/protocol.md`](docs/protocol.md).
-`goldnet::NetSim` (`netsim.h`) adds simulated loss, latency, spikes and a slow link to your send
-path; its header shows the calls.
+The core is its own library, [goldnet](https://github.com/alanfischer/goldnet): its README covers the API and its examples run it
+over plain UDP.
 
 ## Debugging
 

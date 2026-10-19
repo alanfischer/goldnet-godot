@@ -11,8 +11,8 @@ add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    # The engine-agnostic protocol core (header-only).
-    ${CMAKE_SOURCE_DIR}/core/include
+    # The engine-agnostic protocol core (header-only), from github.com/alanfischer/goldnet.
+    ${CMAKE_SOURCE_DIR}/extern/goldnet/include
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE godot::cpp)
