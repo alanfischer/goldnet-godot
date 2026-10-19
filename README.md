@@ -729,3 +729,7 @@ path; its header shows the calls.
   the `seed` key of the `sim_config` property.
 - `GOLDNET_RPC_NETCHAN=0` — send this end's RPCs through the inner `SceneMultiplayer` instead of
   the netchan, to compare the two.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
