@@ -88,7 +88,9 @@ struct Peer {
 	std::vector<uint32_t> spawned, despawned, lost;
 	std::vector<uint16_t> acks;
 	std::vector<uint32_t> times;
+	std::vector<uint16_t> command_acks;
 	int mismatches = 0;
+	int refuse_spawns = 0; // the host can't create the next N spawns yet
 	uint32_t cur = 0;
 };
 
@@ -96,8 +98,16 @@ struct TestClientHost {
 	Peer *p;
 	void protocol_mismatch() { p->mismatches++; }
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
+	void command_ack(uint16_t seq) { p->command_acks.push_back(seq); }
 	void send_ack(uint16_t seq) { p->acks.push_back(seq); }
-	void spawn(uint32_t net_id, uint32_t, const uint8_t *, size_t) { p->spawned.push_back(net_id); }
+	bool spawn(uint32_t net_id, uint32_t, const uint8_t *, size_t) {
+		if (p->refuse_spawns > 0) {
+			p->refuse_spawns--;
+			return false;
+		}
+		p->spawned.push_back(net_id);
+		return true;
+	}
 	void despawn(uint32_t net_id) { p->despawned.push_back(net_id); }
 	void relevance_lost(uint32_t net_id) { p->lost.push_back(net_id); }
 	bool registered(uint32_t net_id) { return p->slot_count.count(net_id) > 0; }
@@ -359,6 +369,65 @@ static void test_spawn_is_lazy_and_reliable() {
 	printf("  spawns are lazy and reliable; despawns go to holders only: ok\n");
 }
 
+// With acks lost the server resends the spawn and the despawn every tick; the host must still see
+// each once. A spawn the host refuses isn't counted as held, so a resend gets another try.
+static void test_resent_spawn_reaches_host_once() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.refuse_spawns = 2;
+	n.drop_acks.insert(2);
+	n.tick();
+	n.tick();
+	CHECK(a.spawned.empty()); // refused twice
+	n.tick();
+	n.tick();
+	n.tick();
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 }); // accepted on the third, resends ignored
+
+	n.server.despawn(500);
+	n.tick();
+	n.tick();
+	n.tick();
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+
+	n.server.add_spawn(502, TestServer::SpawnRecord());
+	a.refuse_spawns = 100;
+	n.tick();
+	n.server.despawn(502);
+	n.tick();
+	n.tick();
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 }); // never held 502, so no despawn for it
+
+	a.client.reset();
+	a.refuse_spawns = 0;
+	n.drop_acks.clear();
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.tick();
+	CHECK(a.spawned == (std::vector<uint32_t>{ 500, 500 })); // a reused id spawns again
+	printf("  resent spawns and despawns reach the host once: ok\n");
+}
+
+// A refused spawn holds the ack, even on the very first frame: acking would retire the spawn as
+// delivered and nothing would resend it.
+static void test_refused_spawn_holds_ack() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.refuse_spawns = 3;
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	n.tick();
+	n.tick();
+	CHECK(a.spawned.size() == 1);
+	CHECK(n.sent_to(2) == 0 || base_seq_of(n.last_packet(2)) != 0); // acked and back on deltas
+	printf("  a refused spawn holds the ack until it's accepted: ok\n");
+}
+
 static void test_leave_and_reentry() {
 	Net n;
 	n.server.set_relevance_events(true);
@@ -561,6 +630,22 @@ static void test_charged_traffic_delays_the_next_snapshot() {
 	printf("  other traffic charged to a peer delays its next snapshot: ok\n");
 }
 
+// The command ack rides the header, and a new one is worth a snapshot even when nothing else is.
+static void test_command_ack_rides_the_header() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.tick();
+	n.tick();
+	CHECK(n.sent_to(2) == 0); // idle
+	n.server.set_command_ack(2, 77);
+	n.tick();
+	CHECK(n.sent_to(2) == 1 && p.command_acks.back() == 77);
+	n.tick();
+	CHECK(n.sent_to(2) == 0); // told once
+	printf("  the command ack rides the header and earns a send when new: ok\n");
+}
+
 int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
@@ -573,6 +658,9 @@ int main() {
 	test_truncated_packet_not_committed();
 	test_protocol_mismatch_warns_once();
 	test_spawn_is_lazy_and_reliable();
+	test_resent_spawn_reaches_host_once();
+	test_command_ack_rides_the_header();
+	test_refused_spawn_holds_ack();
 	test_leave_and_reentry();
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();

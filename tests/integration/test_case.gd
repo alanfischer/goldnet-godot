@@ -73,6 +73,18 @@ func server_step(_t: float) -> void:
 func client_step(_t: float) -> void:
 	pass
 
+## Server: a command-stream call arrived (see main.gd's _case_command / _case_raw).
+func on_command(_sender: int, _args: Array) -> void:
+	pass
+
+## Server: what to send back when the client asks (main._case_ask).
+func report() -> Variant:
+	return null
+
+## Client: the server sent back a report through main._case_report.
+func on_report(_data: Variant) -> void:
+	pass
+
 ## Set false so entities are gated per peer rather than visible to everyone. Cases doing
 ## PVS work need this — with public visibility on, the per-peer bit is never consulted.
 var public_visibility: bool = true

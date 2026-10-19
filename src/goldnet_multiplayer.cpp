@@ -50,6 +50,23 @@ static uint32_t net_id_for(Node *p_node) {
 // node, e.g. ".:position" or "NetInterp:net_pos") into the target node under
 // `p_root` and the property path to get_indexed/set_indexed on it. Returns null
 // if the target node can't be resolved.
+// p_method's @rpc config, from the two places the engine merges: a node-level rpc_config() (an
+// explicit per-node override) and the script's @rpc annotations (the common case, which
+// get_node_rpc_config() does NOT surface). False if it's in neither, or the target has no script.
+static bool rpc_method_config(Object *p_object, const StringName &p_method, Dictionary &r_config) {
+	Node *n = Object::cast_to<Node>(p_object);
+	Variant cfg = n ? n->get_node_rpc_config() : Variant();
+	if (cfg.get_type() != Variant::DICTIONARY || !Dictionary(cfg).has(p_method)) {
+		Ref<Script> scr = p_object->get_script();
+		cfg = scr.is_valid() ? scr->get_rpc_config() : Variant();
+	}
+	if (cfg.get_type() != Variant::DICTIONARY || !Dictionary(cfg).has(p_method)) {
+		return false;
+	}
+	r_config = Dictionary(cfg)[p_method];
+	return true;
+}
+
 static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath &r_prop) {
 	String node_path;
 	int64_t nc = p_cfg_path.get_name_count();
@@ -322,11 +339,15 @@ GoldNetMultiplayer::~GoldNetMultiplayer() {}
 void GoldNetMultiplayer::_reset_client_state() {
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
+	commands_out.reset();
+	snapshot_ack = 0;
+	snapshot_ack_new = false;
 }
 
 void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
+	commands_in.remove_peer((int32_t)p_id);
 	sim.forget_link((int32_t)p_id);
 	emit_signal("peer_disconnected", p_id);
 }
@@ -401,14 +422,9 @@ GoldNetLink *GoldNetMultiplayer::_ensure_link() {
 		rpc_cfg["channel"] = 0;
 		l->rpc_config("_gn_recv", rpc_cfg);
 
-		// Client → server frame ack. unreliable_ordered so a newer ack always
-		// supersedes an older one and a lost ack self-heals on the next.
-		Dictionary ack_cfg;
-		ack_cfg["rpc_mode"] = MultiplayerAPI::RPC_MODE_ANY_PEER;
-		ack_cfg["transfer_mode"] = MultiplayerPeer::TRANSFER_MODE_UNRELIABLE_ORDERED;
-		ack_cfg["call_local"] = false;
-		ack_cfg["channel"] = 0;
-		l->rpc_config("_gn_ack", ack_cfg);
+		// Client → server uplink: the snapshot ack and any commands. Unreliable, like the snapshot:
+		// each packet repeats the newest ack and every unacked command it can, so a lost one heals.
+		l->rpc_config("_gn_up", rpc_cfg);
 	}
 	return l;
 }
@@ -552,30 +568,29 @@ void GoldNetMultiplayer::_detect_despawns() {
 // Client: build a spawned node from its recipe, add it under the spawner's spawn_path, and
 // fire the spawner's `spawned` signal so the game runs its per-node bookkeeping. The node's
 // child synchronizer auto-registers on enter-tree and streams state like any other entity.
-void GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
-	if (client_spawned.has(p_net_id)) {
-		return; // already have it (redundant reliable-until-acked resend)
-	}
+// False when it can't be built yet; goldnet::Client then takes a later resend.
+bool GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
 	if (!spawner_netid_to_objid.has(p_spawner_net_id)) {
-		return; // spawner not registered here yet — a later resend will land
+		return false; // spawner not registered here yet
 	}
 	uint64_t sobj = spawner_netid_to_objid[p_spawner_net_id];
 	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(ObjectDB::get_instance(sobj));
 	if (!spawner || !spawners.has(sobj)) {
-		return;
+		return false;
 	}
 	Node *spawn_root = spawner->get_node_or_null(spawner->get_spawn_path());
 	if (!spawn_root) {
-		return;
+		return false;
 	}
 	Variant node_v = spawners[sobj].orig_fn.callv(Array::make(p_data));
 	Node *node = Object::cast_to<Node>(node_v);
 	if (!node) {
-		return;
+		return false;
 	}
 	spawn_root->add_child(node);
 	client_spawned[p_net_id] = node->get_instance_id();
 	spawner->emit_signal("spawned", node);
+	return true;
 }
 
 // Client: free a spawned node and fire the spawner's `despawned` signal.
@@ -841,24 +856,6 @@ Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const Stri
 	return OK;
 }
 
-// Look p_method up in one rpc-config Dictionary (method name → per-method config carrying a
-// "transfer_mode" MultiplayerPeer::TransferMode). Sets r_unreliable and returns true if the method
-// is present; returns false (r_unreliable untouched) if absent or the config isn't a Dictionary.
-static bool rpc_cfg_lookup(const Variant &p_config, const StringName &p_method, bool &r_unreliable) {
-	if (p_config.get_type() != Variant::DICTIONARY) {
-		return false;
-	}
-	Dictionary cfg = p_config;
-	if (!cfg.has(p_method)) {
-		return false;
-	}
-	Dictionary mc = cfg[p_method];
-	int tm = (int)mc.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE);
-	r_unreliable = (tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE ||
-			tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE_ORDERED);
-	return true;
-}
-
 // Resolve whether an @rpc method is unreliable (loss-droppable), caching per (object, method). The
 // mode lives in two places the engine merges: node-level runtime rpc_config() (an explicit per-node
 // override) and the script's @rpc annotation config (the common case — WizardWars uses only these,
@@ -875,13 +872,10 @@ bool GoldNetMultiplayer::_rpc_is_unreliable(Object *p_object, const StringName &
 	}
 
 	bool unreliable = false;
-	Node *n = Object::cast_to<Node>(p_object);
-	// Node-level override takes priority; fall back to the script's annotation config.
-	if (!(n && rpc_cfg_lookup(n->get_node_rpc_config(), p_method, unreliable))) {
-		Ref<Script> scr = p_object->get_script();
-		if (scr.is_valid()) {
-			rpc_cfg_lookup(scr->get_rpc_config(), p_method, unreliable);
-		}
+	Dictionary mc;
+	if (rpc_method_config(p_object, p_method, mc)) {
+		const int tm = (int)mc.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE);
+		unreliable = tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE || tm == MultiplayerPeer::TRANSFER_MODE_UNRELIABLE_ORDERED;
 	}
 	_rpc_unreliable_cache[oid][p_method] = unreliable;
 	return unreliable;
@@ -944,6 +938,10 @@ void GoldNetMultiplayer::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
+	ClassDB::bind_method(D_METHOD("set_command_rate", "hz"), &GoldNetMultiplayer::set_command_rate);
+	ClassDB::bind_method(D_METHOD("get_command_rate"), &GoldNetMultiplayer::get_command_rate);
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "command_rate"), "set_command_rate", "get_command_rate");
+	ClassDB::bind_method(D_METHOD("get_command_stats"), &GoldNetMultiplayer::get_command_stats);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "relevance_events"), "set_relevance_events", "get_relevance_events");
 	// Emitted on a client when an owned MultiplayerSynchronizer leaves this peer's PVS (the server
 	// stopped sending it). The game hides/deactivates the entity in response. Entry is not signalled —
@@ -1183,15 +1181,16 @@ struct GoldNetMultiplayer::ClientHost {
 	// Every snapshot's header clock, as an always-on server-time feed (see ServerClock).
 	void server_time(uint32_t ms) { gn->emit_signal("server_time_received", (int64_t)ms); }
 
+	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq, (uint32_t)Time::get_singleton()->get_ticks_msec()); }
+
+	// Carried by the next uplink packet (_send_uplink).
 	void send_ack(uint16_t seq) {
-		GoldNetLink *l = gn->_ensure_link();
-		if (l) {
-			gn->inner->rpc(1, l, "_gn_ack", Array::make((int)seq));
-		}
+		gn->snapshot_ack = seq;
+		gn->snapshot_ack_new = true;
 	}
 
-	void spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
-		gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
+	bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
+		return gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
 	}
 
 	void despawn(uint32_t net_id) { gn->_apply_despawn(net_id); }
@@ -1268,11 +1267,184 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	}
 }
 
-void GoldNetMultiplayer::on_ack(int32_t p_peer, int32_t p_seq) {
-	server.on_ack(p_peer, (uint16_t)p_seq);
+// The Godot side of goldnet::CommandReceiver::receive.
+struct GoldNetMultiplayer::UplinkHost {
+	GoldNetMultiplayer *gn;
+
+	void protocol_mismatch(int32_t peer) {
+		UtilityFunctions::push_error("goldnet: uplink protocol mismatch from peer ", peer, " — the server "
+				"and client are running different goldnet builds. Rebuild/redeploy both to the same version.");
+	}
+	void snapshot_ack(int32_t peer, uint16_t seq) { gn->server.on_ack(peer, seq); }
+	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
+		gn->_deliver_command(peer, stream, data, size);
+	}
+};
+
+void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_bytes) {
+	if (inner->get_unique_id() != 1) {
+		return;
+	}
+	UplinkHost host{ this };
+	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host);
+	server.set_command_ack(p_peer, commands_in.ack(p_peer));
+}
+
+// A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
+// own bytes, the shape a game packing its own command takes; anything else as var_to_bytes.
+static const uint8_t COMMAND_ARGS_VARIANT = 0;
+static const uint8_t COMMAND_ARGS_BYTES = 1;
+
+// The stream id for an RPC, or 0 if it isn't one: the node lists the method in its gn_commands
+// meta, and the method is an @rpc (an unmarked one fails here exactly as it would on stock).
+// Hashed from the node's path and the method, so both ends agree with no handshake.
+uint32_t GoldNetMultiplayer::_command_stream_id(Object *p_object, const StringName &p_method) {
+	const uint64_t oid = p_object->get_instance_id();
+	HashMap<StringName, uint32_t> &methods = command_stream_cache[oid];
+	if (const uint32_t *cached = methods.getptr(p_method)) {
+		return *cached;
+	}
+	uint32_t id = 0;
+	Node *n = Object::cast_to<Node>(p_object);
+	if (n && n->has_meta("gn_commands") && Array(n->get_meta("gn_commands")).has(p_method)) {
+		Dictionary cfg;
+		if (rpc_method_config(p_object, p_method, cfg)) {
+			id = (String(n->get_path()) + "::" + String(p_method)).hash();
+			id = id ? id : 1;
+		} else {
+			UtilityFunctions::push_error("goldnet: '", p_method, "' is in gn_commands but isn't an @rpc; "
+					"calling it as an ordinary RPC.");
+		}
+	}
+	methods[p_method] = id;
+	return id;
+}
+
+void GoldNetMultiplayer::_scan_command_targets(Node *p_node) {
+	if (p_node->has_meta("gn_commands")) {
+		Array methods = p_node->get_meta("gn_commands");
+		for (int i = 0; i < methods.size(); i++) {
+			const StringName method = methods[i];
+			uint32_t id = (String(p_node->get_path()) + "::" + String(method)).hash();
+			id = id ? id : 1;
+			command_targets[id] = CommandTarget{ p_node->get_instance_id(), method };
+		}
+	}
+	for (int i = 0; i < p_node->get_child_count(); i++) {
+		_scan_command_targets(p_node->get_child(i));
+	}
+}
+
+// Call the method a command stands for, as the inner would have for the RPC: the same permission
+// rule, and get_remote_sender_id() answering the client that sent it.
+void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, const uint8_t *p_data, size_t p_size) {
+	const CommandTarget *t = command_targets.getptr(p_stream);
+	Object *o = t ? ObjectDB::get_instance(t->object_id) : nullptr;
+	if (!o) {
+		// A node marked since the last scan, or one freed and re-added. Rescanning is a tree walk, so a
+		// client sending ids nothing matches can't make the server do it more than once a second.
+		const uint64_t now = Time::get_singleton()->get_ticks_msec();
+		if (command_scan_ms != 0 && now - command_scan_ms < 1000) {
+			return;
+		}
+		command_scan_ms = now;
+		command_targets.clear();
+		SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+		if (tree && tree->get_root()) {
+			_scan_command_targets(tree->get_root());
+		}
+		t = command_targets.getptr(p_stream);
+		o = t ? ObjectDB::get_instance(t->object_id) : nullptr;
+		if (!o) {
+			return;
+		}
+	}
+	if (p_size < 1) {
+		return;
+	}
+	Array args;
+	if (p_data[0] == COMMAND_ARGS_BYTES) {
+		PackedByteArray b;
+		b.resize((int64_t)p_size - 1);
+		memcpy(b.ptrw(), p_data + 1, p_size - 1);
+		args.push_back(b);
+	} else {
+		PackedByteArray b;
+		b.resize((int64_t)p_size - 1);
+		memcpy(b.ptrw(), p_data + 1, p_size - 1);
+		Variant v = UtilityFunctions::bytes_to_var(b);
+		if (v.get_type() != Variant::ARRAY) {
+			return;
+		}
+		args = v;
+	}
+	Dictionary cfg;
+	Node *n = Object::cast_to<Node>(o);
+	if (!n || !rpc_method_config(o, t->method, cfg)) {
+		return;
+	}
+	const int mode = (int)cfg.get("rpc_mode", (int)MultiplayerAPI::RPC_MODE_AUTHORITY);
+	if (mode == MultiplayerAPI::RPC_MODE_DISABLED ||
+			(mode == MultiplayerAPI::RPC_MODE_AUTHORITY && n->get_multiplayer_authority() != p_peer)) {
+		return;
+	}
+	const StringName method = t->method;
+	command_sender = p_peer;
+	o->callv(method, args);
+	command_sender = 0;
+}
+
+// Client: one uplink packet, when there are commands due or a snapshot ack to send. While a stream
+// is active the ack waits for the next command packet (which comes within the command interval)
+// rather than costing a packet of its own.
+void GoldNetMultiplayer::_send_uplink() {
+	Ref<MultiplayerPeer> peer = inner->get_multiplayer_peer();
+	if (peer.is_null() || peer->get_connection_status() != MultiplayerPeer::CONNECTION_CONNECTED ||
+			inner->get_unique_id() == 1) {
+		return;
+	}
+	const uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
+	const bool streaming = commands_out.idle_ms(now) < commands_out.interval_ms() + 100;
+	if (!commands_out.due(now) && !(snapshot_ack_new && !streaming)) {
+		return;
+	}
+	GoldNetLink *l = _ensure_link();
+	if (!l) {
+		return;
+	}
+	goldnet::Writer w;
+	commands_out.write(now, snapshot_ack, w);
+	snapshot_ack_new = false;
+	if (sim.loss_percent() > 0 && sim.loss_roll()) {
+		return; // simulated drop
+	}
+	PackedByteArray bytes;
+	bytes.resize((int64_t)w.size());
+	memcpy(bytes.ptrw(), w.data(), w.size());
+	_sim_send(1, l, "_gn_up", Array::make(bytes), true, (int)w.size() + 8);
+}
+
+void GoldNetMultiplayer::set_command_rate(double p_hz) {
+	commands_out.set_interval_ms(p_hz > 0.0 ? (uint32_t)std::lround(1000.0 / p_hz) : 0);
+}
+
+double GoldNetMultiplayer::get_command_rate() const {
+	const uint32_t iv = commands_out.interval_ms();
+	return iv > 0 ? 1000.0 / (double)iv : 0.0;
+}
+
+Dictionary GoldNetMultiplayer::get_command_stats() const {
+	Dictionary d;
+	d["pending"] = (int)commands_out.pending();
+	d["dropped"] = (int)commands_out.dropped();
+	d["rtt_ms"] = (int)commands_out.rtt_ms();
+	return d;
 }
 
 Error GoldNetMultiplayer::_poll() {
+	// Before the inner polls, since that is when its peer flushes: a command made this frame goes out
+	// this frame, as the RPC it replaces would have.
+	_send_uplink();
 	Error e = inner->poll();
 	_ensure_link();
 	uint64_t now = Time::get_singleton()->get_ticks_msec();
@@ -1348,14 +1520,32 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	// send-side loss (unreliable only) + latency/spike here; the game can't observe the few-ms
 	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
 	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
-	// (netsim_plan §4a). This is what lets /sim_loss exercise the input-command redundancy ring.
+	// (netsim_plan §4a). A command stream's calls skip this: they ride the uplink, whose own send
+	// (_send_uplink) the sim applies to.
+	if (rpc_stats) {
+		_rpc_stats_count(p_peer, p_object, p_method, p_args);
+	}
+	// A command stream's call rides the uplink instead (see _command_stream_id).
+	if (p_peer == 1 && inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() != 1) {
+		if (const uint32_t stream = _command_stream_id(p_object, p_method)) {
+			std::vector<uint8_t> payload;
+			if (p_args.size() == 1 && p_args[0].get_type() == Variant::PACKED_BYTE_ARRAY) {
+				const PackedByteArray b = p_args[0];
+				payload.push_back(COMMAND_ARGS_BYTES);
+				payload.insert(payload.end(), b.ptr(), b.ptr() + b.size());
+			} else {
+				const PackedByteArray b = UtilityFunctions::var_to_bytes(p_args);
+				payload.push_back(COMMAND_ARGS_VARIANT);
+				payload.insert(payload.end(), b.ptr(), b.ptr() + b.size());
+			}
+			commands_out.push(stream, payload.data(), payload.size(), (uint32_t)Time::get_singleton()->get_ticks_msec());
+			return OK;
+		}
+	}
 	const bool simulating = sim.loss_percent() > 0 || sim.bandwidth_bps() > 0;
 	const bool droppable = simulating && _rpc_is_unreliable(p_object, p_method);
 	if (droppable && sim.loss_percent() > 0 && sim.loss_roll()) {
 		return OK; // simulated drop
-	}
-	if (rpc_stats) {
-		_rpc_stats_count(p_peer, p_object, p_method, p_args);
 	}
 	_charge_rpc(p_peer, p_args);
 	return _sim_send(p_peer, p_object, p_method, p_args, droppable);
@@ -1426,7 +1616,7 @@ void GoldNetMultiplayer::_rpc_stats_print(uint64_t p_now) {
 }
 
 int32_t GoldNetMultiplayer::_get_remote_sender_id() const {
-	return inner->get_remote_sender_id();
+	return command_sender != 0 ? command_sender : inner->get_remote_sender_id();
 }
 
 Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Variant &p_config) {

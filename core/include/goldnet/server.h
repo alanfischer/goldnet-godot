@@ -19,6 +19,25 @@
 //   void encode(Writer &w, const V &v, uint8_t quant, uint32_t now_ms)  one tagged value
 //   void send(int32_t peer, const Writer &packet)
 //
+// Spawns. An entity the client already has (one loaded with the map, at the same net_id on both
+// ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
+// is two registrations under one net_id, and the host makes both:
+//
+//   add_spawn(net_id, record)   tells each peer to create it; record.data is the host's recipe
+//   add_entity(key, net_id)     streams its slot state, like any other entity
+//
+// and when it's destroyed, despawn(net_id) and remove_entity(key). Calling both on the same tick
+// is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
+// first time the entity is visible to it (see SpawnRecord::vis_keys), is re-sent in every
+// snapshot until the peer acks one carrying it, and the despawn reaches only peers that got it.
+//
+// On the client, Client::apply() hands each spawn to the host's spawn() before it reads the
+// deltas, so by the time spawn() returns, registered() and begin_entity() must know the entity.
+// A delta for an id the host doesn't know is discarded and the frame still acked, and an idle
+// entity's state is then never sent again. A host that can't create it yet returns false from
+// spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
+// the client withholds the ack and the server keeps offering it (Client::apply has the details).
+//
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
 #include "goldnet/protocol.h"
@@ -67,8 +86,9 @@ public:
 	};
 
 	// A runtime entity's creation record, replayed to each peer the first time the entity is
-	// visible to it. node_key is the host's handle for detecting the entity's destruction;
-	// vis_keys are the keys to ask spawn_visible() about. data is opaque to the protocol.
+	// visible to it. spawner_net_id names what creates it on the client (0 = none) and goes on the
+	// wire with data, which is opaque to the protocol. node_key is the host's own; the server never
+	// reads it. vis_keys are the keys to ask spawn_visible() about.
 	struct SpawnRecord {
 		uint32_t spawner_net_id = 0;
 		uint64_t node_key = 0;
@@ -212,6 +232,10 @@ public:
 		const double start = pr.clear_at_ms > (double)p_now ? pr.clear_at_ms : (double)p_now;
 		pr.clear_at_ms = start + (double)p_bytes * 1000.0 / (double)pr.rate_bps;
 	}
+	// The newest command this peer sent that the host has delivered with none missing before it
+	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none.
+	void set_command_ack(int32_t p_peer, uint16_t p_seq) { rings_[p_peer].cmd_ack = p_seq; }
+
 	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
 	uint32_t chokes(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
@@ -338,6 +362,8 @@ private:
 		// merely a later tick touching it again.
 		std::unordered_map<uint32_t, uint32_t> stale_since;
 		uint32_t bandwidth_bps = 0;
+		uint16_t cmd_ack = 0;      // see set_command_ack
+		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
 		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
@@ -646,11 +672,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// server_time, the client's only clock feed, so "nothing to report" only earns a skip while
 		// that feed is still fresh. last_packet_ms == 0 is a peer never sent anything — its first
 		// snapshot must go out regardless, or the clock never starts. `seq` is simply left unused.
-		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.last_packet_ms != 0
-				&& p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
+		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
+				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
 		pr.last_packet_ms = p_now;
+		pr.cmd_ack_sent = pr.cmd_ack;
 
 		const int slot = seq & (RING - 1);
 		pr.frames[slot] = std::move(included);
@@ -662,6 +690,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		packet.put_u16(seq);
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);
+		packet.put_u16(pr.cmd_ack);
 		packet.put_u16(spawn_ct);
 		packet.put_data(spawn_body);
 		packet.put_u16(despawn_ct);

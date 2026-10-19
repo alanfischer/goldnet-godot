@@ -17,7 +17,9 @@ namespace goldnet {
 // v4: two new self-describing value tags, TAG_ANGLE8 and TAG_TIME_DELTA — an old decoder seeing
 // either would fall through to the opaque-value default and misparse the stream, so this must bump
 // even though nothing about the existing tags changed.
-static const uint8_t SNAPSHOT_VERSION = 4;
+// v5: the header carries the client's command ack (see uplink.h), and the client's snapshot ack
+// rides its uplink packet instead of travelling alone.
+static const uint8_t SNAPSHOT_VERSION = 5;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.
@@ -44,10 +46,11 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 // outranks everything that fit this tick on the next one, the same self-heal the leave cap relies on.
 static const int SAFE_PACKET_BYTES = 1200;
 
-// Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, and the four
-// section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when
-// sizing the entity-delta budget, so the budget describes the packet rather than one section.
-static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2;
+// Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, command_ack u16,
+// and the four section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from
+// SAFE_PACKET_BYTES when sizing the entity-delta budget, so the budget describes the packet rather
+// than one section.
+static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2 + 2;
 
 // Longest a peer may go with no snapshot at all. Every snapshot header carries the server's
 // send-time, which the client surfaces as its server clock feed — an always-on feed independent
@@ -56,6 +59,14 @@ static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2;
 // still goes out this often to keep it fed. Cheap: a header-only packet at 4 Hz is ~68 B/s,
 // against the ~450 B/s the skip saves at a 30 Hz tick.
 static const uint32_t CLOCK_KEEPALIVE_MS = 250;
+
+// Unacked commands a client holds for resending (see uplink.h). One that would make it COMMAND_RING
+// + 1 drops the oldest, which the server then skips. ~1s at 60 Hz, which covers a WiFi dropout.
+static const int COMMAND_RING = 64;
+
+// Older commands riding with each new one (GoldSrc cl_cmdbackup): a lost packet or two is covered
+// before anyone could know it was lost.
+static const int COMMAND_BACKUP_DEFAULT = 2;
 
 // Compact, self-delimiting wire encoding for per-slot values: a 1-byte tag, then the payload.
 // The DECODER needs no hint (it reads the tag and knows the width, so a value for an unknown

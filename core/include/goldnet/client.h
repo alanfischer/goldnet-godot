@@ -7,9 +7,11 @@
 // The host passed to apply() provides:
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
-//   void send_ack(uint16_t seq)
-//   void spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
-//   void despawn(uint32_t net_id)
+//   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
+//   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
+//   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
+//        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
+//   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
 //   bool registered(uint32_t net_id)               does an entity with this id exist here?
 //   int  begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer)
@@ -23,6 +25,7 @@
 #include "goldnet/protocol.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace goldnet {
@@ -46,6 +49,7 @@ public:
 			frames_[i].clear();
 			frame_seq_[i] = 0;
 		}
+		spawned_.clear();
 		last_seq_ = 0;
 		has_ = false;
 		defer_streak_ = 0;
@@ -64,6 +68,9 @@ private:
 	uint16_t frame_seq_[RING] = {};
 	uint16_t last_seq_ = 0;
 	bool has_ = false;
+	// Spawns the host accepted. Spawns and despawns are resent until acked, so the same one can
+	// arrive many times; this is what lets the host see each exactly once.
+	std::unordered_set<uint32_t> spawned_;
 	bool warned_mismatch_ = false;
 	// Consecutive frames deferred because a KNOWN entity wasn't ready yet. Capped so an entity that
 	// never resolves can't stall the stream forever; after the cap we accept the frame and move on.
@@ -90,6 +97,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const uint16_t seq = r.get_u16();
 	const uint16_t base_seq = r.get_u16();
 	const uint32_t server_time = r.get_u32();
+	const uint16_t command_ack = r.get_u16();
 	info.seq = seq;
 	info.base_seq = base_seq;
 	if (r.failed()) {
@@ -106,6 +114,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// snapshot's time is <= one already fed) but before the baseline-resolution drop below, so a
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
 	p_host.server_time(server_time);
+	p_host.command_ack(command_ack);
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means full state. If
 	// the server diffed against a frame we no longer hold, we can't reconstruct unchanged fields —
@@ -127,13 +136,18 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// Spawns first: create the entities so they register before the entity deltas below
 	// reference them.
 	const int spawn_ct = r.get_u16();
+	bool spawn_refused = false;
 	for (int i = 0; i < spawn_ct && !r.failed(); i++) {
 		const uint32_t nid = r.get_u32();
 		const uint32_t spawner_nid = r.get_u32();
 		const uint32_t len = r.get_u32();
 		const uint8_t *data = r.get_data(len);
-		if (data) {
-			p_host.spawn(nid, spawner_nid, data, len);
+		if (data && !spawned_.count(nid)) {
+			if (p_host.spawn(nid, spawner_nid, data, len)) {
+				spawned_.insert(nid);
+			} else {
+				spawn_refused = true;
+			}
 		}
 	}
 	info.spawns = spawn_ct;
@@ -216,7 +230,9 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 
 	// Now free despawned entities (after the deltas so nothing applies to one we then free).
 	for (uint32_t nid : despawns) {
-		p_host.despawn(nid);
+		if (spawned_.erase(nid)) {
+			p_host.despawn(nid);
+		}
 	}
 
 	// Drop entities no longer registered here (e.g. after a map change / despawn) so the client
@@ -242,9 +258,15 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// frame so the server keeps resending its full baseline against a frame we hold, and drop this
 	// one uncommitted. Capped, and needs a prior good frame to fall back to; on the very first
 	// frame we just accept it.
-	if (defer_ack && has_ && defer_streak_ < MAX_DEFER_STREAK) {
+	//
+	// A refused spawn holds the same way, for the same reason: acking a frame that carries it tells
+	// the server it was delivered, and it's never sent again. That one holds even on the first
+	// frame, by not acking at all, since the server then keeps sending full state with the spawn.
+	if ((spawn_refused || (defer_ack && has_)) && defer_streak_ < MAX_DEFER_STREAK) {
 		defer_streak_++;
-		p_host.send_ack(last_seq_);
+		if (has_) {
+			p_host.send_ack(last_seq_);
+		}
 		return info;
 	}
 	defer_streak_ = 0;
