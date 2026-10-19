@@ -5,6 +5,8 @@
 #include <cmath>
 #include <vector>
 
+#include <godot_cpp/classes/e_net_multiplayer_peer.hpp>
+#include <godot_cpp/classes/e_net_packet_peer.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/multiplayer_spawner.hpp>
 #include <godot_cpp/classes/scene_multiplayer.hpp>
@@ -344,7 +346,26 @@ void GoldNetMultiplayer::_reset_client_state() {
 	snapshot_ack_new = false;
 }
 
-void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
+// ENet throttles a peer's unreliable sends on its own: when the round trip jumps, as it does under
+// a join's reliable burst, it backs off and drops nearly every unreliable packet, then takes tens
+// of seconds to come back. That is the snapshot stream, which keeps its own rate and choke and
+// can't see what ENet threw away, so the throttle is held where it starts. The setting travels to
+// the remote end too, so the server's call alone covers both directions.
+static void hold_enet_throttle(const Ref<MultiplayerPeer> &p_peer, int32_t p_id) {
+	ENetMultiplayerPeer *enet = Object::cast_to<ENetMultiplayerPeer>(p_peer.ptr());
+	if (!enet) {
+		return;
+	}
+	Ref<ENetPacketPeer> pp = enet->get_peer(p_id);
+	if (pp.is_valid()) {
+		pp->throttle_configure(5000, 2, 0); // ENet's default interval and acceleration; never decelerate
+	}
+}
+
+void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
+	hold_enet_throttle(_get_multiplayer_peer(), (int32_t)p_id);
+	emit_signal("peer_connected", p_id);
+}
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
 	commands_in.remove_peer((int32_t)p_id);
@@ -742,7 +763,8 @@ void GoldNetMultiplayer::set_peer_bandwidth_bps(int p_peer, int p_bps) {
 // turns the whole simulation off and a read-back always matches what was written. Callers that mean
 // to change one knob read, modify and write (see WizardWars' /sim_* commands) — which is only safe
 // because every setter below is idempotent.
-void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
+template <class S>
+static bool apply_sim_config(S &r_sim, const Dictionary &p_cfg, const char *p_property) {
 	// Validate every key BEFORE applying any, so a typo rejects the whole write instead of half
 	// configuring the sim. Unbinding the seven per-knob properties took GDScript's own typo check
 	// away (an invalid property assignment used to be a runtime error); this replaces it. Without
@@ -753,36 +775,73 @@ void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
 		if (k != "loss_percent" && k != "seed" && k != "latency_min_ms" && k != "latency_max_ms" &&
 				k != "spike_ms" && k != "spike_interval_s" && k != "spike_duration_s" && k != "link_bps" &&
 				k != "link_queue_ms" && k != "link_overhead") {
-			ERR_FAIL_MSG("goldnet: unknown sim_config key '" + k +
+			ERR_FAIL_V_MSG(false, String("goldnet: unknown ") + p_property + " key '" + k +
 					"'. Valid keys: loss_percent, seed, latency_min_ms, latency_max_ms, spike_ms, "
 					"spike_interval_s, spike_duration_s, link_bps, link_queue_ms, link_overhead.");
 		}
 	}
-	typedef goldnet::NetSim<PendingSend> Sim;
-	sim.set_loss_percent((int)p_cfg.get("loss_percent", Sim::LOSS_DEFAULT_PERCENT));
-	sim.set_seed((int)p_cfg.get("seed", Sim::SEED_DEFAULT));
-	sim.set_latency_min_ms((int)p_cfg.get("latency_min_ms", Sim::LATENCY_MIN_DEFAULT_MS));
-	sim.set_latency_max_ms((int)p_cfg.get("latency_max_ms", Sim::LATENCY_MAX_DEFAULT_MS));
-	sim.set_spike_ms((int)p_cfg.get("spike_ms", Sim::SPIKE_DEFAULT_MS));
-	sim.set_spike_interval_s((float)p_cfg.get("spike_interval_s", Sim::SPIKE_INTERVAL_DEFAULT_S));
-	sim.set_spike_duration_s((float)p_cfg.get("spike_duration_s", Sim::SPIKE_DURATION_DEFAULT_S));
-	sim.set_bandwidth_bps((int)p_cfg.get("link_bps", Sim::BANDWIDTH_DEFAULT_BPS));
-	sim.set_queue_ms((int)p_cfg.get("link_queue_ms", Sim::QUEUE_DEFAULT_MS));
-	sim.set_packet_overhead((int)p_cfg.get("link_overhead", Sim::PACKET_OVERHEAD_DEFAULT));
+	r_sim.set_loss_percent((int)p_cfg.get("loss_percent", S::LOSS_DEFAULT_PERCENT));
+	r_sim.set_seed((int)p_cfg.get("seed", S::SEED_DEFAULT));
+	r_sim.set_latency_min_ms((int)p_cfg.get("latency_min_ms", S::LATENCY_MIN_DEFAULT_MS));
+	r_sim.set_latency_max_ms((int)p_cfg.get("latency_max_ms", S::LATENCY_MAX_DEFAULT_MS));
+	r_sim.set_spike_ms((int)p_cfg.get("spike_ms", S::SPIKE_DEFAULT_MS));
+	r_sim.set_spike_interval_s((float)p_cfg.get("spike_interval_s", S::SPIKE_INTERVAL_DEFAULT_S));
+	r_sim.set_spike_duration_s((float)p_cfg.get("spike_duration_s", S::SPIKE_DURATION_DEFAULT_S));
+	r_sim.set_bandwidth_bps((int)p_cfg.get("link_bps", S::BANDWIDTH_DEFAULT_BPS));
+	r_sim.set_queue_ms((int)p_cfg.get("link_queue_ms", S::QUEUE_DEFAULT_MS));
+	r_sim.set_packet_overhead((int)p_cfg.get("link_overhead", S::PACKET_OVERHEAD_DEFAULT));
+	return true;
+}
+
+template <class S>
+static Dictionary read_sim_config(const S &p_sim) {
+	Dictionary d;
+	d["loss_percent"] = p_sim.loss_percent();
+	d["seed"] = p_sim.seed();
+	d["latency_min_ms"] = p_sim.latency_min_ms();
+	d["latency_max_ms"] = p_sim.latency_max_ms();
+	d["spike_ms"] = p_sim.spike_ms();
+	d["spike_interval_s"] = p_sim.spike_interval_s();
+	d["spike_duration_s"] = p_sim.spike_duration_s();
+	d["link_bps"] = p_sim.bandwidth_bps();
+	d["link_queue_ms"] = p_sim.queue_ms();
+	d["link_overhead"] = p_sim.packet_overhead();
+	return d;
+}
+
+void GoldNetMultiplayer::set_sim_config(const Dictionary &p_cfg) {
+	apply_sim_config(sim, p_cfg, "sim_config");
 }
 
 Dictionary GoldNetMultiplayer::get_sim_config() const {
+	return read_sim_config(sim);
+}
+
+void GoldNetMultiplayer::set_recv_sim_config(const Dictionary &p_cfg) {
+	if (apply_sim_config(recv_sim, p_cfg, "recv_sim_config") && recv_peer.is_valid()) {
+		apply_sim_config(recv_peer->get_sim(), p_cfg, "recv_sim_config");
+	}
+}
+
+Dictionary GoldNetMultiplayer::get_recv_sim_config() const {
+	return read_sim_config(recv_sim);
+}
+
+Dictionary GoldNetMultiplayer::pop_snapshot_stats() {
+	const goldnet::Client<Variant>::ArrivalStats st = client.pop_arrival_stats();
 	Dictionary d;
-	d["loss_percent"] = sim.loss_percent();
-	d["seed"] = sim.seed();
-	d["latency_min_ms"] = sim.latency_min_ms();
-	d["latency_max_ms"] = sim.latency_max_ms();
-	d["spike_ms"] = sim.spike_ms();
-	d["spike_interval_s"] = sim.spike_interval_s();
-	d["spike_duration_s"] = sim.spike_duration_s();
-	d["link_bps"] = sim.bandwidth_bps();
-	d["link_queue_ms"] = sim.queue_ms();
-	d["link_overhead"] = sim.packet_overhead();
+	d["received"] = (int64_t)st.received;
+	d["lost"] = (int64_t)st.lost;
+	return d;
+}
+
+Dictionary GoldNetMultiplayer::pop_recv_sim_delivered() {
+	if (recv_peer.is_valid()) {
+		return recv_peer->pop_delivered();
+	}
+	Dictionary d;
+	d["bytes"] = 0;
+	d["packets"] = 0;
 	return d;
 }
 
@@ -936,6 +995,11 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_sim_config", "config"), &GoldNetMultiplayer::set_sim_config);
 	ClassDB::bind_method(D_METHOD("get_sim_config"), &GoldNetMultiplayer::get_sim_config);
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "sim_config"), "set_sim_config", "get_sim_config");
+	ClassDB::bind_method(D_METHOD("set_recv_sim_config", "config"), &GoldNetMultiplayer::set_recv_sim_config);
+	ClassDB::bind_method(D_METHOD("get_recv_sim_config"), &GoldNetMultiplayer::get_recv_sim_config);
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "recv_sim_config"), "set_recv_sim_config", "get_recv_sim_config");
+	ClassDB::bind_method(D_METHOD("pop_recv_sim_delivered"), &GoldNetMultiplayer::pop_recv_sim_delivered);
+	ClassDB::bind_method(D_METHOD("pop_snapshot_stats"), &GoldNetMultiplayer::pop_snapshot_stats);
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ClassDB::bind_method(D_METHOD("set_command_rate", "hz"), &GoldNetMultiplayer::set_command_rate);
@@ -1502,11 +1566,25 @@ void GoldNetMultiplayer::_set_multiplayer_peer(const Ref<MultiplayerPeer> &p_pee
 	// Second arming point: the moment a session starts, covering a game that spawns after setting the
 	// peer but before our first poll. Idempotent.
 	capture_spawners();
+	// A client's peer goes in behind the receive sim; a server (id 1) or no peer goes in as is.
+	recv_peer.unref();
+	if (p_peer.is_valid() && p_peer->get_unique_id() != 1) {
+		recv_peer.instantiate();
+		recv_peer->wrap(p_peer);
+		apply_sim_config(recv_peer->get_sim(), read_sim_config(recv_sim), "recv_sim_config");
+		inner->set_multiplayer_peer(recv_peer);
+		return;
+	}
 	inner->set_multiplayer_peer(p_peer);
 }
 
+// The game's own peer, never the receive sim's wrapper around it.
 Ref<MultiplayerPeer> GoldNetMultiplayer::_get_multiplayer_peer() {
-	return inner->get_multiplayer_peer();
+	Ref<MultiplayerPeer> p = inner->get_multiplayer_peer();
+	if (recv_peer.is_valid() && p.ptr() == recv_peer.ptr()) {
+		return recv_peer->get_wrapped();
+	}
+	return p;
 }
 
 int32_t GoldNetMultiplayer::_get_unique_id() const {

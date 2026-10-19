@@ -43,8 +43,23 @@ public:
 		bool committed = false;
 	};
 
+	// Snapshots that arrived, and seqs skipped on the way to them, since the last call. The server
+	// spends a seq only on a snapshot it sends, so a skipped one was lost (or is late, and is taken
+	// back off when it lands). Counted before any check that could still drop the snapshot.
+	struct ArrivalStats {
+		uint32_t received = 0;
+		uint32_t lost = 0;
+	};
+	ArrivalStats pop_arrival_stats() {
+		ArrivalStats s = arrivals_;
+		arrivals_ = ArrivalStats();
+		return s;
+	}
+
 	// A fresh session: old baselines are meaningless.
 	void reset() {
+		arrivals_ = ArrivalStats();
+		arrived_last_ = 0;
 		for (int i = 0; i < RING; i++) {
 			frames_[i].clear();
 			frame_seq_[i] = 0;
@@ -75,6 +90,9 @@ private:
 	// Consecutive frames deferred because a KNOWN entity wasn't ready yet. Capped so an entity that
 	// never resolves can't stall the stream forever; after the cap we accept the frame and move on.
 	uint32_t defer_streak_ = 0;
+	ArrivalStats arrivals_;
+	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
+	void count_arrival(uint16_t p_seq);
 	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
 };
 
@@ -103,6 +121,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if (r.failed()) {
 		return info;
 	}
+	count_arrival(seq);
 
 	// Drop stale/reordered snapshots (unreliable transport). We only advance forward.
 	if (has_ && !seq_newer(seq, last_seq_)) {
@@ -280,6 +299,23 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	p_host.send_ack(seq);
 	info.committed = true;
 	return info;
+}
+
+template <class V>
+void Client<V>::count_arrival(uint16_t p_seq) {
+	arrivals_.received++;
+	if (arrived_last_ == 0) {
+		arrived_last_ = p_seq;
+	} else if (seq_newer(p_seq, arrived_last_)) {
+		uint16_t step = (uint16_t)(p_seq - arrived_last_);
+		if (p_seq < arrived_last_) {
+			step--; // the counter skipped 0 on the way round
+		}
+		arrivals_.lost += step - 1u;
+		arrived_last_ = p_seq;
+	} else if (arrivals_.lost > 0) {
+		arrivals_.lost--; // late, not lost
+	}
 }
 
 } // namespace goldnet

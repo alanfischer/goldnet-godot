@@ -162,7 +162,8 @@ next command due, sent in the peer's next snapshot.
 ## Sequence numbers
 
 `seq` is per peer and counts up from 1. 0 is reserved for "no baseline", so the counter skips it
-when it wraps. Two seqs compare on the circle — `a` is newer than `b` when `(int16)(a − b) > 0` —
+when it wraps. A seq is used only by a snapshot that is sent (a choked or empty one takes none), so
+a gap in the seqs a client receives is a snapshot lost on the way. Two seqs compare on the circle — `a` is newer than `b` when `(int16)(a − b) > 0` —
 which holds while they are within 32767 frames of each other.
 
 Both ends keep the last `RING` = 32 frames, in slot `seq & 31`, and check the stored seq before

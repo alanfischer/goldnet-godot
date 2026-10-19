@@ -23,6 +23,7 @@
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
 #include "goldnet/uplink.h"
+#include "goldnet_sim_peer.h"
 
 #include <vector>
 
@@ -145,6 +146,10 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		Array args;
 	};
 	goldnet::NetSim<PendingSend> sim;
+	// The receive leg (recv_sim_config): its knobs, kept here so they outlive a session, and the
+	// GoldNetSimPeer wrapping the current client peer that applies them.
+	GoldNetSimPeer::Sim recv_sim;
+	Ref<GoldNetSimPeer> recv_peer;
 	// Shared tail of both send funnels: the simulated link, latency and spike, then send now, queue,
 	// or drop. p_droppable: an unreliable send a full link buffer may drop. p_bytes: its wire size,
 	// or -1 to estimate it (only done under a link cap). Returns the inner->rpc Error for the
@@ -277,6 +282,19 @@ public:
 	// else. A non-zero seed replays the whole sim (loss rolls and latency draws); 0 is random.
 	void set_sim_config(const Dictionary &p_cfg);
 	Dictionary get_sim_config() const;
+	// The same knobs for what this endpoint RECEIVES, so a client alone can play over a slow,
+	// lossy downlink without the server being configured for it. Loss drops unreliable packets,
+	// latency and spikes delay every packet, and link_bps queues them. Applies to client peers
+	// only (a server's sends are its own sim_config), and live, at any point in a session.
+	void set_recv_sim_config(const Dictionary &p_cfg);
+	Dictionary get_recv_sim_config() const;
+	// Client: {bytes, packets} the receive sim delivered since the last call. A downlink meter reads
+	// this instead of the transport's counters while the sim is on, since those count what the sim
+	// then holds back or drops. Zeros on a server, which has no receive sim.
+	Dictionary pop_recv_sim_delivered();
+	// Client: {received, lost} snapshots since the last call. The server spends a snapshot seq only
+	// on one it sends, so these are real losses, not the ticks with nothing to send.
+	Dictionary pop_snapshot_stats();
 
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
