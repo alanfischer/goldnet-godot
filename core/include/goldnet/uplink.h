@@ -251,9 +251,7 @@ private:
 		uint32_t last_sent_ms = 0;
 	};
 
-	// Sent longer ago than this and still unacked: presumably lost. A round trip and a half, since the
-	// ack waits for the server's next snapshot, plus a 60 Hz tick.
-	uint32_t overdue_ms() const { return std::max<uint32_t>(srtt_ms_ * 3 / 2, 50) + 16; }
+	uint32_t overdue_ms() const { return goldnet::overdue_ms(srtt_ms_); }
 
 	// Untimed acks in a row that mean the round trip is longer than overdue_ms (see on_ack).
 	static constexpr int UNTIMED_STREAK = 8;

@@ -11,10 +11,12 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "test_support.h"
 #include "goldnet/codec.h"
+#include "goldnet/protocol.h"
 
 using namespace goldnet;
 
@@ -60,74 +62,73 @@ static void test_seq_half_space_boundary() {
 	printf("  seq half-space boundary: ok\n");
 }
 
-// --- reliable_include ---
+// --- owe_include / retire_proven ---
 
-static void test_reliable_include_first_send() {
-	FakeMap wait;
-	// No ack yet: the record is sent and starts being tracked.
-	CHECK(reliable_include(wait, 42, 10, 0, false));
-	CHECK(wait.count(42));
-	CHECK(wait[42] == 10);
-	printf("  reliable_include first send: ok\n");
-}
+typedef std::unordered_map<uint32_t, Owed> OwedMap;
 
-static void test_reliable_include_retains_first_seq() {
-	// The key invariant: the tracked seq is the FIRST send of the unacked run, not the
-	// latest. If it were updated to the current seq on every resend, an ack could never
-	// catch up to it and the record would resend forever.
-	FakeMap wait;
-	reliable_include(wait, 42, 10, 0, false);
-	for (uint16_t seq = 11; seq <= 15; seq++) {
-		CHECK(reliable_include(wait, 42, seq, 0, false)); // still unacked → keep resending
-		CHECK(wait[42] == 10); // first seq preserved
+// The first send and RELIABLE_BACKUP more, then nothing until overdue, then another burst.
+static void test_owe_include_bursts_then_waits_for_overdue() {
+	OwedMap owed;
+	uint32_t now = 1000;
+	uint16_t seq = 10;
+	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
+		CHECK(owe_include(owed, 42, seq++, now, 200, RELIABLE_BACKUP));
+		now += 16;
 	}
-	// An ack for 12 covers the original send at 10, even though we're now at seq 15.
-	CHECK(!reliable_include(wait, 42, 15, 12, true));
-	CHECK(!wait.count(42)); // stopped tracking
-	printf("  reliable_include retains first seq: ok\n");
+	const uint32_t last = now - 16;
+	while (now - last < 200) {
+		CHECK(!owe_include(owed, 42, seq++, now, 200, RELIABLE_BACKUP));
+		now += 16;
+	}
+	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
+		CHECK(owe_include(owed, 42, seq++, now, 200, RELIABLE_BACKUP));
+		now += 16;
+	}
+	CHECK(!owe_include(owed, 42, seq++, now, 200, RELIABLE_BACKUP));
+	printf("  owe_include bursts, then waits for overdue: ok\n");
 }
 
-static void test_reliable_include_ack_too_old() {
-	// An ack that predates the first send doesn't confirm anything.
-	FakeMap wait;
-	reliable_include(wait, 42, 10, 0, false);
-	CHECK(reliable_include(wait, 42, 11, 9, true)); // ack 9 < first send 10 → resend
-	CHECK(wait.count(42));
-	printf("  reliable_include ack too old: ok\n");
+// Only an ack of a snapshot that carried the record proves it arrived. An ack of a later one that
+// didn't is the client's newest frame, not evidence of the earlier one.
+static void test_retire_proven_needs_a_carrier() {
+	OwedMap owed;
+	owe_include(owed, 42, 10, 0, 1000, 0);
+	std::vector<uint32_t> retired;
+	retire_proven(owed, 11, retired);
+	CHECK(retired.empty());
+	CHECK(owed.count(42));
+	retire_proven(owed, 10, retired);
+	CHECK(retired == std::vector<uint32_t>{ 42 });
+	CHECK(!owed.count(42));
+	printf("  retire_proven needs an ack of a carrier: ok\n");
 }
 
-static void test_reliable_include_no_ack_flag() {
-	// has_ack=false means the peer has never acked anything; last_acked is meaningless
-	// and must not be trusted even though its value looks newer.
-	FakeMap wait;
-	reliable_include(wait, 42, 10, 0, false);
-	CHECK(reliable_include(wait, 42, 11, 9999, false));
-	CHECK(wait.count(42));
-	printf("  reliable_include ignores last_acked without has_ack: ok\n");
+static void test_retire_proven_independent_records() {
+	OwedMap owed;
+	owe_include(owed, 1, 10, 0, 1000, 0);
+	owe_include(owed, 2, 11, 0, 1000, 0);
+	owe_include(owed, 3, 11, 0, 1000, 0);
+	std::vector<uint32_t> retired;
+	retire_proven(owed, 11, retired);
+	CHECK(retired.size() == 2);
+	CHECK(owed.count(1) && !owed.count(2) && !owed.count(3));
+	printf("  retire_proven independent records: ok\n");
 }
 
-static void test_reliable_include_rollover() {
-	// First send just before the wrap, ack just after it.
-	FakeMap wait;
-	CHECK(reliable_include(wait, 7, 65530, 0, false));
-	CHECK(wait[7] == 65530);
-	CHECK(!reliable_include(wait, 7, 3, 3, true)); // ack 3 is newer than 65530 → delivered
-	CHECK(!wait.count(7));
-	printf("  reliable_include across rollover: ok\n");
+static void test_retire_proven_across_rollover() {
+	OwedMap owed;
+	owe_include(owed, 7, 65535, 0, 0, 0);
+	owe_include(owed, 7, 1, 50, 0, 0); // seq skips 0 on the wrap
+	std::vector<uint32_t> retired;
+	retire_proven(owed, 1, retired);
+	CHECK(retired == std::vector<uint32_t>{ 7 });
+	printf("  retire_proven across rollover: ok\n");
 }
 
-static void test_reliable_include_independent_records() {
-	// Records must not interfere — acking one leaves the others tracked.
-	FakeMap wait;
-	reliable_include(wait, 1, 10, 0, false);
-	reliable_include(wait, 2, 20, 0, false);
-	reliable_include(wait, 3, 30, 0, false);
-	CHECK(wait.size() == 3);
-	CHECK(!reliable_include(wait, 2, 31, 25, true)); // only #2 is covered by ack 25
-	CHECK(wait.count(1));
-	CHECK(!wait.count(2));
-	CHECK(wait.count(3));
-	printf("  reliable_include independent records: ok\n");
+static void test_overdue_is_a_round_trip_and_a_half() {
+	CHECK(overdue_ms(0) == 66);
+	CHECK(overdue_ms(200) == 316);
+	printf("  overdue is a round trip and a half: ok\n");
 }
 
 // --- derive_leaves ---
@@ -199,72 +200,20 @@ static void test_derive_leaves_empty_baseline_owes_nothing() {
 	printf("  derive_leaves owes a fresh peer nothing: ok\n");
 }
 
-// --- retire_acked ---
-
-static void test_retire_acked() {
-	FakeMap wait;
-	wait[1] = 10;
-	wait[2] = 20;
-	wait[3] = 30;
-
-	std::vector<uint32_t> retired;
-	retire_acked(wait, 20, retired);
-
-	// Entries first sent at or before seq 20 are confirmed delivered and dropped.
-	CHECK(retired.size() == 2);
-	CHECK(!wait.count(1));
-	CHECK(!wait.count(2));
-	CHECK(wait.count(3)); // 30 is still in flight
-	CHECK(wait.size() == 1);
-	printf("  retire_acked partial: ok\n");
-}
-
-static void test_retire_acked_none() {
-	FakeMap wait;
-	wait[1] = 50;
-	wait[2] = 60;
-
-	std::vector<uint32_t> retired;
-	retire_acked(wait, 40, retired);
-
-	CHECK(retired.empty());
-	CHECK(wait.size() == 2);
-	printf("  retire_acked none eligible: ok\n");
-}
-
-static void test_retire_acked_rollover() {
-	FakeMap wait;
-	wait[1] = 65530; // sent just before the wrap
-	wait[2] = 10;    // sent just after
-
-	std::vector<uint32_t> retired;
-	retire_acked(wait, 5, retired); // ack 5: covers 65530, not 10
-
-	CHECK(retired.size() == 1);
-	CHECK(retired[0] == 1);
-	CHECK(!wait.count(1));
-	CHECK(wait.count(2));
-	printf("  retire_acked across rollover: ok\n");
-}
-
 int main() {
 	printf("test_seq\n");
 	test_seq_basic();
 	test_seq_rollover();
 	test_seq_half_space_boundary();
-	test_reliable_include_first_send();
-	test_reliable_include_retains_first_seq();
-	test_reliable_include_ack_too_old();
-	test_reliable_include_no_ack_flag();
-	test_reliable_include_rollover();
-	test_reliable_include_independent_records();
+	test_owe_include_bursts_then_waits_for_overdue();
+	test_retire_proven_needs_a_carrier();
+	test_retire_proven_independent_records();
+	test_retire_proven_across_rollover();
+	test_overdue_is_a_round_trip_and_a_half();
 	test_derive_leaves_is_baseline_minus_visible();
 	test_derive_leaves_recomputes_until_acked();
 	test_derive_leaves_carries_what_the_cap_held_back();
 	test_derive_leaves_empty_baseline_owes_nothing();
-	test_retire_acked();
-	test_retire_acked_none();
-	test_retire_acked_rollover();
 	printf("test_seq: %d checks passed\n", checks);
 	return 0;
 }

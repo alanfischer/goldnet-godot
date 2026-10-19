@@ -213,7 +213,7 @@ struct ServerApp {
 
 	// The host interface CommandReceiver::receive() calls back into.
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
-	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq); }
+	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq, now_ms()); }
 	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
 		PeerInfo &p = peers[peer];
 		const uint32_t n = size >= 4 ? data[0] | (data[1] << 8) | (data[2] << 16) | ((uint32_t)data[3] << 24) : 0;

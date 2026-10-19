@@ -188,27 +188,71 @@ inline uint32_t sim_rng_seed(uint32_t p_seed) {
 
 // --- reliable-until-acked bookkeeping ---
 //
-// Shared by the spawn and despawn sections. `wait[net_id]` records the first seq of the
-// current unacked run, so a record keeps being resent until an ack covers the seq it
-// was *first* sent on — not merely the latest one, which would let a record fall out of
-// the resend set while its only transmission was still in flight.
+// Shared by the spawn and despawn sections. A record owed to a peer goes in the first snapshot
+// and the RELIABLE_BACKUP after it, so a lost snapshot or two is covered before anyone could know,
+// and after that only once overdue (GoldSrc's reliable channel resends on loss, not every packet).
+// Delivery is proven only by an ack naming a snapshot that carried it: an ack names the newest
+// frame the client committed, so an ack of a later frame says nothing about one lost on the way.
 
-// Returns whether to (re)send this record to the peer, and stops tracking once acked.
+// Sent longer ago than this and still unacked: presumably lost. A round trip and a half, since an
+// ack waits for the other end's next packet, plus a 60 Hz tick.
+inline uint32_t overdue_ms(uint32_t p_srtt_ms) {
+	return (p_srtt_ms * 3 / 2 > 50 ? p_srtt_ms * 3 / 2 : 50) + 16;
+}
+
+struct Owed {
+	static const int SEQS = 16; // the most recent carriers kept; older acks are long overdue anyway
+	uint16_t seqs[SEQS] = {};
+	uint32_t carries = 0;
+	int backups = 0; // copies still due in the snapshots right after this one
+	uint32_t last_ms = 0;
+
+	bool carried_in(uint16_t p_seq) const {
+		const uint32_t n = carries < (uint32_t)SEQS ? carries : (uint32_t)SEQS;
+		for (uint32_t i = 0; i < n; i++) {
+			if (seqs[i] == p_seq) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+// Whether this snapshot (seq p_seq, which goes out) carries the record, starting to track it on
+// its first call. Proof of delivery is retire_proven's job, never this one's.
 template <typename M>
-bool reliable_include(M &p_wait, uint32_t p_net_id, uint16_t p_seq, uint16_t p_last_acked,
-		bool p_has_ack) {
-	uint16_t fs;
-	if (p_wait.count(p_net_id)) {
-		fs = p_wait[p_net_id];
+bool owe_include(M &p_owed, uint32_t p_net_id, uint16_t p_seq, uint32_t p_now, uint32_t p_overdue_ms,
+		int p_backup) {
+	auto it = p_owed.find(p_net_id);
+	if (it == p_owed.end()) {
+		it = p_owed.emplace(p_net_id, Owed()).first;
+		it->second.backups = p_backup;
+	} else if (it->second.backups > 0) {
+		it->second.backups--;
+	} else if (p_now - it->second.last_ms >= p_overdue_ms) {
+		it->second.backups = p_backup;
 	} else {
-		fs = p_seq;
-		p_wait[p_net_id] = p_seq;
+		return false;
 	}
-	if (p_has_ack && seq_le(fs, p_last_acked)) {
-		p_wait.erase(p_net_id);
-		return false; // delivered — stop resending
-	}
+	Owed &o = it->second;
+	o.seqs[o.carries % Owed::SEQS] = p_seq;
+	o.carries++;
+	o.last_ms = p_now;
 	return true;
+}
+
+// Drops the records an ack of p_seq proves delivered, reporting them through r_retired. Any ack
+// proves its frame was committed, so this holds for a late ack older than the newest too.
+template <typename M, typename V>
+void retire_proven(M &p_owed, uint16_t p_seq, V &r_retired) {
+	for (const auto &kv : p_owed) {
+		if (kv.second.carried_in(p_seq)) {
+			r_retired.push_back(kv.first);
+		}
+	}
+	for (int i = 0; i < (int)r_retired.size(); i++) {
+		p_owed.erase(r_retired[i]);
+	}
 }
 
 // --- PVS removal derivation (GoldSrc) ---
@@ -233,19 +277,6 @@ void derive_leaves(const S &p_held, const S &p_visible, int p_cap, V &r_send, V 
 		} else {
 			r_carry.push_back(id);
 		}
-	}
-}
-
-// Drops the records an ack confirms delivered, reporting them through r_retired.
-template <typename M, typename V>
-void retire_acked(M &p_wait, uint16_t p_last_acked, V &r_retired) {
-	for (const auto &kv : p_wait) {
-		if (seq_le(kv.second, p_last_acked)) {
-			r_retired.push_back(kv.first);
-		}
-	}
-	for (int i = 0; i < (int)r_retired.size(); i++) {
-		p_wait.erase(r_retired[i]);
 	}
 }
 

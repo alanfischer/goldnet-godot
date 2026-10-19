@@ -91,6 +91,7 @@ struct Peer {
 	std::vector<uint16_t> command_acks;
 	int mismatches = 0;
 	int refuse_spawns = 0; // the host can't create the next N spawns yet
+	std::map<uint32_t, std::pair<uint32_t, int>> creates; // spawn net_id -> the entity it registers
 	uint32_t cur = 0;
 };
 
@@ -106,6 +107,10 @@ struct TestClientHost {
 			return false;
 		}
 		p->spawned.push_back(net_id);
+		auto it = p->creates.find(net_id);
+		if (it != p->creates.end()) {
+			p->slot_count[it->second.first] = it->second.second;
+		}
 		return true;
 	}
 	void despawn(uint32_t net_id) { p->despawned.push_back(net_id); }
@@ -184,7 +189,7 @@ struct Net {
 				p.client.apply(pkt.data(), pkt.size(), ch);
 				if (!drop_acks.count(p.id)) {
 					for (size_t i = acks_before; i < p.acks.size(); i++) {
-						server.on_ack(p.id, p.acks[i]);
+						server.on_ack(p.id, p.acks[i], now);
 					}
 				}
 			}
@@ -196,6 +201,7 @@ struct Net {
 };
 
 static uint16_t base_seq_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[3] | (pkt[4] << 8)); }
+static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[11] | (pkt[12] << 8)); }
 
 // --- tests ---
 
@@ -410,14 +416,14 @@ static void test_resent_spawn_reaches_host_once() {
 }
 
 // A refused spawn holds the ack, even on the very first frame: acking would retire the spawn as
-// delivered and nothing would resend it.
+// delivered, and the next copy comes only once the last is overdue.
 static void test_refused_spawn_holds_ack() {
 	Net n;
 	Peer &a = n.add_peer(2);
 	n.add_entity(10, 100, { 1 });
 	n.server.add_spawn(500, TestServer::SpawnRecord());
-	a.refuse_spawns = 3;
-	for (int i = 0; i < 4; i++) {
+	a.refuse_spawns = RELIABLE_BACKUP + 1; // every copy of the first burst
+	for (int i = 0; i < 20 && a.spawned.empty(); i++) {
 		n.tick();
 	}
 	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
@@ -426,6 +432,101 @@ static void test_refused_spawn_holds_ack() {
 	CHECK(a.spawned.size() == 1);
 	CHECK(n.sent_to(2) == 0 || base_seq_of(n.last_packet(2)) != 0); // acked and back on deltas
 	printf("  a refused spawn holds the ack until it's accepted: ok\n");
+}
+
+// GoldSrc's reliable channel resends on loss, not in every packet. With no ack coming back the
+// spawn goes in a burst of 1 + RELIABLE_BACKUP, then once more per overdue interval — not every tick.
+static void test_unacked_spawn_resends_only_when_overdue() {
+	Net n;
+	n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.drop_acks.insert(2);
+	int carried = 0;
+	const int ticks = 30;
+	for (int i = 0; i < ticks; i++) {
+		n.tick();
+		if (n.sent_to(2) && spawn_ct_of(n.last_packet(2)) > 0) {
+			carried++;
+		}
+	}
+	// 480 ms with no round trip timed: overdue is 66 ms, so a burst about every 5 ticks.
+	CHECK(carried >= RELIABLE_BACKUP + 1);
+	CHECK(carried < ticks / 2);
+	printf("  an unacked spawn resends only when overdue (%d of %d snapshots): ok\n", carried, ticks);
+}
+
+// An ack of a snapshot that did NOT carry the spawn proves nothing: the client may have lost every
+// carrier and still committed a later frame. The spawn must come again.
+static void test_ack_of_a_later_frame_does_not_retire_a_spawn() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.drop_snapshots.insert(2);
+	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
+		n.tick();
+	}
+	n.drop_snapshots.clear();
+	n.world.ents[10].vals[0] = 2; // gives the next frames something to carry, and acks to send
+	n.tick();
+	CHECK(a.spawned.empty());
+	CHECK(!a.acks.empty());
+	for (int i = 0; i < 20 && a.spawned.empty(); i++) {
+		n.tick();
+	}
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	printf("  an ack of a later frame does not retire a spawn: ok\n");
+}
+
+// A client that missed every carrier of a spawn discards its entity's deltas and acks them anyway.
+// Once the spawn lands, the entity must arrive whole, not as a delta against values it never had.
+static void test_entity_sent_whole_until_its_spawn_is_proven() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1, 2 });
+	a.slot_count.erase(100);
+	a.creates[500] = { 100, 2 };
+	TestServer::SpawnRecord rec;
+	rec.vis_keys = { 10 };
+	n.server.add_spawn(500, rec);
+	n.drop_snapshots.insert(2);
+	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
+		n.tick();
+	}
+	n.drop_snapshots.clear();
+	n.tick(); // the entity, to a client that doesn't know it: discarded, and acked
+	CHECK(a.spawned.empty());
+	n.world.ents[10].vals[0] = 5; // only slot 0 changes from here on
+	for (int i = 0; i < 20 && a.spawned.empty(); i++) {
+		n.tick();
+	}
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	CHECK(a.vals[100] == (std::vector<Val>{ 5, 2 })); // slot 1 too, though it never changed
+	printf("  an entity goes whole until its spawn is proven: ok\n");
+}
+
+// A despawn follows the same rule: a burst, then only when overdue, until an ack proves it.
+static void test_lost_despawn_is_resent() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.tick();
+	n.tick();
+	CHECK(a.spawned.size() == 1);
+	n.server.despawn(500);
+	n.drop_snapshots.insert(2);
+	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
+		n.tick();
+	}
+	n.drop_snapshots.clear();
+	for (int i = 0; i < 20 && a.despawned.empty(); i++) {
+		n.world.ents[10].vals[0]++; // keep snapshots going
+		n.tick();
+	}
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+	printf("  a lost despawn is resent once overdue: ok\n");
 }
 
 static void test_leave_and_reentry() {
@@ -702,6 +803,10 @@ int main() {
 	test_resent_spawn_reaches_host_once();
 	test_command_ack_rides_the_header();
 	test_refused_spawn_holds_ack();
+	test_unacked_spawn_resends_only_when_overdue();
+	test_ack_of_a_later_frame_does_not_retire_a_spawn();
+	test_entity_sent_whole_until_its_spawn_is_proven();
+	test_lost_despawn_is_resent();
 	test_leave_and_reentry();
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();
