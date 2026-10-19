@@ -1695,8 +1695,9 @@ void GoldNetMultiplayer::_deliver_message(int32_t p_from, const uint8_t *p_data,
 	command_sender = outer_sender;
 }
 
-// The RPC on the netchan, if it can go there: every call between the server and a client, but not one
-// a node lists in its gn_bypass meta, or a client's to another client (the inner relays those).
+// The RPC on the netchan, if it can go there: every call between the server and a client on channel 0.
+// A call declared on another channel goes through the inner, unordered against the netchan, as stock
+// orders each channel apart; so does a client's call to another client (the inner relays those).
 bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
 	if (!rpc_netchan) {
 		return false;
@@ -1709,12 +1710,12 @@ bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const St
 	if (!n || !n->is_inside_tree()) {
 		return false;
 	}
-	if (n->has_meta("gn_bypass") && Array(n->get_meta("gn_bypass")).has(p_method)) {
-		return false;
-	}
 	Dictionary cfg;
 	if (!rpc_method_config(p_object, p_method, cfg)) {
 		return false; // not an @rpc: the inner says so
+	}
+	if ((int)cfg.get("channel", 0) != 0) {
+		return false;
 	}
 	const bool reliable = (int)cfg.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE) ==
 			MultiplayerPeer::TRANSFER_MODE_RELIABLE;

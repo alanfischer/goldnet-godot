@@ -67,6 +67,11 @@ pipeline. A node lands in:
   A→B→A between two acked frames, the peer sees only the final A. That holds for
   every slot; goldnet carries *state*, not events. Put events on `@rpc`.
 
+- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
+  Map-static entities load with the map (both peers already have them) so they need
+  no spawn record; runtime entities do, because the client has no other way to know
+  they should exist.
+
 **Commands, the other way.** A client's input to the server (Quake's usercmds) is a stream
 in which every element matters, so it can't converge the way state does. Mark the `@rpc` a
 client calls once per command with `CommandStream.mark(node, &"method")`. Its contract is a
@@ -85,12 +90,8 @@ in fragments, up to 32 in flight, one per packet (GoldSrc sent one per round tri
 goes whole or not at all, and never plays after a newer packet's. So state and events share one ordered stream: a death RPC can't be overtaken by
 the snapshot that hides the body, and the peer's rate counts every byte. `call_local` and
 `get_remote_sender_id()` behave as with the inner. What stays on the inner: a client's call to
-another client, an unreliable call bigger than 512 bytes, and any method a node lists in its
-`gn_bypass` meta.
-- **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
-  Map-static entities load with the map (both peers already have them) so they need
-  no spawn record; runtime entities do, because the client has no other way to know
-  they should exist.
+another client, an unreliable call bigger than 512 bytes, and any RPC declared on a channel other
+than 0.
 
 **The snapshot protocol (delta against acked baseline).** Each tick, per peer, the
 server emits one unreliable snapshot:
@@ -576,11 +577,14 @@ something false.
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
    ```
-10. (Optional) Keep an RPC off the netchan. A method a node lists in its `gn_bypass` meta goes
-   through the inner `SceneMultiplayer`, with no ordering against the netchan's: for traffic with
-   its own pacing, like voice, that shouldn't compete with the snapshot's budget.
+10. (Optional) Keep an RPC off the netchan by declaring it on a channel other than 0. It goes
+   through the inner `SceneMultiplayer` straight away, ordered only against its own channel, as stock
+   orders each channel apart. That suits traffic with its own pacing, like voice, which shouldn't
+   compete with the snapshot's budget, and a call that can't wait for the next snapshot, like a
+   kick reason sent just before the disconnect.
    ```gdscript
-   set_meta("gn_bypass", [&"sync_voice"])
+   @rpc("authority", "call_remote", "unreliable", 1)
+   func sync_voice(packet: PackedByteArray) -> void: ...
    ```
 11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). The values are running
    totals, so diff two reads for a rate; every key is present on both ends and 0 where it doesn't

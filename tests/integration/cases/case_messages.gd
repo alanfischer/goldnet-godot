@@ -6,12 +6,14 @@ extends "res://test_case.gd"
 ##   - unreliable calls arrive only in increasing order: a late packet's never play
 ##   - a call bigger than a reliable block arrives whole, cut into fragments on the way
 ##   - call_local still runs on the server, and get_remote_sender_id() names the caller
+##   - a call declared on a non-zero channel stays off the netchan, and still arrives
 ##
 ## The message stats are the evidence goldnet carried them: the inner would deliver the same calls.
 ##
 ##   t=0.2-2.2  server: 120 reliable and 120 unreliable calls at 60 Hz; client: 60 of each up, 30 Hz
 ##   t=0.3      server: one call_local call
 ##   t=0.5      server: one 6 KB call (8 fragments)
+##   t=1.0      server: SIDE_COUNT reliable calls on channel 1, which must queue no message
 ##   t=7.0      client asks for the report
 
 const LOSSY := {"loss_percent": 30, "latency_min_ms": 20, "latency_max_ms": 20, "seed": 5}
@@ -19,6 +21,7 @@ const START := 0.2
 const DOWN_COUNT := 120
 const UP_COUNT := 60
 const BIG := 6000
+const SIDE_COUNT := 10
 const ASK_AT := 7.0
 
 var _down_sent := 0
@@ -27,6 +30,8 @@ var _rel: Array = []
 var _unrel: Array = []
 var _big: PackedByteArray = PackedByteArray()
 var _local: Array = []
+var _side: Array = []
+var _side_queued := -1  # server: netchan messages the channel-1 calls queued
 var _up: Array = []        # server
 var _up_unrel: Array = []  # server
 var _report: Variant = null
@@ -62,6 +67,8 @@ func on_message(sender: int, kind: String, args: Array) -> void:
 			_up.append(args[0])
 		"up_unrel":
 			_up_unrel.append(args[0])
+		"side":
+			_side.append(args[0])
 	if kind in ["rel", "unrel", "big"]:
 		check_eq(sender, 1, "a server call names the server")
 
@@ -75,6 +82,12 @@ func server_step(t: float) -> void:
 		main._case_msg_local.rpc(7)
 	if at(t, 0.5, "big"):
 		main._case_msg_big.rpc(_big_bytes())
+	if at(t, 1.0, "side"):
+		var peer: int = main.multiplayer.get_peers()[0]
+		var before: int = goldnet().get_peer_stats(peer)["messages_queued"]
+		for i in SIDE_COUNT:
+			main._case_msg_side.rpc(i)
+		_side_queued = goldnet().get_peer_stats(peer)["messages_queued"] - before
 
 
 func client_step(t: float) -> void:
@@ -93,6 +106,8 @@ func client_step(t: float) -> void:
 	check(_increasing(_unrel), "unreliable calls only ever arrive newer than the last")
 	check(_big == _big_bytes(), "the big call arrived whole (%d bytes)" % _big.size())
 	check_eq(_local, [[1, 7]], "the client got the call_local call once")
+	check_eq(_side, range(SIDE_COUNT), "every channel-1 call arrived once, in order")
+	check_eq(r["side_queued"], 0, "and none of them went on the netchan")
 	check_eq(r["local"], [[1, 7]], "the server ran its own copy once")
 	check_eq(r["up"], range(UP_COUNT), "every reliable uplink call arrived once, in order")
 	check(_increasing(r["up_unrel"]), "unreliable uplink calls only ever arrive newer than the last")
@@ -117,4 +132,5 @@ func on_report(data: Variant) -> void:
 
 func report() -> Variant:
 	var peer: int = main.multiplayer.get_peers()[0]
-	return {"up": _up, "up_unrel": _up_unrel, "local": _local, "stats": goldnet().get_peer_stats(peer)}
+	return {"up": _up, "up_unrel": _up_unrel, "local": _local, "stats": goldnet().get_peer_stats(peer),
+		"side_queued": _side_queued}
