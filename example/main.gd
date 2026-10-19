@@ -8,8 +8,14 @@ extends Node
 ## The server installs GoldNetMultiplayer, spawns 3 cubes through a stock
 ## MultiplayerSpawner, and moves them every frame. The client installs the same API,
 ## connects, and receives the cubes + their moving positions over GoldSrc ack-delta
-## snapshots — with NO goldnet-specific code: just a MultiplayerSpawner and
+## snapshots — with no replication code: just a MultiplayerSpawner and
 ## MultiplayerSynchronizers, exactly as with Godot's built-in replication.
+##
+## The other way, the client sends a command every physics tick, the way Quake sends usercmds:
+## a reliable @rpc marked as a CommandStream, which goldnet carries over its uplink. The command
+## sets Cube0's height, so the client sees its own input come back in the snapshots.
+
+const CommandStream = preload("res://addons/goldnet/command_stream.gd")
 
 const PORT := 9977
 
@@ -17,11 +23,17 @@ var _is_server := false
 var _spawner: MultiplayerSpawner
 var _cubes: Array = []
 var _t := 0.0
+var _next_cmd := 0      # client: the next command's number
+var _height := 0.0      # server: Cube0's height, from the newest command
+var _cmds := 0          # server: commands this second
+var _expect := {}       # server: per peer, the command number due next
+var _out_of_order := 0
 
 
 func _ready() -> void:
 	_is_server = OS.get_cmdline_user_args().has("--server")
 	var role := "server" if _is_server else "client"
+	CommandStream.mark(self, &"submit_input")
 
 	# 1) Install goldnet as the tree's MultiplayerAPI, BEFORE any synchronizer/spawner
 	#    enters the tree. That single line is the whole opt-in.
@@ -63,6 +75,8 @@ func _ready() -> void:
 		multiplayer.connected_to_server.connect(func(): print("[client] connected"))
 		multiplayer.connection_failed.connect(func():
 			push_error("[client] connection failed"); get_tree().quit(1))
+		multiplayer.server_disconnected.connect(func():
+			print("[client] server gone"); get_tree().quit())
 
 
 ## Spawnable entity, built in code (no scene file): a Node3D whose `position` a stock
@@ -83,6 +97,30 @@ func _make_cube(data: Variant) -> Node:
 	return cube
 
 
+## One command: its number and the height the client wants for Cube0. Declared reliable, as a
+## command stream must be: every call runs once on the server, in order.
+@rpc("any_peer", "call_remote", "reliable")
+func submit_input(cmd: PackedByteArray) -> void:
+	var sender := multiplayer.get_remote_sender_id()
+	var n := cmd.decode_u32(0)
+	if n != _expect.get(sender, 0):
+		_out_of_order += 1
+	_expect[sender] = n + 1
+	_height = cmd.decode_s8(4) / 64.0
+	_cmds += 1
+
+
+func _physics_process(_delta: float) -> void:
+	if _is_server or multiplayer.multiplayer_peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	var cmd := PackedByteArray()
+	cmd.resize(5)
+	cmd.encode_u32(0, _next_cmd)
+	cmd.encode_s8(4, roundi(sin(_t * 2.0) * 64.0))
+	_next_cmd += 1
+	submit_input.rpc_id(1, cmd)
+
+
 func _process(delta: float) -> void:
 	_t += delta
 	var tick := fmod(_t, 1.0) < delta   # ~once per second
@@ -91,8 +129,11 @@ func _process(delta: float) -> void:
 			var c: Node3D = _cubes[i]
 			if is_instance_valid(c):
 				c.position = Vector3(cos(_t + i), 0.0, sin(_t + i)) * (2.0 + float(i))
+				if i == 0:
+					c.position.y = _height
 		if tick and not _cubes.is_empty():
-			print("[server] t=%.0f cube0.pos=%.2v" % [_t, (_cubes[0] as Node3D).position])
+			print("[server] t=%.0f cube0.pos=%.2v, %d commands/s, %d out of order" % [_t, (_cubes[0] as Node3D).position, _cmds, _out_of_order])
+			_cmds = 0
 	elif tick:
 		var cubes := get_children().filter(func(n: Node): return n.name.begins_with("Cube"))
 		if cubes.is_empty():

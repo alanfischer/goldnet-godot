@@ -1460,8 +1460,10 @@ Error GoldNetMultiplayer::_poll() {
 	// That is a normal state, not a broken one — the API sits peerless before the first session
 	// and again after one ends (including a join the server refused because it was full) — and
 	// because this runs every poll, one error becomes a continuous stream for as long as the
-	// game is open. Nothing below applies without a peer: the server branch needs one anyway.
-	if (inner->get_multiplayer_peer().is_null()) {
+	// game is open. Nothing below applies without a peer: the server branch needs one anyway. A
+	// client whose server went away still holds its peer, closed, which logs the same way.
+	Ref<MultiplayerPeer> mp = inner->get_multiplayer_peer();
+	if (mp.is_null() || mp->get_connection_status() == MultiplayerPeer::CONNECTION_DISCONNECTED) {
 		return e;
 	}
 	if (rpc_stats) {
