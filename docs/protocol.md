@@ -324,14 +324,3 @@ For each snapshot:
 
 The server, on an ack newer than the peer's previous one, makes that frame the peer's baseline and
 times its round trip. On any ack, it retires every spawn and despawn that frame carried.
-
-## Version history
-
-- **v3** — the entity mask became a `uvarint` (was a fixed `u32`); a 1-byte version replaced the
-  4-byte magic; empty snapshots stopped being sent.
-- **v4** — added `ANGLE8` and `TIME_DELTA`.
-- **v5** — added `command_ack` to the snapshot header, and the uplink packet, which carries the
-  snapshot ack (it had travelled alone, as `_gn_ack`).
-- **v6** — the channel part in both packets, and the uplink packet's own `seq`.
-- **v7** — the uplink packet's `send_time` and `rate`, and the snapshot header's uplink report.
-- **v8** — the uplink packet's `update_rate`, and the snapshot header's granted `update_rate`.
