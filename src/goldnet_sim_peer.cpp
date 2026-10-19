@@ -67,15 +67,6 @@ void GoldNetSimPeer::_deliver(Packet &&p_packet) {
 	ready.push_back(std::move(p_packet));
 }
 
-Dictionary GoldNetSimPeer::pop_delivered() {
-	Dictionary d;
-	d["bytes"] = delivered_bytes;
-	d["packets"] = delivered_packets;
-	delivered_bytes = 0;
-	delivered_packets = 0;
-	return d;
-}
-
 Error GoldNetSimPeer::_get_packet(const uint8_t **r_buffer, int32_t *r_buffer_size) {
 	if (ready.empty()) {
 		return ERR_UNAVAILABLE;

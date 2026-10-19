@@ -211,14 +211,6 @@ public:
 	// slowing anyone else down. 0 restores "every tick". Dropped with the peer.
 	void set_peer_interval_ms(int32_t p_peer, uint32_t p_ms) { rings_[p_peer].interval_ms = p_ms; }
 
-	// Per-peer entity-delta budget in bytes/sec (0 = use the default below).
-	void set_peer_bandwidth_bps(int32_t p_peer, uint32_t p_bps) { rings_[p_peer].bandwidth_bps = p_bps; }
-
-	// Default entity-delta budget in bytes/sec for peers without their own (0 = none: only the flat
-	// MTU-safety ceiling applies). Converted to a per-packet budget via the peer's send interval.
-	void set_bandwidth_bps(uint32_t p_bps) { bandwidth_bps_default_ = p_bps; }
-	uint32_t bandwidth_bps() const { return bandwidth_bps_default_; }
-
 	// GoldSrc rate / choke: the most bytes per second this peer's link takes (0 = unlimited). Every
 	// send to the peer — snapshots here, and whatever else the host reports through charge() —
 	// pushes its clear time out by bytes / rate. While that's in the future the peer is choked: it
@@ -293,9 +285,6 @@ public:
 		auto it = rings_.find(p_peer);
 		return it == rings_.end() ? 0 : it->second.chokes;
 	}
-
-	// The server's own send interval, used to convert a bandwidth budget for an unthrottled peer.
-	void set_tick_interval_ms(uint32_t p_ms) { tick_interval_ms_ = p_ms > 0 ? p_ms : 1; }
 
 	// Opt-in relevance events: the server sends leave markers for entities that drop out of a
 	// peer's PVS. Off by default so the protocol stays pure state replication.
@@ -418,7 +407,6 @@ private:
 		// most-overdue, highest-weighted entity goes first. Only a successful write resets it, not
 		// merely a later tick touching it again.
 		std::unordered_map<uint32_t, uint32_t> stale_since;
-		uint32_t bandwidth_bps = 0;
 		uint16_t cmd_ack = 0;      // see set_command_ack
 		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
 		bool cmd_news = false;     // see set_command_ack
@@ -450,8 +438,6 @@ private:
 	// Entity::slot_ctr and PeerRing::frame_ctr so change tests are a single integer compare. Unlike
 	// the 16-bit wire seq it never wraps in any realistic session (2^32 ticks at 60 Hz is ~2 years).
 	uint32_t ctr_ = 0;
-	uint32_t bandwidth_bps_default_ = 0;
-	uint32_t tick_interval_ms_ = 33;
 	int packet_overhead_ = 0;
 	bool relevance_events_ = false;
 	std::vector<size_t> live_; // scratch: entities live this tick
@@ -701,9 +687,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		}
 
 		// What's left of a safe UDP payload after the header and every section already built —
-		// measured, not estimated. A bandwidth budget only ever tightens the remainder further,
-		// converted to a per-packet allowance via this peer's own send interval (falling back to the
-		// server's cadence for an unthrottled peer, which sends every tick).
+		// measured, not estimated.
 		int peer_budget = SAFE_PACKET_BYTES - SNAPSHOT_HEADER_BYTES - (int)spawn_body.size()
 				- (int)despawn_body.size() - (int)leave_body.size();
 		peer_budget -= (int)block.size() + (up.fragments ? 2 : 0);
@@ -711,12 +695,6 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		std::vector<uint8_t> datagram;
 		pr.dgram.take(peer_budget, datagram);
 		peer_budget -= (int)datagram.size();
-		const uint32_t effective_bps = pr.bandwidth_bps > 0 ? pr.bandwidth_bps : bandwidth_bps_default_;
-		if (effective_bps > 0) {
-			const uint32_t iv = pr.interval_ms > 0 ? pr.interval_ms : tick_interval_ms_;
-			const int rate_budget = (int)(((uint64_t)effective_bps * iv) / 1000);
-			peer_budget = std::min(peer_budget, rate_budget);
-		}
 
 		for (size_t ci = 0; ci < candidates.size(); ci++) {
 			const Candidate &c = candidates[ci];
@@ -724,7 +702,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			// it waiting so it outranks everything else next tick if it's still unlucky then.
 			//
 			// `ci > 0` makes the highest-scoring candidate unconditional, which guarantees forward
-			// progress: a budget of zero or less (a tiny bandwidth_bps, or a spawn section that spent
+			// progress: a budget of zero or less (a spawn section that spent
 			// the whole MTU) would otherwise starve replication completely and silently. One entity of
 			// overrun beats a permanent stall, and it is self-limiting: the sections that crowded the
 			// budget out are reliable-until-acked, so they retire and the budget reopens.

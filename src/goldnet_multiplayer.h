@@ -108,10 +108,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<uint64_t, uint64_t> dirty_route;
 	bool manual_send = false;                    // see set_manual_send
 	uint64_t last_send_us = 0;                   // server send deadline (microseconds — see _poll)
-	uint32_t cached_min_interval_ms = 33;        // send cadence; refreshed on config add/remove, not per poll
-	// The same cadence in microseconds. The gate runs off this rather than the millisecond value
-	// because a millisecond cannot express the tick rates games actually use: 60 Hz is 16.667 ms,
-	// and rounding that to 17 costs 1.2% of the rate before any jitter is counted.
+	// Send cadence; refreshed on config add/remove, not per poll. Microseconds, because a millisecond
+	// cannot express the tick rates games actually use: 60 Hz is 16.667 ms.
 	uint64_t cached_min_interval_us = 33000;
 	int32_t snapshot_interval_override = 0;      // config: >0 overrides the synchronizer-derived send cadence (ms)
 	uint64_t dbg_last_ms = 0;                    // throttle for the GOLDNET_DEBUG stats print
@@ -199,7 +197,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// A message names its target (a node path and a method) by a small id, which the sending end
 	// registers with the receiving one reliably, the first time it uses it with that peer: GoldSrc's
 	// svc_newusermsg, done lazily. The ids are this end's own; each peer keeps the ones the other named.
-	bool rpc_netchan = true;
+	bool rpc_netchan = true; // GOLDNET_RPC_NETCHAN=0 sends through the inner, for an A/B
 	HashMap<String, uint32_t> msg_ids; // "path::method" -> id
 	uint32_t msg_next_id = 1;          // 0 is the registration message itself
 	// Peer -> id -> the index of its registration in that peer's reliable stream. Until the peer has
@@ -239,9 +237,8 @@ public:
 private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
-	uint32_t _min_interval_ms() const;
 	uint64_t _min_interval_us() const;
-	void _refresh_interval(); // recompute the cached send cadence and hand it to the core
+	void _refresh_interval(); // recompute the cached send cadence
 
 	// Phase 3 spawn/despawn.
 	bool spawners_scanned = false;
@@ -269,26 +266,12 @@ public:
 	// replication_interval (min across owned syncs). Set >0 to pin one global tick rate.
 	void set_snapshot_interval_ms(int p_ms);
 	int get_snapshot_interval_ms() const;
-	// Write-only on purpose, like set_peer_bandwidth_bps below: the per-peer value is consulted in
-	// the send path, and nothing has ever needed to read it back, so the getters were dropped rather
-	// than carried as surface. Both are trivial to restore if a consumer turns up wanting them.
+	// Write-only: the per-peer value is consulted in the send path and nothing reads it back.
 	void set_peer_snapshot_interval_ms(int p_peer, int p_ms);
-	// Entity-delta bandwidth budget in bytes/sec, converted to a per-packet budget via each peer's
-	// snapshot interval. 0 (default) means no rate budget — only the flat MTU-safety ceiling
-	// applies, today's behavior. A rate budget only ever tightens that ceiling, never relaxes it.
-	// Unlike snapshot_interval_ms above (a server-wide send-cadence setting, unrelated to any
-	// per-peer default), this one IS a genuine global default: set_bandwidth_bps applies to every
-	// peer that hasn't been given its own via set_peer_bandwidth_bps, which wins when set.
-	void set_bandwidth_bps(int p_bps);
-	int get_bandwidth_bps() const;
-	void set_peer_bandwidth_bps(int p_peer, int p_bps);
 	// GoldSrc rate / choke: the most bytes per second to send this peer (0 = unlimited, the
 	// default). Snapshots and game RPCs both count; while the peer is over, its snapshots are
-	// skipped (choked), and the next one it gets carries the latest state. Unlike
-	// set_peer_bandwidth_bps, which caps each snapshot's entity bytes, this spaces snapshots out.
+	// skipped (choked), and the next one it gets carries the latest state.
 	void set_peer_rate(int p_peer, int p_bytes_per_sec);
-	// Snapshots withheld from this peer by its rate so far.
-	int get_peer_chokes(int p_peer) const;
 	// Who decides when snapshots go out. Off (the default): goldnet sends on its own clock, at the
 	// synchronizers' replication_interval, from poll. On: the game calls send_snapshots() once per
 	// server tick, after it has written that tick's state — GoldSrc's SV_SendClientMessages at the
@@ -314,13 +297,16 @@ public:
 	// only (a server's sends are its own sim_config), and live, at any point in a session.
 	void set_recv_sim_config(const Dictionary &p_cfg);
 	Dictionary get_recv_sim_config() const;
-	// Client: {bytes, packets} the receive sim delivered since the last call. A downlink meter reads
-	// this instead of the transport's counters while the sim is on, since those count what the sim
-	// then holds back or drops. Zeros on a server, which has no receive sim.
-	Dictionary pop_recv_sim_delivered();
-	// Client: {received, lost} snapshots since the last call. The server spends a snapshot seq only
-	// on one it sends, so these are real losses, not the ticks with nothing to send.
-	Dictionary pop_snapshot_stats();
+	// Running totals for the link to p_peer (a client passes 1); a caller wanting a rate diffs two
+	// reads. Every key is present on both ends, 0 where it doesn't apply:
+	//   chokes                   server: snapshots withheld from the peer by its rate
+	//   snapshots_received/lost  client: lost counts only seqs the server spent, so real losses
+	//   messages_queued/delivered  reliable netchan messages sent to the peer, and how many it has
+	//   commands_pending/dropped client: unacked commands, and ones given up on
+	//   command_rtt_ms           client: the command round trip (current, not a total)
+	//   recv_sim_bytes/packets   client: what the receive sim let through, which is what a downlink
+	//                            meter should count while it is on, not the transport's counters
+	Dictionary get_peer_stats(int p_peer) const;
 
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.
@@ -331,14 +317,6 @@ public:
 	// is a command to send, which a game calling its command RPC once per tick makes once per tick.
 	void set_command_rate(double p_hz);
 	double get_command_rate() const;
-	// Client: {pending: unacked commands, dropped: given up on, rtt_ms: the command round trip}.
-	Dictionary get_command_stats() const;
-	// Carry the game's RPCs on the netchan (the default) rather than the inner SceneMultiplayer. Each
-	// end decides for its own sends, and either end takes both.
-	void set_rpc_netchan(bool p_enabled);
-	bool get_rpc_netchan() const;
-	// {queued, delivered}: reliable messages sent to p_peer (a client passes 1) and how many it has.
-	Dictionary get_message_stats(int p_peer) const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

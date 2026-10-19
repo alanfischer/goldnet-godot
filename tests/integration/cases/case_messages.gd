@@ -97,10 +97,10 @@ func client_step(t: float) -> void:
 	check_eq(r["up"], range(UP_COUNT), "every reliable uplink call arrived once, in order")
 	check(_increasing(r["up_unrel"]), "unreliable uplink calls only ever arrive newer than the last")
 	var down: Dictionary = r["stats"]
-	var up: Dictionary = goldnet().get_message_stats(1)
-	check(down["delivered"] >= DOWN_COUNT + 2, "goldnet carried the server's calls (%s)" % down)
-	check_eq(down["delivered"], down["queued"], "and all of them are acked")
-	check(up["delivered"] >= UP_COUNT, "goldnet carried the client's calls (%s)" % up)
+	var up: Dictionary = goldnet().get_peer_stats(1)
+	check(down["messages_delivered"] >= DOWN_COUNT + 2, "goldnet carried the server's calls (%s)" % down)
+	check_eq(down["messages_delivered"], down["messages_queued"], "and all of them are acked")
+	check(up["messages_delivered"] >= UP_COUNT, "goldnet carried the client's calls (%s)" % up)
 	finish()
 
 
@@ -117,4 +117,4 @@ func on_report(data: Variant) -> void:
 
 func report() -> Variant:
 	var peer: int = main.multiplayer.get_peers()[0]
-	return {"up": _up, "up_unrel": _up_unrel, "local": _local, "stats": goldnet().get_message_stats(peer)}
+	return {"up": _up, "up_unrel": _up_unrel, "local": _local, "stats": goldnet().get_peer_stats(peer)}

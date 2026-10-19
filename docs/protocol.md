@@ -261,8 +261,7 @@ Per tick, for each peer:
    named by a spawn not yet proven delivered to the peer is written whole and left out of the
    frame's baseline: a client that missed the spawn discards its values and acks anyway.
 5. **Budget.** The whole snapshot aims for `SAFE_PACKET_BYTES` = 1200. Header and the three
-   sections come first; entities get what is left, further capped by the peer's
-   `bandwidth_bps` turned into a per-packet allowance. Candidates go in order of how long they
+   sections come first; entities get what is left. Candidates go in order of how long they
    have waited for this peer times their priority weight. Whatever doesn't fit is left out of
    this frame, so the baseline compare offers it again next time. The first candidate always
    goes in, so a crowded packet can't stall replication.

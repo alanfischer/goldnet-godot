@@ -124,8 +124,7 @@ snapshot — is in [`docs/protocol.md`](docs/protocol.md).
   changed-since-baseline compare re-offers it next tick — no retransmit bookkeeping.
   Which entities win the budget is ordered by how long each has been waiting for
   *this* peer, times an optional per-entity `gn_priority` weight (see **Usage**), so
-  the most-overdue entity goes first and nothing starves. `bandwidth_bps` tightens
-  the budget further; it never relaxes the MTU ceiling.
+  the most-overdue entity goes first and nothing starves.
 - A snapshot with nothing to report — no changed entity, no spawn, despawn, or leave
   — **isn't sent at all**, so a fully static world costs nothing per tick. The one
   exception is the clock feed below.
@@ -469,18 +468,7 @@ something false.
    ```gdscript
    sync.set_meta("gn_priority", 4.0)   # players over debris
    ```
-7. (Optional) Cap per-peer entity-delta bandwidth in bytes/sec, converted to a
-   per-packet allowance via that peer's snapshot interval. Only ever tightens the
-   built-in MTU ceiling. 0 (default) leaves the MTU ceiling as the only limit.
-   ```gdscript
-   gn.bandwidth_bps = 32000              # every peer
-   gn.set_peer_bandwidth_bps(peer, 8000) # or per peer, which wins where set
-   ```
-   Note this budgets the entity-delta section only — the header, the netchan's messages and the
-   spawn/despawn/leave sections are accounted against the MTU ceiling but are not
-   rate-limited. It is a replication throttle, not a link-wide one.
-
-   For a link-wide limit, set the peer's **rate** (GoldSrc's `rate`): the most bytes per
+7. (Optional) Limit a peer's link with its **rate** (GoldSrc's `rate`): the most bytes per
    second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
    clear time out by its size over the rate; while that's in the future the peer is
    **choked** — it gets no snapshot that tick, and the next one it does get deltas against
@@ -490,7 +478,6 @@ something false.
    **RPCs on the netchan**) still go out when choked, but they count.
    ```gdscript
    gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
-   gn.get_peer_chokes(peer)          # snapshots withheld so far
    ```
 
    A peer can also be served less often than the server ticks (GoldSrc's `cl_updaterate`),
@@ -588,16 +575,23 @@ something false.
    delta-coded bytewise against the previous one, so a fixed layout compresses best.
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
-   gn.get_command_stats()        # {pending, dropped, rtt_ms}
    ```
 10. (Optional) Keep an RPC off the netchan. A method a node lists in its `gn_bypass` meta goes
    through the inner `SceneMultiplayer`, with no ordering against the netchan's: for traffic with
-   its own pacing, like voice, that shouldn't compete with the snapshot's budget. `rpc_netchan`
-   turns the netchan off for this end's sends.
+   its own pacing, like voice, that shouldn't compete with the snapshot's budget.
    ```gdscript
    set_meta("gn_bypass", [&"sync_voice"])
-   gn.rpc_netchan = false        # every RPC through the inner (or GOLDNET_RPC_NETCHAN=0)
-   gn.get_message_stats(peer)    # {queued, delivered} reliable messages; a client passes 1
+   ```
+11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). The values are running
+   totals, so diff two reads for a rate; every key is present on both ends and 0 where it doesn't
+   apply.
+   ```gdscript
+   gn.get_peer_stats(peer)
+   # server: chokes (snapshots withheld by the rate), messages_queued, messages_delivered
+   # client: snapshots_received, snapshots_lost, messages_queued, messages_delivered,
+   #         commands_pending, commands_dropped, command_rtt_ms (current, not a total),
+   #         recv_sim_bytes, recv_sim_packets (what recv_sim_config let through; count these, not
+   #         the transport's counters, while it is on)
    ```
 
 > **Headless note:** Godot registers `.gdextension` files via
@@ -630,7 +624,6 @@ On the server:
 
 ```cpp
 goldnet::Server<MyValue> server;
-server.set_tick_interval_ms(33);
 server.set_packet_overhead(28);     // what your link adds per packet, for rate budgets
 
 server.add_entity(key, net_id);     // an entity starts replicating; remove_entity(key)
@@ -642,8 +635,7 @@ server.on_ack(peer, seq);           // each ack the client sends
 server.remove_peer(peer);           // on disconnect
 ```
 
-Per-peer cadence, budget and rate are `set_peer_interval_ms`, `set_peer_bandwidth_bps` and
-`set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
+Per-peer cadence and rate are `set_peer_interval_ms` and `set_peer_rate`; anything else you send a peer counts against its rate through `charge()`.
 
 On the client, `client.apply(bytes, size, host)` for each snapshot received and `client.reset()`
 for a new session. The host's `send_ack(seq)` hands over the snapshot ack, which the next uplink

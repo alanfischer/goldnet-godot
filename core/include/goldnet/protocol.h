@@ -42,8 +42,7 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 // the MTU, fragment, and — since a dropped fragment costs the whole packet, and an unacked packet
 // is resent — thrash. The entity-delta body gets whatever is left of this after the header and the
 // spawn/despawn/leave sections, all of which are built BEFORE it and measured rather than
-// estimated. A configured bandwidth budget can only tighten the remainder further, never relax
-// it. An entity that doesn't fit isn't lost: it's simply left out of the peer's baseline so the
+// estimated. An entity that doesn't fit isn't lost: it's simply left out of the peer's baseline so the
 // acked-baseline compare still sees it as changed, and its overflow priority only goes up — it
 // outranks everything that fit this tick on the next one, the same self-heal the leave cap relies on.
 static const int SAFE_PACKET_BYTES = 1200;

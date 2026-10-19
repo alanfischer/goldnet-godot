@@ -17,7 +17,7 @@ void initialize_goldnet_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
-	ClassDB::register_class<GoldNetLink>();
+	GDREGISTER_INTERNAL_CLASS(GoldNetLink);
 	ClassDB::register_class<GoldNetMultiplayer>();
 	GDREGISTER_INTERNAL_CLASS(GoldNetSimPeer);
 

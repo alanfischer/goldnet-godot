@@ -603,23 +603,24 @@ static void test_reentry_before_leave_acked() {
 static void test_budget_overflow_drains_by_priority() {
 	Net n;
 	Peer &p = n.add_peer(2);
-	n.server.set_tick_interval_ms(16);
-	for (int i = 0; i < 20; i++) {
+	const int count = 400; // 7 bytes each, so a packet carries well under half of them
+	for (int i = 0; i < count; i++) {
 		n.add_entity(10 + i, 100 + i, { 0 });
 	}
-	n.world.ents[29].priority = 50.0f;
-	n.tick();
-	n.server.set_bandwidth_bps(600); // 9 bytes a packet: two 7-byte entities a tick
-	for (int i = 0; i < 20; i++) {
+	n.world.ents[10 + count - 1].priority = 50.0f;
+	for (int i = 0; i < 10; i++) {
+		n.tick(); // the first full baseline overflows too; let it drain
+	}
+	for (int i = 0; i < count; i++) {
 		n.world.ents[10 + i].vals[0] = 1;
 	}
 	n.tick();
-	CHECK(p.vals[119][0] == 1); // the heavy one goes first, though it registered last
-	CHECK(p.vals[118][0] == 0);
+	CHECK(p.vals[100 + count - 1][0] == 1); // the heavy one goes first, though it registered last
+	CHECK(p.vals[100 + count - 2][0] == 0);
 	for (int i = 0; i < 40; i++) {
 		n.tick();
 	}
-	for (int i = 0; i < 20; i++) {
+	for (int i = 0; i < count; i++) {
 		CHECK(p.vals[100 + i][0] == 1); // nothing starves
 	}
 	printf("  budget overflow drains, highest priority first: ok\n");
@@ -762,7 +763,7 @@ static void test_command_ack_rides_the_header() {
 }
 
 // A gap in the seqs a client receives is a lost snapshot. Idle ticks send nothing and take no
-// seq, so they read as no loss at all, and a late snapshot is taken back off the count.
+// seq, so they read as no loss at all, and a late snapshot is taken back off the running total.
 static void test_arrival_stats_count_only_real_loss() {
 	Net n;
 	Peer &p = n.add_peer(2);
@@ -771,7 +772,7 @@ static void test_arrival_stats_count_only_real_loss() {
 	for (int i = 0; i < 40; i++) { // 640 ms idle: two keepalives, ~38 skipped ticks
 		n.tick();
 	}
-	auto s = p.client.pop_arrival_stats();
+	auto s = p.client.arrival_stats();
 	CHECK(s.received == 3);
 	CHECK(s.lost == 0);
 
@@ -783,8 +784,8 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.drop_snapshots.clear();
 	n.world.ents[10].vals[0] = 9;
 	n.tick();
-	s = p.client.pop_arrival_stats();
-	CHECK(s.received == 1);
+	s = p.client.arrival_stats();
+	CHECK(s.received == 4);
 	CHECK(s.lost == 3);
 
 	n.world.ents[10].vals[0] = 10;
@@ -796,9 +797,9 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.tick();
 	TestClientHost ch{ &p };
 	p.client.apply(late.data(), late.size(), ch, n.now);
-	s = p.client.pop_arrival_stats();
-	CHECK(s.received == 2);
-	CHECK(s.lost == 0);
+	s = p.client.arrival_stats();
+	CHECK(s.received == 6);
+	CHECK(s.lost == 3); // the late one took its loss back off
 	printf("  arrival stats count only real loss: ok\n");
 }
 

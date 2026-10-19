@@ -52,18 +52,14 @@ public:
 		bool committed = false;
 	};
 
-	// Snapshots that arrived, and seqs skipped on the way to them, since the last call. The server
+	// Snapshots that arrived, and seqs skipped on the way to them, this session. The server
 	// spends a seq only on a snapshot it sends, so a skipped one was lost (or is late, and is taken
 	// back off when it lands). Counted before any check that could still drop the snapshot.
 	struct ArrivalStats {
 		uint32_t received = 0;
 		uint32_t lost = 0;
 	};
-	ArrivalStats pop_arrival_stats() {
-		ArrivalStats s = arrivals_;
-		arrivals_ = ArrivalStats();
-		return s;
-	}
+	const ArrivalStats &arrival_stats() const { return arrivals_; }
 
 	// A fresh session: old baselines are meaningless.
 	void reset() {

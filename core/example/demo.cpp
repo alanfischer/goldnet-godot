@@ -314,7 +314,6 @@ struct ServerApp {
 
 	int run(uint16_t port) {
 		fd = open_socket(port);
-		server.set_tick_interval_ms(TICK_MS);
 		server.set_packet_overhead(28); // IPv4 + UDP headers
 		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID);
 		printf("[server] listening on udp %d (loss %d%%, latency %d ms, rate %u B/s)\n", port,
