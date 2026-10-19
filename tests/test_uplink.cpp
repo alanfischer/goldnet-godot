@@ -268,6 +268,37 @@ static void test_rtt_is_measured_through_backups() {
 	printf("  the round trip is timed through the backups: ok\n");
 }
 
+// A round trip longer than the first overdue guess resends every command before its ack arrives,
+// so no ack can be timed the usual way. The streak of them still measures it, and the resends stop.
+static void test_rtt_is_learned_past_the_first_overdue() {
+	CommandSender s;
+	CommandReceiver r;
+	RecvHost h;
+	uint32_t now = 1000;
+	std::vector<std::vector<uint8_t>> in_flight; // packets arriving 10 ticks (160 ms) after they're sent
+	int late_cmds = 0;
+	for (int i = 0; i < 200; i++) {
+		now += 16;
+		std::vector<uint8_t> b = cmd_bytes(i);
+		s.push(1, b.data(), b.size(), now);
+		Writer w;
+		s.write(now, 0, w);
+		if (i >= 150) {
+			late_cmds += w.data()[10]; // cmd_ct, after one stream id
+		}
+		in_flight.emplace_back(w.data(), w.data() + w.size());
+		if (in_flight.size() > 10) {
+			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h));
+			in_flight.erase(in_flight.begin());
+			s.on_ack(r.ack(2), now);
+		}
+	}
+	CHECK(s.rtt_ms() == 160);
+	CHECK(late_cmds == 50 * (1 + COMMAND_BACKUP_DEFAULT)); // each new command and its backups, no resends
+	CHECK(h.got.size() == 190);
+	printf("  a round trip past the first overdue guess is still learned: ok\n");
+}
+
 static void test_interval_paces_packets() {
 	Link l;
 	l.sender.set_interval_ms(50);
@@ -296,6 +327,7 @@ int main() {
 	test_snapshot_ack_rides_along();
 	test_malformed_input();
 	test_rtt_is_measured_through_backups();
+	test_rtt_is_learned_past_the_first_overdue();
 	test_interval_paces_packets();
 	printf("uplink: %d checks passed\n", checks);
 	return 0;

@@ -114,10 +114,22 @@ public:
 		while (!ring_.empty() && seq_le(ring_.front().seq, p_seq)) {
 			const Cmd &c = ring_.front();
 			// Timed from the first send. Backups go within a tick of it, so the error is that tick at most;
-			// a command resent for being overdue can't say which send arrived, so it isn't timed.
-			if (c.seq == p_seq && !c.resent) {
+			// a command resent for being overdue can't say which send arrived, so it isn't timed. Unless
+			// none can be: a round trip longer than overdue_ms resends every command before its ack, and
+			// would never be measured. A streak of untimed acks means that, not loss, and the original
+			// send is then what arrived, so the streak's shortest sample becomes the round trip.
+			if (c.seq == p_seq) {
 				const uint32_t sample = p_now - c.first_sent_ms;
-				srtt_ms_ = srtt_ms_ == 0 ? sample : (srtt_ms_ * 7 + sample) / 8;
+				if (!c.resent) {
+					srtt_ms_ = srtt_ms_ == 0 ? sample : (srtt_ms_ * 7 + sample) / 8;
+					untimed_ = 0;
+				} else {
+					untimed_min_ms_ = untimed_ == 0 ? sample : std::min(untimed_min_ms_, sample);
+					if (++untimed_ == UNTIMED_STREAK) {
+						srtt_ms_ = untimed_min_ms_;
+						untimed_ = 0;
+					}
+				}
 			}
 			ring_.pop_front();
 		}
@@ -243,6 +255,9 @@ private:
 	// ack waits for the server's next snapshot, plus a 60 Hz tick.
 	uint32_t overdue_ms() const { return std::max<uint32_t>(srtt_ms_ * 3 / 2, 50) + 16; }
 
+	// Untimed acks in a row that mean the round trip is longer than overdue_ms (see on_ack).
+	static constexpr int UNTIMED_STREAK = 8;
+
 	std::deque<Cmd> ring_; // unacked, oldest first
 	uint16_t next_seq_ = 1;
 	uint32_t interval_ms_ = 0;
@@ -252,6 +267,8 @@ private:
 	uint32_t last_push_ms_ = 0;
 	bool pushed_ = false;
 	uint32_t srtt_ms_ = 0;
+	int untimed_ = 0;
+	uint32_t untimed_min_ms_ = 0;
 	uint32_t dropped_ = 0;
 };
 
