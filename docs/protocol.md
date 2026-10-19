@@ -146,7 +146,9 @@ compare the same way.
 **Sending.** The client keeps every unacked command, up to `COMMAND_RING` = 64. A packet carries
 every command not sent yet, the `COMMAND_BACKUP_DEFAULT` = 2 before them, and any unacked command
 last sent more than `max(1.5 × rtt, 50) + 16` ms ago. The round trip is timed from a command's
-first send to the snapshot that acks it, skipping commands that went again for being overdue. A
+first send to the snapshot that acks it, skipping commands that went again for being overdue,
+unless 8 acks in a row are of such commands: the round trip is then longer than the overdue time,
+and the shortest of those 8 becomes it. A
 packet goes when one of those is due and the command interval (GoldSrc `cl_cmdrate`) is up. A
 command that would overflow the ring drops the oldest, which the client then gives up on. A
 packet is kept under `SAFE_PACKET_BYTES`, but its first command always goes.
