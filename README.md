@@ -201,11 +201,6 @@ Measured in WizardWars (ww_2fort + 4 bots, stationary headless clients, server�
 egress at the ENet socket), goldnet vs the **stock `MultiplayerSynchronizer`** path
 on the same build with the same PVS:
 
-> **The table predates the wire-format v4 work** (uvarint mask, empty-snapshot skip,
-> entity budget, `angle8`/`time_delta`), so read it as goldnet's floor rather than its
-> current cost. What that work bought is measured separately below — the shape this
-> table is really for (parity on bandwidth, divergence under loss) is unaffected.
-
 | Condition | goldnet | stock |
 | --- | --- | --- |
 | 1 / 4 / 8 clients, no loss (per-client) | ~26–29 KB/s | ~27–29 KB/s |
@@ -224,41 +219,15 @@ reliable-ordered replication for real-time state on adverse networks.
 > replaces per-entity full-state sends, PVS-culls, and compact-encodes, so against
 > naive full-state replication the reduction is large.
 
-### What the v4 wire work bought
+### The snapshot stream alone
 
-Same WizardWars scenario (ww_2fort, 4 AI bots, 4 stationary headless clients, 190 s
-runs), comparing this build against the pre-v4 one with the *game* held constant. The
-figure below is the **snapshot stream alone** — goldnet's own `dbg_bytes` under
-`GOLDNET_DEBUG=1`, not the ENet socket total. That distinction matters: snapshots are
-only about half of server egress here, the rest being ENet acks and the game's own
-`@rpc` traffic, so measuring at the socket dilutes the effect by roughly half.
-
-| | snapshot stream | total socket egress | over-MTU sends |
-| --- | --- | --- | --- |
-| pre-v4 | 12.4 KB/s (11.3–13.2) | 26.9 KB/s | 7 of 7 runs |
-| v4 | 6.2 KB/s (1.8–10.5) | ~21.8 KB/s | 0 of 14 runs |
-
-n=5 runs pre-v4, n=10 v4, averaged over each run's steady-state tail. **Roughly half
-the snapshot bytes**, and every v4 run came in below every pre-v4 run (10.5 < 11.3).
-
-Read the spread, not just the mean. Pre-v4 is tight because it pays a floor: a snapshot
-per peer per tick whether or not anything changed. v4's cost tracks actual change, so it
-ranges from near the pre-v4 figure when a peer's PVS is busy down to **0.2–0.3 KB/s when
-it is idle** — which is the clock keepalive and nothing else (17 B header x 4 Hz x 4
-peers = 272 B/s, and that is what the log shows). Most of the win is that floor
-disappearing; the rest is the uvarint mask. A busy server should expect the low end of
-the improvement, an idle or lightly-populated one the high end.
-
-Two caveats worth keeping. Adopting the *game-side* quantization hints on top
-(`vec3_half`/`angle8`/`time_delta` — the consumer's own change, not goldnet's) did not
-separate from goldnet's schema-agnostic wins at this sample size: 6.2 vs 6.1 KB/s, well
-inside the run-to-run spread. And this ran on a 4-core container with server, bots, and
-clients on one box, so the absolute numbers are not comparable to the table above —
-only the paired comparison is.
-
-The over-MTU column is the entity budget doing its job, and it is the least ambiguous
-result here: pre-v4 emitted `Sending 1991 bytes unreliably which is above the MTU (1392)`
-on a joining client's first full baseline in **every** run. With the budget, never.
+Same scenario on a 4-client run, measured as goldnet's own `dbg_bytes` under `GOLDNET_DEBUG=1`
+rather than at the socket, where ENet acks and the game's own `@rpc` traffic make up about half of
+egress. The snapshot stream averages **~6 KB/s in total (1.8–10.5 across runs)**, and its cost
+tracks change: a peer whose PVS is busy costs the most, an idle one **0.2–0.3 KB/s**, which is the
+clock keepalive and nothing else (17 B header x 4 Hz x 4 peers = 272 B/s). Game-side quantization
+hints (`vec3_half`/`angle8`/`time_delta`) did not separate from that at this sample size. The entity
+budget keeps every send under the MTU, including a joining client's first full baseline.
 
 ## What we wish Godot had
 
@@ -301,23 +270,7 @@ and replaces the spawner's `spawn_function` with a trampoline purely to capture 
 data. A `spawner_registered` hook, or spawn data available on the configuration callback, would
 delete all of it.
 
-**4. Runtime-added synchronizers that actually pair — RETRACTED, this is not a gap.** This entry
-used to claim that a `MultiplayerSynchronizer` created in code gets no replication-ID handshake,
-never pairs with its remote counterpart, and therefore has to be baked into a `.tscn` for stock
-SceneMultiplayer. Measured on Godot 4.7 and it is false: a headless host+client run on
-WizardWars' `--stock` fallback paired both of its runtime-built synchronizers — one built on a
-map-static node, one built inside a spawner-instantiated entity — and movers, dynamic entities
-and player puppets all arrived, with no errors on either side.
-
-*Forces:* nothing, either way. goldnet keys a synchronizer by the hash of its scene path
-(`net_id_for`), so a code-built sync pairs exactly like a baked one as long as both peers build it
-at the same path; stock, on 4.7, pairs them too. The entry is kept rather than deleted because the
-numbering is cited from elsewhere — and because a reader who has met the same lore should be able
-to find the retraction. If your runtime-built sync does not pair under stock, the difference is
-likely that the two peers build it at different paths, which is worth checking before baking a
-scene you would not otherwise need.
-
-**5. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
+**4. Somewhere to put per-property metadata.** `SceneReplicationConfig` has no per-property
 metadata, so an extension that wants a hint per slot (goldnet's quantization tags: `angle16`,
 `half`, `vec3_half`) has nowhere in the config to put it.
 
@@ -432,8 +385,7 @@ client, where it passes while testing nothing.
 
 Covers the three helpers the addon ships alongside the extension — the client-side
 `InterpolationBuffer` and `ServerClock`, plus `SyncSpec`, which builds a synchronizer's config and
-goldnet's metas from one declaration. (Local prediction, once `PredictedBody` here, moved out to
-pmove-godot — its only consumer — and is not part of this addon.) They're pure GDScript with no
+goldnet's metas from one declaration. They're pure GDScript with no
 dependency on goldnet's wire protocol, so this needs no built extension, no peer and no
 second process; the whole thing runs in one headless process in well under a second.
 
@@ -493,7 +445,7 @@ something false.
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
    ```
    The hints and the replication config are two lists that have to agree (see **What we
-   wish Godot had** #5), so prefer declaring them together and letting `SyncSpec` — the
+   wish Godot had** #4), so prefer declaring them together and letting `SyncSpec` — the
    addon's GDScript helper — derive both. A hint keyed to a property the config does not
    replicate is ignored in silence; a table cannot make that mistake, and `SyncSpec`
    reports the ones it cannot rule out (an unrecognised hint name, two properties sharing
@@ -644,7 +596,7 @@ something false.
    turns the netchan off for this end's sends.
    ```gdscript
    set_meta("gn_bypass", [&"sync_voice"])
-   gn.rpc_netchan = false        # every RPC through the inner, as before v6 (or GOLDNET_RPC_NETCHAN=0)
+   gn.rpc_netchan = false        # every RPC through the inner (or GOLDNET_RPC_NETCHAN=0)
    gn.get_message_stats(peer)    # {queued, delivered} reliable messages; a client passes 1
    ```
 
