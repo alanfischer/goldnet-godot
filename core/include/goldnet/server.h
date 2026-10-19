@@ -471,10 +471,9 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			}
 		}
 
-		const uint16_t seq = pr.next_seq++;
-		if (pr.next_seq == 0) {
-			pr.next_seq = 1; // 0 is reserved for "no baseline"
-		}
+		// Taken for good only once the snapshot goes (below), so a gap in the seqs a client
+		// receives is a lost snapshot, never a skipped one.
+		const uint16_t seq = pr.next_seq;
 
 		// Spawns owed to this peer, reliable-until-acked.
 		Writer spawn_body;
@@ -671,7 +670,8 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// Nothing to report: skip the header-only packet — except that the header carries
 		// server_time, the client's only clock feed, so "nothing to report" only earns a skip while
 		// that feed is still fresh. last_packet_ms == 0 is a peer never sent anything — its first
-		// snapshot must go out regardless, or the clock never starts. `seq` is simply left unused.
+		// snapshot must go out regardless, or the clock never starts. Nothing above recorded `seq`
+		// unless something went in the packet, so the next snapshot reuses it.
 		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
 		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
 				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
@@ -679,6 +679,10 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		}
 		pr.last_packet_ms = p_now;
 		pr.cmd_ack_sent = pr.cmd_ack;
+		pr.next_seq++;
+		if (pr.next_seq == 0) {
+			pr.next_seq = 1; // 0 is reserved for "no baseline"
+		}
 
 		const int slot = seq & (RING - 1);
 		pr.frames[slot] = std::move(included);

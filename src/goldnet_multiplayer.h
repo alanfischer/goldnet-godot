@@ -292,6 +292,9 @@ public:
 	// this instead of the transport's counters while the sim is on, since those count what the sim
 	// then holds back or drops. Zeros on a server, which has no receive sim.
 	Dictionary pop_recv_sim_delivered();
+	// Client: {received, lost} snapshots since the last call. The server spends a snapshot seq only
+	// on one it sends, so these are real losses, not the ticks with nothing to send.
+	Dictionary pop_snapshot_stats();
 
 	// Opt into PVS render-relevance events: the server sends reliable-until-acked "leave" markers for
 	// owned syncs that drop out of a peer's PVS, and the client emits `entity_relevance_lost` for them.

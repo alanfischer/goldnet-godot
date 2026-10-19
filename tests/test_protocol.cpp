@@ -646,6 +646,47 @@ static void test_command_ack_rides_the_header() {
 	printf("  the command ack rides the header and earns a send when new: ok\n");
 }
 
+// A gap in the seqs a client receives is a lost snapshot. Idle ticks send nothing and take no
+// seq, so they read as no loss at all, and a late snapshot is taken back off the count.
+static void test_arrival_stats_count_only_real_loss() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.tick();
+	for (int i = 0; i < 40; i++) { // 640 ms idle: two keepalives, ~38 skipped ticks
+		n.tick();
+	}
+	auto s = p.client.pop_arrival_stats();
+	CHECK(s.received == 3);
+	CHECK(s.lost == 0);
+
+	n.drop_snapshots.insert(2);
+	for (int v = 2; v < 5; v++) { // three changes, three snapshots, all lost
+		n.world.ents[10].vals[0] = v;
+		n.tick();
+	}
+	n.drop_snapshots.clear();
+	n.world.ents[10].vals[0] = 9;
+	n.tick();
+	s = p.client.pop_arrival_stats();
+	CHECK(s.received == 1);
+	CHECK(s.lost == 3);
+
+	n.world.ents[10].vals[0] = 10;
+	n.drop_snapshots.insert(2);
+	n.tick();
+	n.drop_snapshots.clear();
+	std::vector<uint8_t> late = n.world.outbox[2].back();
+	n.world.ents[10].vals[0] = 11;
+	n.tick();
+	TestClientHost ch{ &p };
+	p.client.apply(late.data(), late.size(), ch);
+	s = p.client.pop_arrival_stats();
+	CHECK(s.received == 2);
+	CHECK(s.lost == 0);
+	printf("  arrival stats count only real loss: ok\n");
+}
+
 int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
@@ -671,6 +712,7 @@ int main() {
 	test_removed_entity_leaves_client_frame();
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
+	test_arrival_stats_count_only_real_loss();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

@@ -5,6 +5,8 @@
 #include <cmath>
 #include <vector>
 
+#include <godot_cpp/classes/e_net_multiplayer_peer.hpp>
+#include <godot_cpp/classes/e_net_packet_peer.hpp>
 #include <godot_cpp/classes/engine.hpp>
 #include <godot_cpp/classes/multiplayer_spawner.hpp>
 #include <godot_cpp/classes/scene_multiplayer.hpp>
@@ -344,7 +346,26 @@ void GoldNetMultiplayer::_reset_client_state() {
 	snapshot_ack_new = false;
 }
 
-void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) { emit_signal("peer_connected", p_id); }
+// ENet throttles a peer's unreliable sends on its own: when the round trip jumps, as it does under
+// a join's reliable burst, it backs off and drops nearly every unreliable packet, then takes tens
+// of seconds to come back. That is the snapshot stream, which keeps its own rate and choke and
+// can't see what ENet threw away, so the throttle is held where it starts. The setting travels to
+// the remote end too, so the server's call alone covers both directions.
+static void hold_enet_throttle(const Ref<MultiplayerPeer> &p_peer, int32_t p_id) {
+	ENetMultiplayerPeer *enet = Object::cast_to<ENetMultiplayerPeer>(p_peer.ptr());
+	if (!enet) {
+		return;
+	}
+	Ref<ENetPacketPeer> pp = enet->get_peer(p_id);
+	if (pp.is_valid()) {
+		pp->throttle_configure(5000, 2, 0); // ENet's default interval and acceleration; never decelerate
+	}
+}
+
+void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
+	hold_enet_throttle(_get_multiplayer_peer(), (int32_t)p_id);
+	emit_signal("peer_connected", p_id);
+}
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
 	commands_in.remove_peer((int32_t)p_id);
@@ -806,6 +827,14 @@ Dictionary GoldNetMultiplayer::get_recv_sim_config() const {
 	return read_sim_config(recv_sim);
 }
 
+Dictionary GoldNetMultiplayer::pop_snapshot_stats() {
+	const goldnet::Client<Variant>::ArrivalStats st = client.pop_arrival_stats();
+	Dictionary d;
+	d["received"] = (int64_t)st.received;
+	d["lost"] = (int64_t)st.lost;
+	return d;
+}
+
 Dictionary GoldNetMultiplayer::pop_recv_sim_delivered() {
 	if (recv_peer.is_valid()) {
 		return recv_peer->pop_delivered();
@@ -970,6 +999,7 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_recv_sim_config"), &GoldNetMultiplayer::get_recv_sim_config);
 	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "recv_sim_config"), "set_recv_sim_config", "get_recv_sim_config");
 	ClassDB::bind_method(D_METHOD("pop_recv_sim_delivered"), &GoldNetMultiplayer::pop_recv_sim_delivered);
+	ClassDB::bind_method(D_METHOD("pop_snapshot_stats"), &GoldNetMultiplayer::pop_snapshot_stats);
 	ClassDB::bind_method(D_METHOD("set_relevance_events", "enabled"), &GoldNetMultiplayer::set_relevance_events);
 	ClassDB::bind_method(D_METHOD("get_relevance_events"), &GoldNetMultiplayer::get_relevance_events);
 	ClassDB::bind_method(D_METHOD("set_command_rate", "hz"), &GoldNetMultiplayer::set_command_rate);
