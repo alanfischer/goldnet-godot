@@ -384,7 +384,7 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 	}
 	{
 		// GOLDNET_LATENCY=min,max (per-leg ms range) or a single fixed value; GOLDNET_SPIKE=ms,interval,duration.
-		// These let a headless server simulate its own send leg with no admin console (see netsim_plan §3.5).
+		// These let a headless server simulate its own send leg with no admin console.
 		const char *lat = getenv("GOLDNET_LATENCY");
 		if (lat) {
 			PackedStringArray parts = String(lat).split(",");
@@ -1998,7 +1998,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	// send-side loss (unreliable only) + latency/spike here; the game can't observe the few-ms
 	// deferral (same contract the old net_latency_sim.gd send wrappers had). Loss drops only
 	// UNRELIABLE RPCs — dropping a reliable one would stop ENet retransmitting it and desync state
-	// (netsim_plan §4a). A command stream's calls skip this: they ride the uplink, whose own send
+	// A command stream's calls skip this: they ride the uplink, whose own send
 	// (_send_uplink) the sim applies to.
 	if (rpc_stats) {
 		_rpc_stats_count(p_peer, p_object, p_method, p_args);
