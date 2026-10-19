@@ -296,7 +296,7 @@ struct ServerApp {
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
 				commands.receive(it->second, buf + 1, (size_t)n - 1, *this, now_ms());
-				server.set_command_ack(it->second, commands.ack(it->second));
+				server.set_command_ack(it->second, commands.ack(it->second), commands.take_news(it->second));
 				server.set_uplink_ack(it->second, commands.channel_ack(it->second));
 			}
 			len = sizeof(from);

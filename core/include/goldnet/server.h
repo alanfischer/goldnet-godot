@@ -243,8 +243,13 @@ public:
 		pr.clear_at_ms = start + (double)p_bytes * 1000.0 / (double)pr.rate_bps;
 	}
 	// The newest command this peer sent that the host has delivered with none missing before it
-	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none.
-	void set_command_ack(int32_t p_peer, uint16_t p_seq) { rings_[p_peer].cmd_ack = p_seq; }
+	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none. p_news
+	// (CommandReceiver::take_news) earns a snapshot even when the ack hasn't moved.
+	void set_command_ack(int32_t p_peer, uint16_t p_seq, bool p_news = false) {
+		PeerRing &pr = rings_[p_peer];
+		pr.cmd_ack = p_seq;
+		pr.cmd_news = pr.cmd_news || p_news;
+	}
 
 	// --- Messages (netchan.h) ---
 
@@ -416,6 +421,7 @@ private:
 		uint32_t bandwidth_bps = 0;
 		uint16_t cmd_ack = 0;      // see set_command_ack
 		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
+		bool cmd_news = false;     // see set_command_ack
 		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
@@ -749,7 +755,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		// snapshot must go out regardless, or the clock never starts. Nothing above recorded `seq`
 		// unless something went in the packet, so the next snapshot reuses it.
 		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
-		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent
+		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent && !pr.cmd_news
 				&& block_flags == 0 && datagram.empty() && up.bit == pr.uplink_sent.bit
 				&& (!up.fragments || up.next_fragment == pr.uplink_sent.next_fragment)
 				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
@@ -757,6 +763,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		}
 		pr.last_packet_ms = p_now;
 		pr.cmd_ack_sent = pr.cmd_ack;
+		pr.cmd_news = false;
 		pr.uplink_sent = up;
 		pr.next_seq++;
 		if (pr.next_seq == 0) {

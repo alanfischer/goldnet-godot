@@ -213,7 +213,9 @@ compare the same way.
 
 **Sending.** The client keeps every unacked command, up to `COMMAND_RING` = 64. A packet carries
 every command not sent yet, the `COMMAND_BACKUP_DEFAULT` = 2 before them, and any unacked command
-last sent more than `max(1.5 × rtt, 50) + 16` ms ago. The round trip is timed from a command's
+last sent more than `max(1.5 × rtt, 50) + 16` ms ago or proven lost: the snapshot header's channel
+ack names an uplink packet newer than the one that last carried it (the netchan's rule for a block;
+one held behind a lost command arrives twice, which the server ignores). The round trip is timed from a command's
 first send to the snapshot that acks it, skipping commands that went again for being overdue,
 unless 8 acks in a row are of such commands: the round trip is then longer than the overdue time,
 and the shortest of those 8 becomes it. A
@@ -264,7 +266,9 @@ Per tick, for each peer:
    have waited for this peer times their priority weight. Whatever doesn't fit is left out of
    this frame, so the baseline compare offers it again next time. The first candidate always
    goes in, so a crowded packet can't stall replication.
-6. **Empty skip.** A snapshot with no spawn, despawn, leave or entity, and no `command_ack` the
+6. **Empty skip.** A snapshot with no spawn, despawn, leave or entity, no channel content, no news
+   from the uplink (commands held behind a lost one, or a packet of nothing but repeats, which
+   means the client lacks the ack), and no `command_ack` the
    peer hasn't been sent, isn't sent, unless the peer has gone `CLOCK_KEEPALIVE_MS` = 250 ms
    without one — `server_time` is the client's clock feed and must not go quiet.
 

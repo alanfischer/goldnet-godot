@@ -1470,7 +1470,7 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 	}
 	UplinkHost host{ this };
 	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
-	server.set_command_ack(p_peer, commands_in.ack(p_peer));
+	server.set_command_ack(p_peer, commands_in.ack(p_peer), commands_in.take_news(p_peer));
 	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
 }
 
