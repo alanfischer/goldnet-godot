@@ -36,10 +36,11 @@ inner `SceneMultiplayer`) is the adapter in `src/`.
 
 **Composition, not replacement.** `GoldNetMultiplayer extends
 MultiplayerAPIExtension` and holds an inner stock `SceneMultiplayer`
-(`MultiplayerAPI::create_default_interface()`). Handshake, auth, peer lifecycle,
-and **all `@rpc` traffic** are delegated to the inner; goldnet overrides only the
-object-configuration + poll path that drives state replication. It relays the
-inner's lifecycle signals up to itself so the consuming game listens on one object.
+(`MultiplayerAPI::create_default_interface()`). Handshake, auth and peer lifecycle
+are delegated to the inner, which also carries goldnet's own packets; goldnet overrides the
+object-configuration + poll path that drives state replication, and the `@rpc` path (see
+**RPCs on the netchan**). It relays the inner's lifecycle signals up to itself so the consuming
+game listens on one object.
 
 **Path-hash identity, no handshake.** Every owned node is keyed by
 `net_id = hash(scene_path)`. The same node lives at the same path on server and
@@ -75,6 +76,17 @@ commands not sent yet, two backups, and any unacked one out longer than a round 
 delta-coded against the command before it. The server's ack rides each snapshot header, and the
 client's snapshot ack rides each uplink packet. Without goldnet the marked method is just the
 reliable RPC it was declared as. See **Usage** and [`docs/protocol.md`](docs/protocol.md).
+
+**RPCs on the netchan.** Every other `@rpc` between the server and a client rides goldnet's
+packets too, the way GoldSrc's user messages rode its netchan: a reliable RPC in the packet's
+reliable block, an unreliable one in its datagram, in both directions. One reliable block is in
+flight at a time and goes again only when an ack proves it lost; a call bigger than a block moves
+in fragments, up to 32 in flight, one per packet (GoldSrc sent one per round trip); the datagram
+goes whole or not at all, and never plays after a newer packet's. So state and events share one ordered stream: a death RPC can't be overtaken by
+the snapshot that hides the body, and the peer's rate counts every byte. `call_local` and
+`get_remote_sender_id()` behave as with the inner. What stays on the inner: a client's call to
+another client, an unreliable call bigger than 512 bytes, and any method a node lists in its
+`gn_bypass` meta.
 - **a spawn record** when it is born from a wrapped `MultiplayerSpawner.spawn()`.
   Map-static entities load with the map (both peers already have them) so they need
   no spawn record; runtime entities do, because the client has no other way to know
@@ -512,18 +524,18 @@ something false.
    gn.bandwidth_bps = 32000              # every peer
    gn.set_peer_bandwidth_bps(peer, 8000) # or per peer, which wins where set
    ```
-   Note this budgets the entity-delta section only — the header and the
+   Note this budgets the entity-delta section only — the header, the netchan's messages and the
    spawn/despawn/leave sections are accounted against the MTU ceiling but are not
-   rate-limited, and `@rpc` traffic goes through the inner `SceneMultiplayer`
-   untouched. It is a replication throttle, not a link-wide one.
+   rate-limited. It is a replication throttle, not a link-wide one.
 
    For a link-wide limit, set the peer's **rate** (GoldSrc's `rate`): the most bytes per
    second to send it, snapshots and `@rpc` traffic both counted. Each send pushes the peer's
    clear time out by its size over the rate; while that's in the future the peer is
    **choked** — it gets no snapshot that tick, and the next one it does get deltas against
    its acked baseline, so it carries the latest state rather than a backlog. A slow link
-   then gets fewer snapshots instead of a queue in front of every one of them. Reliable
-   RPCs still go out when choked (they can't be skipped), but they count.
+   then gets fewer snapshots instead of a queue in front of every one of them. RPCs on the
+   netchan wait for the peer's next snapshot like everything else; ones on the inner (see
+   **RPCs on the netchan**) still go out when choked, but they count.
    ```gdscript
    gn.set_peer_rate(peer, 5000)      # bytes/sec; 0 = unlimited (the default)
    gn.get_peer_chokes(peer)          # snapshots withheld so far
@@ -626,6 +638,15 @@ something false.
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
    gn.get_command_stats()        # {pending, dropped, rtt_ms}
    ```
+10. (Optional) Keep an RPC off the netchan. A method a node lists in its `gn_bypass` meta goes
+   through the inner `SceneMultiplayer`, with no ordering against the netchan's: for traffic with
+   its own pacing, like voice, that shouldn't compete with the snapshot's budget. `rpc_netchan`
+   turns the netchan off for this end's sends.
+   ```gdscript
+   set_meta("gn_bypass", [&"sync_voice"])
+   gn.rpc_netchan = false        # every RPC through the inner, as before v6 (or GOLDNET_RPC_NETCHAN=0)
+   gn.get_message_stats(peer)    # {queued, delivered} reliable messages; a client passes 1
+   ```
 
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
@@ -706,3 +727,5 @@ path; its header shows the calls.
   every run drops different packets and draws different delays — fine for poking at
   self-heal, useless for a regression test you need to re-run or bisect. Also settable as
   the `seed` key of the `sim_config` property.
+- `GOLDNET_RPC_NETCHAN=0` — send this end's RPCs through the inner `SceneMultiplayer` instead of
+  the netchan, to compare the two.

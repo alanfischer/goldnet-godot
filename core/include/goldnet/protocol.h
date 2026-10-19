@@ -19,7 +19,9 @@ namespace goldnet {
 // even though nothing about the existing tags changed.
 // v5: the header carries the client's command ack (see uplink.h), and the client's snapshot ack
 // rides its uplink packet instead of travelling alone.
-static const uint8_t SNAPSHOT_VERSION = 5;
+// v6: GoldSrc's netchan (netchan.h): both packets carry a reliable block and a datagram after the
+// header, and the uplink packet gained a seq of its own and the newest snapshot received.
+static const uint8_t SNAPSHOT_VERSION = 6;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.
@@ -47,10 +49,28 @@ static const uint16_t MAX_LEAVES_PER_SNAPSHOT = 32;
 static const int SAFE_PACKET_BYTES = 1200;
 
 // Fixed part of every snapshot: version u8, seq u16, base_seq u16, server_time u32, command_ack u16,
-// and the four section counts (spawn/despawn/leave/changed) at u16 each. Subtracted from
-// SAFE_PACKET_BYTES when sizing the entity-delta budget, so the budget describes the packet rather
-// than one section.
-static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 2 + 2 + 2;
+// the channel part's ack u16, flags u8 and datagram length u16, and the four section counts
+// (spawn/despawn/leave/changed) at u16 each. Subtracted from SAFE_PACKET_BYTES when sizing the
+// entity-delta budget, so the budget describes the packet rather than one section.
+static const int SNAPSHOT_HEADER_BYTES = 1 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 2 + 2 + 2 + 2;
+
+// Largest reliable block (netchan.h), the GoldSrc fragment size scaled to SAFE_PACKET_BYTES: a block
+// leaves a third of the packet for the datagram and the entities, and a bigger message is cut into
+// fragments of this size.
+static const int RELIABLE_BLOCK_BYTES = 800;
+
+// Fragments of one message in flight at once (netchan.h). GoldSrc sent one per round trip, which a
+// message the size of a resource list turns into a long join; a window lets the link's rate set the
+// pace instead, while each fragment is still resent only on proof of its loss.
+static const int RELIABLE_FRAGMENT_WINDOW = 32;
+
+// How long after its last fragment arrived an end keeps telling the other which fragment it needs
+// next. Past that it says nothing, and the two bytes stop going in every packet.
+static const uint32_t FRAGMENT_ACK_MS = 1000;
+
+// Pending reliable data past this, not counting messages big enough to fragment, is an overflow:
+// the other end isn't taking it. GoldSrc dropped the client ("reliable channel overflowed").
+static const int RELIABLE_OVERFLOW_BYTES = 64 * 1024;
 
 // Longest a peer may go with no snapshot at all. Every snapshot header carries the server's
 // send-time, which the client surfaces as its server clock feed — an always-on feed independent

@@ -17,9 +17,15 @@
 // COMMAND_RING unacked is given up on. The packet's floor says so, and the server skips past it
 // rather than wait forever. That takes about a second of total loss.
 //
+// The packet is also the client's end of a GoldSrc netchan (netchan.h): queue_reliable and
+// queue_unreliable put the host's other messages in it, delivered to the server's host ahead of the
+// commands (reliable) and after them (datagram), as GoldSrc ran a string command before a move.
+//
 // Uplink packet:
 //   u8   version          SNAPSHOT_VERSION
+//   u16  seq              this packet's, counting up from 1 and skipping 0 like a snapshot's
 //   u16  snapshot_ack     the newest snapshot the client committed; 0 = none
+//   ...  channel part     (netchan.h) its ack is the newest snapshot received, committed or not
 //   u16  floor            the oldest command the client still holds; its next seq if it holds none
 //   u8   stream_ct        then stream_ct × u32 stream_id
 //   u8   cmd_ct           then, if cmd_ct > 0, u16 first_seq and cmd_ct × command, seqs ascending
@@ -31,10 +37,13 @@
 // The host passed to CommandReceiver::receive() provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
 //   void snapshot_ack(int32_t peer, uint16_t seq)   pass to Server::on_ack
+//   void channel_ack(int32_t peer, const ChannelAck &ack)   pass to Server::on_channel_ack
 //   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
+//   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
+#include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
 
 #include <algorithm>
@@ -140,10 +149,23 @@ public:
 	uint32_t interval_ms() const { return interval_ms_; }
 	void set_backup(int p_backup) { backup_ = p_backup < 0 ? 0 : p_backup; }
 
-	// Whether a packet should go now: a command not sent yet, or one overdue, and the interval is up.
+	// The client's other messages (netchan.h).
+	void queue_reliable(const uint8_t *p_data, size_t p_size) { rel_.queue(p_data, p_size); }
+	bool queue_unreliable(const uint8_t *p_data, size_t p_size) { return dgram_.queue(p_data, p_size); }
+	bool overflowed() const { return rel_.overflowed(); }
+	uint64_t reliable_queued() const { return rel_.queued(); }
+	uint64_t reliable_delivered() const { return rel_.delivered(); }
+	// From a snapshot header: what the server has received of this channel.
+	void on_channel_ack(const ChannelAck &p_ack) { rel_.on_ack(p_ack); }
+
+	// Whether a packet should go now: a command not sent yet, or one overdue, or a message, and the
+	// interval is up.
 	bool due(uint32_t p_now) const {
 		if (interval_ms_ > 0 && sent_any_ && p_now - last_send_ms_ < interval_ms_) {
 			return false;
+		}
+		if (rel_.due() || !dgram_.empty()) {
+			return true;
 		}
 		for (const Cmd &c : ring_) {
 			if (c.sends == 0 || p_now - c.last_sent_ms >= overdue_ms()) {
@@ -156,8 +178,18 @@ public:
 	// How long ago the last command was pushed, so a host can tell an active stream from an idle one.
 	uint32_t idle_ms(uint32_t p_now) const { return pushed_ ? p_now - last_push_ms_ : 0xFFFFFFFFu; }
 
-	// Build the next uplink packet, carrying p_snapshot_ack and whichever commands are due.
-	void write(uint32_t p_now, uint16_t p_snapshot_ack, Writer &r_out) {
+	// Build the next uplink packet, carrying p_snapshot_ack, what this end has received of the server's
+	// channel (Client::channel_ack), and whatever is due.
+	void write(uint32_t p_now, uint16_t p_snapshot_ack, const ChannelAckSource &p_received, Writer &r_out) {
+		const uint16_t seq = seq_;
+		seq_ = command_seq_next(seq_);
+		const ChannelAck ack = p_received.at(p_now);
+		std::vector<uint8_t> block;
+		const uint8_t block_flags = rel_.write(seq, block);
+		const int channel_bytes = (int)block.size() + (ack.fragments ? 2 : 0);
+		std::vector<uint8_t> datagram;
+		dgram_.take(SAFE_PACKET_BYTES - 16 - channel_bytes, datagram);
+
 		const size_t size = ring_.size();
 		size_t first_new = size;
 		while (first_new > 0 && ring_[first_new - 1].sends == 0) {
@@ -180,7 +212,7 @@ public:
 			picks.push_back(i);
 		}
 
-		const int budget = SAFE_PACKET_BYTES - 9 - 4 * (int)streams.size();
+		const int budget = SAFE_PACKET_BYTES - 16 - 4 * (int)streams.size() - (int)datagram.size() - channel_bytes;
 		Writer body;
 		std::vector<const std::vector<uint8_t> *> prev(streams.size(), nullptr);
 		std::vector<size_t> sent;
@@ -208,7 +240,9 @@ public:
 		}
 
 		r_out.put_u8(SNAPSHOT_VERSION);
+		r_out.put_u16(seq);
 		r_out.put_u16(p_snapshot_ack);
+		put_channel(r_out, ack, block_flags, block, datagram);
 		r_out.put_u16(ring_.empty() ? next_seq_ : ring_.front().seq);
 		r_out.put_u8((uint8_t)streams.size());
 		for (uint32_t s : streams) {
@@ -268,19 +302,29 @@ private:
 	int untimed_ = 0;
 	uint32_t untimed_min_ms_ = 0;
 	uint32_t dropped_ = 0;
+	uint16_t seq_ = 1;
+	ReliableSender rel_;
+	DatagramSender dgram_;
 };
 
 // The server end: one sequence per peer, delivered in order.
 class CommandReceiver {
 public:
-	// One uplink packet from p_peer. False if it was malformed or from a mismatched build.
+	// One uplink packet from p_peer. False if it was malformed or from a mismatched build. p_now: the
+	// host's clock, the one it writes its snapshots by.
 	template <class Host>
-	bool receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host);
+	bool receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
 	// The newest command from p_peer delivered with none missing before it. 0 = none yet.
 	uint16_t ack(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
 		return it == peers_.end() || !it->second.delivered ? 0 : command_seq_prev(it->second.next);
+	}
+
+	// What the server has received of p_peer's channel, for Server::set_uplink_ack.
+	ChannelAckSource channel_ack(int32_t p_peer) const {
+		auto it = peers_.find(p_peer);
+		return it == peers_.end() ? ChannelAckSource() : it->second.chan.ack_source();
 	}
 
 	// Commands p_peer gave up on before they arrived.
@@ -303,6 +347,7 @@ private:
 		std::unordered_map<uint16_t, Held> held;
 		uint32_t skipped = 0;
 		bool warned = false;
+		ChannelReceiver chan;
 	};
 	// Commands held for a gap to fill are bounded by what a client can have unacked.
 	static const int MAX_AHEAD = COMMAND_RING * 2;
@@ -310,7 +355,7 @@ private:
 };
 
 template <class Host>
-bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host) {
+bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	Reader r(p_data, p_size);
 	const uint8_t version = r.get_u8();
 	if (r.failed()) {
@@ -324,7 +369,10 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		}
 		return false;
 	}
+	const uint16_t packet_seq = r.get_u16();
 	const uint16_t snapshot_ack = r.get_u16();
+	ChannelPart chan;
+	chan.read(r);
 	uint16_t floor = r.get_u16();
 	const int stream_ct = r.get_u8();
 	std::vector<uint32_t> streams;
@@ -360,6 +408,19 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		p_host.snapshot_ack(p_peer, snapshot_ack);
 	}
 	Peer &p = peers_[p_peer];
+	// The channel only from a packet newer than every one before it. Commands carry their own seqs,
+	// so a reordered packet still delivers those.
+	std::vector<std::vector<uint8_t>> reliable;
+	std::vector<std::vector<uint8_t>> unreliable;
+	if (p.chan.accept(packet_seq)) {
+		p_host.channel_ack(p_peer, chan.ack);
+		if (!chan.take(p.chan, p_now, reliable, unreliable)) {
+			return false;
+		}
+	}
+	for (const std::vector<uint8_t> &m : reliable) {
+		p_host.message(p_peer, m.data(), m.size(), true);
+	}
 	if (floor == 0) {
 		floor = 1;
 	}
@@ -387,6 +448,9 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		p.next = command_seq_next(p.next);
 		p.delivered = true;
 		p_host.command(p_peer, h.stream, h.bytes.data(), h.bytes.size());
+	}
+	for (const std::vector<uint8_t> &m : unreliable) {
+		p_host.message(p_peer, m.data(), m.size(), false);
 	}
 	return true;
 }

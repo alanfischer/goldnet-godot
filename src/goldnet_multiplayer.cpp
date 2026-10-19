@@ -233,9 +233,8 @@ static Variant gn_bytes_to_var(const uint8_t *p_data, size_t p_size) {
 // p_ref_time_ms is the CURRENT packet's header timestamp (already parsed before the entity loop
 // reaches this call), the same value the sender's p_now_ms was — TAG_TIME_DELTA reconstructs the
 // absolute stamp by adding the wire delta back to it.
-static Variant gn_get_value(goldnet::Reader &r, uint32_t p_ref_time_ms) {
+static Variant gn_get_tagged(uint8_t t, goldnet::Reader &r, uint32_t p_ref_time_ms) {
 	using namespace goldnet;
-	uint8_t t = r.get_u8();
 	switch (t) {
 		case TAG_FLOAT:
 			return (double)r.get_float();
@@ -271,9 +270,112 @@ static Variant gn_get_value(goldnet::Reader &r, uint32_t p_ref_time_ms) {
 	}
 }
 
+static Variant gn_get_value(goldnet::Reader &r, uint32_t p_ref_time_ms) {
+	const uint8_t t = r.get_u8();
+	return gn_get_tagged(t, r, p_ref_time_ms);
+}
+
+// An RPC's arguments in a message (see _send_message): the snapshot's value tags where they fit, and
+// the binding's own for the types an RPC passes most that they don't carry compactly.
+static const uint8_t ARG_NIL = 64;
+static const uint8_t ARG_STRING = 65;
+static const uint8_t ARG_STRING_NAME = 66;
+static const uint8_t ARG_BYTES = 67;
+static const uint8_t ARG_DOUBLE = 68; // a float an f32 would change; the inner keeps those exact too
+
+// An unreliable call bigger than this goes through the inner: a datagram is all or nothing, and one
+// call this size would crowd out the rest of the packet's.
+static const int MAX_UNRELIABLE_MESSAGE = 512;
+
+static void put_str(goldnet::Writer &w, const String &p_s) {
+	const CharString u = p_s.utf8();
+	goldnet::put_uvarint(&w, (uint32_t)u.length());
+	w.put_data((const uint8_t *)u.get_data(), (size_t)u.length());
+}
+
+static String get_str(goldnet::Reader &r) {
+	const uint32_t n = goldnet::get_uvarint(&r);
+	const uint8_t *p = r.get_data(n);
+	return p ? String::utf8((const char *)p, n) : String();
+}
+
+static void put_arg(goldnet::Writer &w, const Variant &v) {
+	switch (v.get_type()) {
+		case Variant::NIL:
+			w.put_u8(ARG_NIL);
+			return;
+		case Variant::STRING:
+			w.put_u8(ARG_STRING);
+			put_str(w, v);
+			return;
+		case Variant::STRING_NAME:
+			w.put_u8(ARG_STRING_NAME);
+			put_str(w, String(StringName(v)));
+			return;
+		case Variant::PACKED_BYTE_ARRAY: {
+			const PackedByteArray b = v;
+			w.put_u8(ARG_BYTES);
+			goldnet::put_uvarint(&w, (uint32_t)b.size());
+			w.put_data(b.ptr(), (size_t)b.size());
+			return;
+		}
+		case Variant::FLOAT: {
+			const double d = v;
+			if ((double)(float)d == d) {
+				break;
+			}
+			uint64_t u;
+			memcpy(&u, &d, sizeof(u));
+			w.put_u8(ARG_DOUBLE);
+			w.put_u32((uint32_t)u);
+			w.put_u32((uint32_t)(u >> 32));
+			return;
+		}
+		default:
+			break;
+	}
+	gn_put_value(w, v, goldnet::QUANT_AUTO, 0);
+}
+
+static Variant get_arg(goldnet::Reader &r) {
+	const uint8_t t = r.get_u8();
+	switch (t) {
+		case ARG_NIL:
+			return Variant();
+		case ARG_STRING:
+			return get_str(r);
+		case ARG_STRING_NAME:
+			return StringName(get_str(r));
+		case ARG_BYTES: {
+			const uint32_t n = goldnet::get_uvarint(&r);
+			const uint8_t *p = r.get_data(n);
+			PackedByteArray b;
+			if (p) {
+				b.resize(n);
+				memcpy(b.ptrw(), p, n);
+			}
+			return b;
+		}
+		case ARG_DOUBLE: {
+			const uint64_t lo = r.get_u32();
+			const uint64_t hi = r.get_u32();
+			const uint64_t u = lo | (hi << 32);
+			double d;
+			memcpy(&d, &u, sizeof(d));
+			return d;
+		}
+		default:
+			return gn_get_tagged(t, r, 0);
+	}
+}
+
 GoldNetMultiplayer::GoldNetMultiplayer() {
 	dbg = getenv("GOLDNET_DEBUG") != nullptr;
 	rpc_stats = getenv("GOLDNET_RPC_STATS") != nullptr;
+	{
+		const char *netchan = getenv("GOLDNET_RPC_NETCHAN"); // =0: every RPC through the inner, for an A/B
+		rpc_netchan = !(netchan && String(netchan) == "0");
+	}
 	{
 		const char *loss = getenv("GOLDNET_LOSS");
 		sim.set_loss_percent(loss ? atoi(loss) : 0); // via the setter, so the 0-100 clamp applies here too
@@ -344,6 +446,8 @@ void GoldNetMultiplayer::_reset_client_state() {
 	commands_out.reset();
 	snapshot_ack = 0;
 	snapshot_ack_new = false;
+	msg_registered.clear();
+	msg_targets.clear();
 }
 
 // ENet throttles a peer's unreliable sends on its own: when the round trip jumps, as it does under
@@ -369,6 +473,8 @@ void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
 	commands_in.remove_peer((int32_t)p_id);
+	msg_registered.erase((int32_t)p_id);
+	msg_targets.erase((int32_t)p_id);
 	sim.forget_link((int32_t)p_id);
 	emit_signal("peer_disconnected", p_id);
 }
@@ -986,6 +1092,10 @@ void GoldNetMultiplayer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_bandwidth_bps"), &GoldNetMultiplayer::get_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_bandwidth_bps", "peer", "bps"), &GoldNetMultiplayer::set_peer_bandwidth_bps);
 	ClassDB::bind_method(D_METHOD("set_peer_rate", "peer", "bytes_per_sec"), &GoldNetMultiplayer::set_peer_rate);
+	ClassDB::bind_method(D_METHOD("set_rpc_netchan", "enabled"), &GoldNetMultiplayer::set_rpc_netchan);
+	ClassDB::bind_method(D_METHOD("get_rpc_netchan"), &GoldNetMultiplayer::get_rpc_netchan);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "rpc_netchan"), "set_rpc_netchan", "get_rpc_netchan");
+	ClassDB::bind_method(D_METHOD("get_message_stats", "peer"), &GoldNetMultiplayer::get_message_stats);
 	ClassDB::bind_method(D_METHOD("set_manual_send", "manual"), &GoldNetMultiplayer::set_manual_send);
 	ClassDB::bind_method(D_METHOD("get_manual_send"), &GoldNetMultiplayer::get_manual_send);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "manual_send"), "set_manual_send", "get_manual_send");
@@ -1247,6 +1357,10 @@ struct GoldNetMultiplayer::ClientHost {
 
 	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq, (uint32_t)Time::get_singleton()->get_ticks_msec()); }
 
+	void channel_ack(const goldnet::ChannelAck &ack) { gn->commands_out.on_channel_ack(ack); }
+
+	void message(const uint8_t *data, size_t size, bool) { gn->_deliver_message(1, data, size); }
+
 	// Carried by the next uplink packet (_send_uplink).
 	void send_ack(uint16_t seq) {
 		gn->snapshot_ack = seq;
@@ -1318,7 +1432,8 @@ struct GoldNetMultiplayer::ClientHost {
 
 void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	ClientHost host{ this };
-	goldnet::Client<Variant>::ApplyInfo info = client.apply(p_bytes.ptr(), (size_t)p_bytes.size(), host);
+	goldnet::Client<Variant>::ApplyInfo info = client.apply(p_bytes.ptr(), (size_t)p_bytes.size(), host,
+			(uint32_t)Time::get_singleton()->get_ticks_msec());
 	if (dbg && info.committed) {
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (now - dbg_last_ms > 2000) {
@@ -1345,6 +1460,8 @@ struct GoldNetMultiplayer::UplinkHost {
 	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
 		gn->_deliver_command(peer, stream, data, size);
 	}
+	void channel_ack(int32_t peer, const goldnet::ChannelAck &ack) { gn->server.on_channel_ack(peer, ack); }
+	void message(int32_t peer, const uint8_t *data, size_t size, bool) { gn->_deliver_message(peer, data, size); }
 };
 
 void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_bytes) {
@@ -1352,8 +1469,9 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 		return;
 	}
 	UplinkHost host{ this };
-	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host);
+	commands_in.receive(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host, (uint32_t)Time::get_singleton()->get_ticks_msec());
 	server.set_command_ack(p_peer, commands_in.ack(p_peer));
+	server.set_uplink_ack(p_peer, commands_in.channel_ack(p_peer));
 }
 
 // A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
@@ -1455,9 +1573,237 @@ void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, con
 		return;
 	}
 	const StringName method = t->method;
+	const int32_t outer_sender = command_sender;
 	command_sender = p_peer;
 	o->callv(method, args);
-	command_sender = 0;
+	command_sender = outer_sender;
+}
+
+// Queue one call to p_peer on the netchan: reliable, or in the datagram. False if it should go through
+// the inner instead (an unreliable call too big for a datagram).
+bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const StringName &p_method, const Array &p_args,
+		bool p_reliable) {
+	const bool on_server = inner->get_unique_id() == 1;
+	const String path = String(p_node->get_path());
+	const String key = path + String("::") + String(p_method);
+	uint32_t id;
+	if (const uint32_t *known_id = msg_ids.getptr(key)) {
+		id = *known_id;
+	} else {
+		id = msg_next_id++;
+		msg_ids[key] = id;
+	}
+	goldnet::Writer reg;
+	goldnet::put_uvarint(&reg, 0);
+	goldnet::put_uvarint(&reg, id);
+	put_str(reg, path);
+	put_str(reg, String(p_method));
+	goldnet::Writer args;
+	goldnet::put_uvarint(&args, (uint32_t)p_args.size());
+	for (int i = 0; i < p_args.size(); i++) {
+		put_arg(args, p_args[i]);
+	}
+
+	HashMap<uint32_t, uint64_t> &registered = msg_registered[p_peer];
+	const uint64_t *reg_at = registered.getptr(id);
+	const uint64_t delivered = on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered();
+	const bool known = reg_at && delivered > *reg_at;
+	// A call is its target's id and its arguments. An unreliable one to a target the peer may not know
+	// yet carries the registration in front instead, so it can go in the datagram with the rest.
+	goldnet::Writer call;
+	if (p_reliable || known) {
+		goldnet::put_uvarint(&call, id);
+	} else {
+		call.put_data(reg);
+	}
+	call.put_data(args);
+	if (!p_reliable && (int)call.size() > MAX_UNRELIABLE_MESSAGE) {
+		return false;
+	}
+	auto queue_reliable = [&](const goldnet::Writer &w) {
+		if (on_server) {
+			server.queue_reliable(p_peer, w.data(), w.size());
+		} else {
+			commands_out.queue_reliable(w.data(), w.size());
+		}
+	};
+	if (!reg_at) {
+		registered[id] = on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued();
+		queue_reliable(reg);
+	}
+	if (p_reliable) {
+		queue_reliable(call);
+	} else if (on_server) {
+		server.queue_unreliable(p_peer, call.data(), call.size()); // a full datagram drops it, as GoldSrc's did
+	} else {
+		commands_out.queue_unreliable(call.data(), call.size());
+	}
+	return true;
+}
+
+// GoldSrc dropped a client whose reliable channel overflowed: it isn't taking what it's sent.
+void GoldNetMultiplayer::_check_overflow(int32_t p_peer) {
+	Ref<MultiplayerPeer> mp = _get_multiplayer_peer();
+	if (mp.is_null()) {
+		return;
+	}
+	if (inner->get_unique_id() == 1) {
+		if (server.overflowed(p_peer)) {
+			UtilityFunctions::push_error("goldnet: reliable channel overflowed for peer ", p_peer, "; dropping it.");
+			server.remove_peer(p_peer);
+			mp->disconnect_peer(p_peer);
+		}
+	} else if (commands_out.overflowed()) {
+		UtilityFunctions::push_error("goldnet: reliable channel to the server overflowed; disconnecting.");
+		commands_out.reset();
+		mp->close();
+	}
+}
+
+// One message from p_from: a target registration, or a call, made the way the inner would have made it.
+void GoldNetMultiplayer::_deliver_message(int32_t p_from, const uint8_t *p_data, size_t p_size) {
+	goldnet::Reader r(p_data, p_size);
+	uint32_t id = goldnet::get_uvarint(&r);
+	HashMap<uint32_t, MsgTarget> &targets = msg_targets[p_from];
+	if (id == 0) {
+		// A registration, and a call to it if anything follows (see _send_message).
+		const uint32_t new_id = goldnet::get_uvarint(&r);
+		const NodePath path = NodePath(get_str(r));
+		const StringName method = StringName(get_str(r));
+		if (r.failed() || new_id == 0) {
+			return;
+		}
+		MsgTarget *known = targets.getptr(new_id);
+		if (!known || known->path != path || known->method != method) {
+			MsgTarget t;
+			t.path = path;
+			t.method = method;
+			targets[new_id] = t;
+		}
+		if (r.remaining() == 0) {
+			return;
+		}
+		id = new_id;
+	}
+	MsgTarget *t = targets.getptr(id);
+	if (!t) {
+		return;
+	}
+	Node *n = nullptr;
+	if (Object *o = t->object_id ? ObjectDB::get_instance(t->object_id) : nullptr) {
+		n = Object::cast_to<Node>(o);
+		if (n && !n->is_inside_tree()) {
+			n = nullptr;
+		}
+	}
+	if (!n) {
+		SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+		n = tree && tree->get_root() ? tree->get_root()->get_node_or_null(t->path) : nullptr;
+		t->object_id = n ? n->get_instance_id() : 0;
+	}
+	if (!n) {
+		if (!t->warned) {
+			t->warned = true;
+			UtilityFunctions::push_warning("goldnet: RPC '", t->method, "' for ", t->path, ", which isn't here.");
+		}
+		return;
+	}
+	const uint32_t argc = goldnet::get_uvarint(&r);
+	Array args;
+	for (uint32_t i = 0; i < argc && !r.failed(); i++) {
+		args.push_back(get_arg(r));
+	}
+	Dictionary cfg;
+	if (r.failed() || !rpc_method_config(n, t->method, cfg)) {
+		return;
+	}
+	const int mode = (int)cfg.get("rpc_mode", (int)MultiplayerAPI::RPC_MODE_AUTHORITY);
+	if (mode == MultiplayerAPI::RPC_MODE_DISABLED ||
+			(mode == MultiplayerAPI::RPC_MODE_AUTHORITY && n->get_multiplayer_authority() != p_from)) {
+		return;
+	}
+	const StringName method = t->method; // the call may register more targets, moving t
+	const int32_t outer_sender = command_sender;
+	command_sender = p_from;
+	n->callv(method, args);
+	command_sender = outer_sender;
+}
+
+// The RPC on the netchan, if it can go there: every call between the server and a client, but not one
+// a node lists in its gn_bypass meta, or a client's to another client (the inner relays those).
+bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args) {
+	if (!rpc_netchan) {
+		return false;
+	}
+	Ref<MultiplayerPeer> mp = inner->get_multiplayer_peer();
+	if (mp.is_null() || mp->get_connection_status() != MultiplayerPeer::CONNECTION_CONNECTED) {
+		return false;
+	}
+	Node *n = Object::cast_to<Node>(p_object);
+	if (!n || !n->is_inside_tree()) {
+		return false;
+	}
+	if (n->has_meta("gn_bypass") && Array(n->get_meta("gn_bypass")).has(p_method)) {
+		return false;
+	}
+	Dictionary cfg;
+	if (!rpc_method_config(p_object, p_method, cfg)) {
+		return false; // not an @rpc: the inner says so
+	}
+	const bool reliable = (int)cfg.get("transfer_mode", (int)MultiplayerPeer::TRANSFER_MODE_RELIABLE) ==
+			MultiplayerPeer::TRANSFER_MODE_RELIABLE;
+	if (inner->get_unique_id() != 1) {
+		if (p_peer != 1 || !_send_message(1, n, p_method, p_args, reliable)) {
+			return false;
+		}
+		_check_overflow(1);
+		return true;
+	}
+	if (p_peer == 1) {
+		return false; // only ourselves
+	}
+	const PackedInt32Array peers = inner->get_peers();
+	std::vector<int32_t> targets;
+	if (p_peer > 0) {
+		if (!peers.has(p_peer)) {
+			return false; // the inner reports the unknown peer
+		}
+		targets.push_back(p_peer);
+	} else {
+		for (int i = 0; i < peers.size(); i++) {
+			if (peers[i] != -p_peer) {
+				targets.push_back(peers[i]);
+			}
+		}
+	}
+	for (int32_t t : targets) {
+		if (_send_message(t, n, p_method, p_args, reliable)) {
+			_check_overflow(t);
+		} else {
+			_charge_rpc(t, p_args);
+			_sim_send(t, p_object, p_method, p_args, !reliable);
+		}
+	}
+	if ((bool)cfg.get("call_local", false) && (p_peer == 0 || (p_peer < 0 && p_peer != -1))) {
+		inner->rpc(1, p_object, p_method, p_args); // the server's own copy, as the inner makes it
+	}
+	return true;
+}
+
+void GoldNetMultiplayer::set_rpc_netchan(bool p_enabled) {
+	rpc_netchan = p_enabled;
+}
+
+bool GoldNetMultiplayer::get_rpc_netchan() const {
+	return rpc_netchan;
+}
+
+Dictionary GoldNetMultiplayer::get_message_stats(int p_peer) const {
+	const bool on_server = inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() == 1;
+	Dictionary d;
+	d["queued"] = (int64_t)(on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued());
+	d["delivered"] = (int64_t)(on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered());
+	return d;
 }
 
 // Client: one uplink packet, when there are commands due or a snapshot ack to send. While a stream
@@ -1479,7 +1825,7 @@ void GoldNetMultiplayer::_send_uplink() {
 		return;
 	}
 	goldnet::Writer w;
-	commands_out.write(now, snapshot_ack, w);
+	commands_out.write(now, snapshot_ack, client.channel_ack(), w);
 	snapshot_ack_new = false;
 	if (sim.loss_percent() > 0 && sim.loss_roll()) {
 		return; // simulated drop
@@ -1624,6 +1970,9 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 			return OK;
 		}
 	}
+	if (_netchan_rpc(p_peer, p_object, p_method, p_args)) {
+		return OK;
+	}
 	const bool simulating = sim.loss_percent() > 0 || sim.bandwidth_bps() > 0;
 	const bool droppable = simulating && _rpc_is_unreliable(p_object, p_method);
 	if (droppable && sim.loss_percent() > 0 && sim.loss_roll()) {
@@ -1681,6 +2030,14 @@ void GoldNetMultiplayer::_rpc_stats_print(uint64_t p_now) {
 		rows.push_back({ kv.key, kv.value });
 	}
 	std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second.bytes > b.second.bytes; });
+	if (inner->get_unique_id() == 1) {
+		const PackedInt32Array peers = inner->get_peers();
+		for (int i = 0; i < peers.size(); i++) {
+			UtilityFunctions::print("[goldnet rpc]   netchan peer ", peers[i], ": reliable ",
+					(int64_t)server.reliable_delivered(peers[i]), "/", (int64_t)server.reliable_queued(peers[i]),
+					" delivered, ", (int64_t)server.datagram_dropped(peers[i]), " datagrams dropped");
+		}
+	}
 	UtilityFunctions::print("[goldnet rpc] ", String::num(secs, 1), "s peers=", inner->get_peers().size(),
 			" snapshot=", String::num(rpc_stats_snap_bytes / 1024.0 / secs, 2), " KB/s (",
 			String::num(rpc_stats_snap_sends / secs, 0), " sends/s) rpc=",

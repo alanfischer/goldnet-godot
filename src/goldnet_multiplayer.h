@@ -18,6 +18,10 @@
 // addons/goldnet/command_stream.gd): a client's calls to the server are carried by
 // goldnet::CommandSender instead of the inner, and the server's CommandReceiver calls the method
 // once per call, in order, the way a reliable RPC would.
+//
+// Every other RPC between the server and a client rides the same packets too, as a message on
+// GoldSrc's netchan (goldnet/netchan.h): a reliable one in the reliable stream, an unreliable one in
+// the datagram. See _send_message.
 
 #include "goldnet/client.h"
 #include "goldnet/netsim.h"
@@ -183,13 +187,35 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	};
 	HashMap<uint32_t, CommandTarget> command_targets;
 	uint64_t command_scan_ms = 0;
-	// Server: the peer whose command is being delivered, for get_remote_sender_id().
+	// The peer whose command or message is being delivered, for get_remote_sender_id().
 	int32_t command_sender = 0;
 	uint32_t _command_stream_id(Object *p_object, const StringName &p_method);
 	void _scan_command_targets(Node *p_node);
 	void _deliver_command(int32_t p_peer, uint32_t p_stream, const uint8_t *p_data, size_t p_size);
 	void _send_uplink();
 	struct UplinkHost;
+
+	// --- Messages: RPCs on the netchan ---
+	// A message names its target (a node path and a method) by a small id, which the sending end
+	// registers with the receiving one reliably, the first time it uses it with that peer: GoldSrc's
+	// svc_newusermsg, done lazily. The ids are this end's own; each peer keeps the ones the other named.
+	bool rpc_netchan = true;
+	HashMap<String, uint32_t> msg_ids; // "path::method" -> id
+	uint32_t msg_next_id = 1;          // 0 is the registration message itself
+	// Peer -> id -> the index of its registration in that peer's reliable stream. Until the peer has
+	// that, an unreliable call goes reliable, so it can't arrive before its target is known.
+	HashMap<int32_t, HashMap<uint32_t, uint64_t>> msg_registered;
+	struct MsgTarget {
+		NodePath path;
+		StringName method;
+		uint64_t object_id = 0; // resolved on first delivery
+		bool warned = false;
+	};
+	HashMap<int32_t, HashMap<uint32_t, MsgTarget>> msg_targets; // peer -> id -> what it named
+	bool _send_message(int32_t p_peer, Node *p_node, const StringName &p_method, const Array &p_args, bool p_reliable);
+	void _deliver_message(int32_t p_from, const uint8_t *p_data, size_t p_size);
+	bool _netchan_rpc(int32_t p_peer, Object *p_object, const StringName &p_method, const Array &p_args);
+	void _check_overflow(int32_t p_peer);
 
 	// Re-emit the inner API's lifecycle signals on ourselves (the game listens on us).
 	void _relay_peer_connected(int64_t p_id);
@@ -307,6 +333,12 @@ public:
 	double get_command_rate() const;
 	// Client: {pending: unacked commands, dropped: given up on, rtt_ms: the command round trip}.
 	Dictionary get_command_stats() const;
+	// Carry the game's RPCs on the netchan (the default) rather than the inner SceneMultiplayer. Each
+	// end decides for its own sends, and either end takes both.
+	void set_rpc_netchan(bool p_enabled);
+	bool get_rpc_netchan() const;
+	// {queued, delivered}: reliable messages sent to p_peer (a client passes 1) and how many it has.
+	Dictionary get_message_stats(int p_peer) const;
 	~GoldNetMultiplayer();
 
 	// Client-side snapshot apply (called by GoldNetLink::_gn_recv).

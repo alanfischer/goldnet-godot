@@ -8,7 +8,10 @@
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
 //   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
+//   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
+//                                                  (CommandSender::on_channel_ack)
 //   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
+//   void message(const uint8_t *data, size_t size, bool reliable)   one netchan message (netchan.h)
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
 //        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
@@ -20,8 +23,14 @@
 //   void end_entity(bool applied)                  the current target is done
 //   V    decode(Reader &r, uint32_t ref_time_ms)   one tagged value
 //
+// Messages are delivered from any snapshot newer than every one before it, committed or not:
+// the reliable ones before the spawns, the datagram's after the entity deltas and before the
+// despawns, so an event can name an entity the same snapshot creates or removes. QuakeWorld ran its
+// datagram after the entities; it held only temp entities, which need no entity to land on.
+//
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
+#include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
 
 #include <unordered_map>
@@ -68,10 +77,15 @@ public:
 		last_seq_ = 0;
 		has_ = false;
 		defer_streak_ = 0;
+		chan_ = ChannelReceiver();
 	}
 
+	// For the uplink: what this end has received of the server's channel.
+	const ChannelAckSource &channel_ack() const { return chan_.ack_source(); }
+
+	// p_now: the host's clock, the same one it writes its uplink packets by (see channel_ack).
 	template <class Host>
-	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host);
+	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
 private:
 	// A frame is { net_id -> its slot values, in slot order }.
@@ -92,13 +106,14 @@ private:
 	uint32_t defer_streak_ = 0;
 	ArrivalStats arrivals_;
 	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
+	ChannelReceiver chan_;
 	void count_arrival(uint16_t p_seq);
 	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
 };
 
 template <class V>
 template <class Host>
-typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_size, Host &p_host) {
+typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	ApplyInfo info;
 	Reader r(p_data, p_size);
 
@@ -116,6 +131,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const uint16_t base_seq = r.get_u16();
 	const uint32_t server_time = r.get_u32();
 	const uint16_t command_ack = r.get_u16();
+	ChannelPart chan;
+	chan.read(r);
 	info.seq = seq;
 	info.base_seq = base_seq;
 	if (r.failed()) {
@@ -123,10 +140,24 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	}
 	count_arrival(seq);
 
-	// Drop stale/reordered snapshots (unreliable transport). We only advance forward.
-	if (has_ && !seq_newer(seq, last_seq_)) {
+	// Drop stale/reordered snapshots (unreliable transport). We only advance forward. A snapshot
+	// newer than the last committed one but not the last received is stale too: GoldSrc drops any
+	// packet older than the newest, and its messages must never play after a newer packet's.
+	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
 		return info;
 	}
+	p_host.channel_ack(chan.ack);
+	std::vector<std::vector<uint8_t>> reliable;
+	std::vector<std::vector<uint8_t>> unreliable;
+	if (!chan.take(chan_, p_now, reliable, unreliable)) {
+		return info;
+	}
+	auto deliver = [&p_host](std::vector<std::vector<uint8_t>> &p_msgs, bool p_reliable) {
+		for (const std::vector<uint8_t> &m : p_msgs) {
+			p_host.message(m.data(), m.size(), p_reliable);
+		}
+		p_msgs.clear();
+	};
 
 	// Surface the header clock: every snapshot carries the server's send-time, an always-on feed a
 	// client can drive a clock estimator from. Emitted after the stale-seq drop (a reordered
@@ -145,12 +176,16 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		if (frame_seq_[bslot] == base_seq) {
 			base = &frames_[bslot];
 		} else {
+			deliver(reliable, true);
+			deliver(unreliable, false);
 			if (has_) {
 				p_host.send_ack(last_seq_);
 			}
 			return info;
 		}
 	}
+
+	deliver(reliable, true);
 
 	// Spawns first: create the entities so they register before the entity deltas below
 	// reference them.
@@ -240,6 +275,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			p_host.end_entity(applied);
 		}
 	}
+
+	deliver(unreliable, false);
 
 	// A truncated or corrupt packet: whatever it applied stays applied (later snapshots carry the
 	// same state again), but it is not a frame we can baseline against, so don't commit or ack it.
