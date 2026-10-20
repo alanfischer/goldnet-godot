@@ -22,6 +22,9 @@ extends RefCounted
 ##
 ## Per-property options, all optional:
 ##   "quant"  String  lossy encoding hint — see QUANT_HINTS and the README's Usage section.
+##   "grid"   float   a float or Vector3 property travels as whole multiples of this, coded as its
+##                    change from what the peer holds: a position that moves a little costs a byte
+##                    or two an axis. The value lands rounded to the grid. Not with "quant".
 ##   "push"   bool    the game promises to mark_dirty() every write to this property, so goldnet
 ##                    may skip reading it on a tick nobody marked. An undeclared property is
 ##                    polled every tick, which is why forgetting one costs a read, not a desync.
@@ -47,7 +50,8 @@ extends RefCounted
 ## ignore, so validate() reports it.
 const QUANT_HINTS := ["angle8", "angle16", "half", "vec3_half", "time_delta"]
 
-const _PROP_KEYS := ["quant", "push", "mode", "spawn"]
+const _PROP_KEYS := ["quant", "grid", "push", "mode", "spawn"]
+const _HINT_KEYS := ["quant", "grid", "push"]  ## the options the metas key by leaf name
 const _SPEC_KEYS := ["priority"]
 
 
@@ -69,6 +73,7 @@ static func apply(sync: MultiplayerSynchronizer, decl: Dictionary, opts: Diction
 	# (all-auto / poll everything), and a sync that always carries both describes itself when
 	# something is inspecting it.
 	sync.set_meta("gn_quant", quant_hints(decl))
+	sync.set_meta("gn_grid", grids(decl))
 	sync.set_meta("gn_push", pushed(decl))
 	if opts.has("priority"):
 		sync.set_meta("gn_priority", float(opts["priority"]))
@@ -95,6 +100,16 @@ static func quant_hints(decl: Dictionary) -> Dictionary:
 		var o := _opts(decl, key)
 		if o.has("quant"):
 			out[_leaf(key)] = String(o["quant"])
+	return out
+
+
+## The `gn_grid` meta: leaf name -> grid step, for the properties that declared one.
+static func grids(decl: Dictionary) -> Dictionary:
+	var out := {}
+	for key in decl:
+		var o := _opts(decl, key)
+		if o.has("grid"):
+			out[_leaf(key)] = float(o["grid"])
 	return out
 
 
@@ -133,6 +148,10 @@ static func validate(decl: Dictionary, cfg: SceneReplicationConfig = null,
 		if o.has("quant") and not (String(o["quant"]) in QUANT_HINTS):
 			problems.append("'%s' has unknown quant hint '%s' (want one of %s)"
 				% [key, o["quant"], QUANT_HINTS])
+		if o.has("grid") and (not (typeof(o["grid"]) in [TYPE_FLOAT, TYPE_INT]) or float(o["grid"]) <= 0.0):
+			problems.append("'%s' has grid %s, not a positive number" % [key, o["grid"]])
+		if o.has("grid") and o.has("quant"):
+			problems.append("'%s' has both grid and quant; a grid is its own encoding" % key)
 		if o.has("push") and typeof(o["push"]) != TYPE_BOOL:
 			problems.append("'%s' has non-bool push" % key)
 		if o.has("mode") and not (int(o.get("mode", -1)) in [
@@ -144,8 +163,8 @@ static func validate(decl: Dictionary, cfg: SceneReplicationConfig = null,
 		# a problem when a hint is actually involved — otherwise the leaf is never looked up.
 		var leaf := _leaf(key)
 		if leaf_owners.has(leaf):
-			if o.has("quant") or o.has("push") or _opts(decl, leaf_owners[leaf]).has("quant") \
-					or _opts(decl, leaf_owners[leaf]).has("push"):
+			var other := _opts(decl, leaf_owners[leaf])
+			if _has_hint(o) or _has_hint(other):
 				problems.append("'%s' and '%s' share the leaf name '%s', which the metas key by, so a hint on one applies to both"
 					% [leaf_owners[leaf], key, leaf])
 		else:
@@ -166,6 +185,10 @@ static func validate(decl: Dictionary, cfg: SceneReplicationConfig = null,
 			if not in_config.has(key):
 				problems.append("table declares '%s', which the config does not replicate" % key)
 	return problems
+
+
+static func _has_hint(o: Dictionary) -> bool:
+	return _HINT_KEYS.any(func(k: String) -> bool: return o.has(k))
 
 
 static func _opts(decl: Dictionary, key: Variant) -> Dictionary:

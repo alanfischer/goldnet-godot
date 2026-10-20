@@ -33,6 +33,7 @@ func run() -> void:
 	_test_leaf_collision()
 	_test_config_drift_both_ways()
 	_test_unknown_sync_option()
+	_test_grid()
 
 
 # --- derivation ---
@@ -173,3 +174,15 @@ func _test_unknown_sync_option() -> void:
 	var problems := Spec.validate(DECL, null, {"prioritiy": 2.0})
 	check_eq(problems.size(), 1, "a misspelled sync option is caught")
 	check("prioritiy" in problems[0], "the problem names it")
+
+
+func _test_grid() -> void:
+	var decl := {".:pos": {"grid": 0.25, "push": true}, ".:vel": {}}
+	check_eq(Spec.grids(decl), {"pos": 0.25}, "gn_grid is keyed by leaf name, for the gridded property only")
+	check_eq(Spec.validate(decl).size(), 0, "a positive grid is sound")
+	var sync := Spec.build("S", decl)
+	check_eq(sync.get_meta("gn_grid"), {"pos": 0.25}, "gn_grid is stamped")
+	sync.free()
+	check_eq(Spec.validate({".:pos": {"grid": 0.0}}).size(), 1, "a zero grid is reported")
+	check_eq(Spec.validate({".:pos": {"grid": "fine"}}).size(), 1, "a non-number grid is reported")
+	check_eq(Spec.validate({".:pos": {"grid": 0.25, "quant": "vec3_half"}}).size(), 1, "grid with quant is reported")

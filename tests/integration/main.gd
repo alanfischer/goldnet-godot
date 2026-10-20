@@ -88,7 +88,8 @@ func _ready() -> void:
 
 	CommandStream.mark(self, &"_case_command")
 	CommandStream.mark(self, &"_case_raw")
-	CommandStream.mark(self, &"_case_typed", [TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_NIL])
+	CommandStream.mark(self, &"_case_typed", {"n": {"type": TYPE_INT}, "f": {"type": TYPE_FLOAT},
+			"b": {"type": TYPE_BOOL}, "v": {}})
 
 	print("[%s] case=%s ready on udp:%d" % ["server" if _is_server else "client", _case_name, PORT])
 
@@ -132,8 +133,8 @@ func registered_count() -> int:
 # --- command streams ---
 #
 # Three marked RPCs (see CommandStream): one taking an int and a String, one a lone
-# PackedByteArray, and one an Array whose declared elements are an int, a float, a bool and an
-# untyped one, so every field kind and both ways of declaring them are covered. Server-side they
+# PackedByteArray, and one a Dictionary whose field table declares an int, a float, a bool and an
+# untyped field, so every field kind and both ways of declaring them are covered. Server-side they
 # forward to the case.
 
 const CommandStream = preload("res://addons/goldnet/command_stream.gd")
@@ -150,8 +151,8 @@ func _case_raw(bytes: PackedByteArray) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func _case_typed(fields: Array) -> void:
-	_case.on_command(multiplayer.get_remote_sender_id(), fields)
+func _case_typed(fields: Dictionary) -> void:
+	_case.on_command(multiplayer.get_remote_sender_id(), [fields["n"], fields["f"], fields["b"], fields["v"]])
 
 
 ## Client → server: ask the case for its report. The ask and the report are on channel 1, which
