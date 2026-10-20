@@ -460,8 +460,8 @@ void GoldNetMultiplayer::_reset_client_state() {
 // the remote end too, so the server's call alone covers both directions.
 static void hold_enet_throttle(const Ref<MultiplayerPeer> &p_peer, int32_t p_id) {
 	ENetMultiplayerPeer *enet = Object::cast_to<ENetMultiplayerPeer>(p_peer.ptr());
-	if (!enet) {
-		return;
+	if (!enet || enet->get_unique_id() != 1) {
+		return; // a client only links to the server; its other peers are relayed, not ENet peers
 	}
 	Ref<ENetPacketPeer> pp = enet->get_peer(p_id);
 	if (pp.is_valid()) {
