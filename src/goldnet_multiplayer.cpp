@@ -1442,9 +1442,11 @@ struct GoldNetMultiplayer::UplinkHost {
 		UtilityFunctions::push_error("goldnet: uplink protocol mismatch from peer ", peer, " — the server "
 				"and client are running different goldnet builds. Rebuild/redeploy both to the same version.");
 	}
-	void command(int32_t peer, uint32_t stream, const uint8_t *data, size_t size) {
-		gn->_deliver_command(peer, stream, data, size);
+	const goldnet::Schema *command_schema(int32_t, uint32_t stream) {
+		const CommandTarget *t = gn->_command_target(stream);
+		return t ? &t->sig.kinds : nullptr;
 	}
+	void command(int32_t peer, uint32_t stream, const goldnet::Command &cmd) { gn->_deliver_command(peer, stream, cmd); }
 	void message(int32_t peer, const uint8_t *data, size_t size, bool) { gn->_deliver_message(peer, data, size); }
 };
 
@@ -1457,44 +1459,197 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 			(uint32_t)Time::get_singleton()->get_ticks_msec());
 }
 
-// A command's payload: a form byte, then the call's arguments. A lone PackedByteArray goes as its
-// own bytes, the shape a game packing its own command takes; anything else as var_to_bytes.
-static const uint8_t COMMAND_ARGS_VARIANT = 0;
-static const uint8_t COMMAND_ARGS_BYTES = 1;
+// How a command field maps back to its argument: the field kind, and for bytes whether the argument
+// was a PackedByteArray or any other Variant (put_arg's encoding, coded bytewise).
+enum CommandArgForm : uint8_t {
+	CMD_ARG_INT,
+	CMD_ARG_FLOAT,
+	CMD_ARG_BOOL,
+	CMD_ARG_BYTES,
+	CMD_ARG_VARIANT,
+};
 
-// The stream id for an RPC, or 0 if it isn't one: the node lists the method in its gn_commands
-// meta, and the method is an @rpc (an unmarked one fails here exactly as it would on stock).
-// Hashed from the node's path and the method, so both ends agree with no handshake.
-uint32_t GoldNetMultiplayer::_command_stream_id(Object *p_object, const StringName &p_method) {
-	const uint64_t oid = p_object->get_instance_id();
-	HashMap<StringName, uint32_t> &methods = command_stream_cache[oid];
-	if (const uint32_t *cached = methods.getptr(p_method)) {
-		return *cached;
+static uint8_t command_arg_form(int p_type) {
+	switch (p_type) {
+		case Variant::INT:
+			return CMD_ARG_INT;
+		case Variant::FLOAT:
+			return CMD_ARG_FLOAT;
+		case Variant::BOOL:
+			return CMD_ARG_BOOL;
+		case Variant::PACKED_BYTE_ARRAY:
+			return CMD_ARG_BYTES;
+		default:
+			return CMD_ARG_VARIANT;
 	}
-	uint32_t id = 0;
+}
+
+// A command stream's fields are its method's arguments, typed by their declarations: an int, float
+// or bool argument is a field of that kind (a float travels as f32), a PackedByteArray one is bytes,
+// and anything else, typed or not, is its Variant encoding as bytes. Or, when CommandStream.mark gave
+// element types (the node's gn_command_fields meta), the method takes one Array and each element is
+// a field of its given type. Both ends read the same script, so they agree with no handshake; the
+// signature is folded into the stream id, so two builds that declare it differently see different
+// streams rather than misreading each other's fields.
+static bool command_signature(Object *p_object, const StringName &p_method, std::vector<uint8_t> &r_forms,
+		bool &r_array) {
+	Node *n = Object::cast_to<Node>(p_object);
+	const Dictionary declared = n && n->has_meta("gn_command_fields") ? Dictionary(n->get_meta("gn_command_fields")) : Dictionary();
+	r_array = declared.has(p_method);
+	if (r_array) {
+		const Array types = declared[p_method];
+		if (types.size() > goldnet::MAX_COMMAND_FIELDS) {
+			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' declares more than ",
+					goldnet::MAX_COMMAND_FIELDS, " fields.");
+			return false;
+		}
+		r_forms.clear();
+		for (int64_t i = 0; i < types.size(); i++) {
+			r_forms.push_back(command_arg_form((int)types[i]));
+		}
+		return true;
+	}
+	const TypedArray<Dictionary> methods = p_object->get_method_list();
+	for (int64_t i = 0; i < methods.size(); i++) {
+		const Dictionary m = methods[i];
+		if (StringName(m.get("name", "")) != p_method) {
+			continue;
+		}
+		const Array args = m.get("args", Array());
+		if (args.size() > goldnet::MAX_COMMAND_FIELDS) {
+			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes more than ",
+					goldnet::MAX_COMMAND_FIELDS, " arguments.");
+			return false;
+		}
+		r_forms.clear();
+		for (int64_t a = 0; a < args.size(); a++) {
+			r_forms.push_back(command_arg_form((int)Dictionary(args[a]).get("type", (int)Variant::NIL)));
+		}
+		return true;
+	}
+	return false;
+}
+
+static goldnet::FieldKind command_field_kind(uint8_t p_form) {
+	switch (p_form) {
+		case CMD_ARG_INT:
+			return goldnet::FIELD_INT;
+		case CMD_ARG_FLOAT:
+			return goldnet::FIELD_FLOAT;
+		case CMD_ARG_BOOL:
+			return goldnet::FIELD_BOOL;
+		default:
+			return goldnet::FIELD_BYTES;
+	}
+}
+
+// The signature for p_node's p_method, id 0 if it isn't a command stream or can't be one.
+static void make_command_signature(Node *p_node, const StringName &p_method, uint32_t &r_id,
+		goldnet::Schema &r_kinds, std::vector<uint8_t> &r_forms, bool &r_array) {
+	r_id = 0;
+	if (!command_signature(p_node, p_method, r_forms, r_array)) {
+		return;
+	}
+	String sig = r_array ? "[" : "";
+	r_kinds.clear();
+	for (uint8_t form : r_forms) {
+		r_kinds.push_back(command_field_kind(form));
+		sig += String::chr('a' + form);
+	}
+	r_id = (String(p_node->get_path()) + "::" + String(p_method) + "(" + sig + ")").hash();
+	r_id = r_id ? r_id : 1;
+}
+
+// The signature for an RPC, or null if it isn't a command stream: the node lists the method in its
+// gn_commands meta, and the method is an @rpc (an unmarked one fails here exactly as it would on stock).
+const GoldNetMultiplayer::CommandSignature *GoldNetMultiplayer::_command_stream(Object *p_object, const StringName &p_method) {
+	const uint64_t oid = p_object->get_instance_id();
+	HashMap<StringName, CommandSignature> &methods = command_stream_cache[oid];
+	if (const CommandSignature *cached = methods.getptr(p_method)) {
+		return cached->id ? cached : nullptr;
+	}
+	CommandSignature sig;
 	Node *n = Object::cast_to<Node>(p_object);
 	if (n && n->has_meta("gn_commands") && Array(n->get_meta("gn_commands")).has(p_method)) {
 		Dictionary cfg;
 		if (rpc_method_config(p_object, p_method, cfg)) {
-			id = (String(n->get_path()) + "::" + String(p_method)).hash();
-			id = id ? id : 1;
+			make_command_signature(n, p_method, sig.id, sig.kinds, sig.forms, sig.array);
 		} else {
 			UtilityFunctions::push_error("goldnet: '", p_method, "' is in gn_commands but isn't an @rpc; "
 					"calling it as an ordinary RPC.");
 		}
 	}
-	methods[p_method] = id;
-	return id;
+	methods[p_method] = sig;
+	const CommandSignature *stored = methods.getptr(p_method);
+	return stored->id ? stored : nullptr;
+}
+
+// A call's arguments as its command's fields. False, with an error, if they don't fit the signature.
+static bool command_from_args(const std::vector<uint8_t> &p_forms, bool p_array, const StringName &p_method,
+		const Array &p_call_args, goldnet::Command &r_cmd) {
+	if (p_array && (p_call_args.size() != 1 || p_call_args[0].get_type() != Variant::ARRAY)) {
+		UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes one Array, its fields; "
+				"the call is dropped.");
+		return false;
+	}
+	const Array args = p_array ? Array(p_call_args[0]) : p_call_args;
+	if ((size_t)args.size() != p_forms.size()) {
+		UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes ", (int64_t)p_forms.size(),
+				p_array ? " fields" : " arguments", " but was called with ", args.size(), "; the call is dropped.");
+		return false;
+	}
+	r_cmd.assign(p_forms.size(), goldnet::Field());
+	for (size_t k = 0; k < p_forms.size(); k++) {
+		const Variant &v = args[(int64_t)k];
+		const Variant::Type t = v.get_type();
+		const bool number = t == Variant::INT || t == Variant::FLOAT || t == Variant::BOOL;
+		bool ok = true;
+		switch (p_forms[k]) {
+			case CMD_ARG_INT:
+				ok = number;
+				r_cmd[k].i = ok ? (int64_t)v : 0;
+				break;
+			case CMD_ARG_FLOAT:
+				ok = number;
+				r_cmd[k].f = ok ? (float)(double)v : 0.0f;
+				break;
+			case CMD_ARG_BOOL:
+				ok = number;
+				r_cmd[k].i = ok && (bool)v ? 1 : 0;
+				break;
+			case CMD_ARG_BYTES: {
+				ok = t == Variant::PACKED_BYTE_ARRAY;
+				if (ok) {
+					const PackedByteArray b = v;
+					r_cmd[k].bytes.assign(b.ptr(), b.ptr() + b.size());
+				}
+			} break;
+			default: {
+				goldnet::Writer w;
+				put_arg(w, v);
+				r_cmd[k].bytes.assign(w.data(), w.data() + w.size());
+			} break;
+		}
+		if (!ok) {
+			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' argument ", (int64_t)k,
+					" is a ", Variant::get_type_name(t), ", which its declared type can't take; the call is dropped.");
+			return false;
+		}
+	}
+	return true;
 }
 
 void GoldNetMultiplayer::_scan_command_targets(Node *p_node) {
 	if (p_node->has_meta("gn_commands")) {
 		Array methods = p_node->get_meta("gn_commands");
 		for (int i = 0; i < methods.size(); i++) {
-			const StringName method = methods[i];
-			uint32_t id = (String(p_node->get_path()) + "::" + String(method)).hash();
-			id = id ? id : 1;
-			command_targets[id] = CommandTarget{ p_node->get_instance_id(), method };
+			CommandTarget t;
+			t.object_id = p_node->get_instance_id();
+			t.method = methods[i];
+			make_command_signature(p_node, t.method, t.sig.id, t.sig.kinds, t.sig.forms, t.sig.array);
+			if (t.sig.id) {
+				command_targets[t.sig.id] = t;
+			}
 		}
 	}
 	for (int i = 0; i < p_node->get_child_count(); i++) {
@@ -1502,48 +1657,66 @@ void GoldNetMultiplayer::_scan_command_targets(Node *p_node) {
 	}
 }
 
+// The method a stream id calls, or null. A node marked since the last scan, or one freed and
+// re-added, takes a rescan; that is a tree walk, so a client sending ids nothing matches can't make
+// the server do it more than once a second.
+const GoldNetMultiplayer::CommandTarget *GoldNetMultiplayer::_command_target(uint32_t p_stream) {
+	const CommandTarget *t = command_targets.getptr(p_stream);
+	if (t && ObjectDB::get_instance(t->object_id)) {
+		return t;
+	}
+	const uint64_t now = Time::get_singleton()->get_ticks_msec();
+	if (command_scan_ms != 0 && now - command_scan_ms < 1000) {
+		return nullptr;
+	}
+	command_scan_ms = now;
+	command_targets.clear();
+	SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+	if (tree && tree->get_root()) {
+		_scan_command_targets(tree->get_root());
+	}
+	t = command_targets.getptr(p_stream);
+	return t && ObjectDB::get_instance(t->object_id) ? t : nullptr;
+}
+
 // Call the method a command stands for, as the inner would have for the RPC: the same permission
 // rule, and get_remote_sender_id() answering the client that sent it.
-void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, const uint8_t *p_data, size_t p_size) {
-	const CommandTarget *t = command_targets.getptr(p_stream);
-	Object *o = t ? ObjectDB::get_instance(t->object_id) : nullptr;
-	if (!o) {
-		// A node marked since the last scan, or one freed and re-added. Rescanning is a tree walk, so a
-		// client sending ids nothing matches can't make the server do it more than once a second.
-		const uint64_t now = Time::get_singleton()->get_ticks_msec();
-		if (command_scan_ms != 0 && now - command_scan_ms < 1000) {
-			return;
-		}
-		command_scan_ms = now;
-		command_targets.clear();
-		SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
-		if (tree && tree->get_root()) {
-			_scan_command_targets(tree->get_root());
-		}
-		t = command_targets.getptr(p_stream);
-		o = t ? ObjectDB::get_instance(t->object_id) : nullptr;
-		if (!o) {
-			return;
-		}
-	}
-	if (p_size < 1) {
+void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, const goldnet::Command &p_cmd) {
+	const CommandTarget *t = _command_target(p_stream);
+	if (!t || p_cmd.size() != t->sig.forms.size()) {
 		return;
 	}
+	Object *o = ObjectDB::get_instance(t->object_id);
 	Array args;
-	if (p_data[0] == COMMAND_ARGS_BYTES) {
-		PackedByteArray b;
-		b.resize((int64_t)p_size - 1);
-		memcpy(b.ptrw(), p_data + 1, p_size - 1);
-		args.push_back(b);
-	} else {
-		PackedByteArray b;
-		b.resize((int64_t)p_size - 1);
-		memcpy(b.ptrw(), p_data + 1, p_size - 1);
-		Variant v = UtilityFunctions::bytes_to_var(b);
-		if (v.get_type() != Variant::ARRAY) {
-			return;
+	for (size_t k = 0; k < p_cmd.size(); k++) {
+		const goldnet::Field &f = p_cmd[k];
+		switch (t->sig.forms[k]) {
+			case CMD_ARG_INT:
+				args.push_back(f.i);
+				break;
+			case CMD_ARG_FLOAT:
+				args.push_back((double)f.f);
+				break;
+			case CMD_ARG_BOOL:
+				args.push_back(f.i != 0);
+				break;
+			case CMD_ARG_BYTES: {
+				PackedByteArray b;
+				b.resize((int64_t)f.bytes.size());
+				if (!f.bytes.empty()) {
+					memcpy(b.ptrw(), f.bytes.data(), f.bytes.size());
+				}
+				args.push_back(b);
+			} break;
+			default: {
+				goldnet::Reader r(f.bytes.data(), f.bytes.size());
+				const Variant v = get_arg(r);
+				if (r.failed()) {
+					return;
+				}
+				args.push_back(v);
+			} break;
 		}
-		args = v;
 	}
 	Dictionary cfg;
 	Node *n = Object::cast_to<Node>(o);
@@ -1558,7 +1731,7 @@ void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, con
 	const StringName method = t->method;
 	const int32_t outer_sender = command_sender;
 	command_sender = p_peer;
-	o->callv(method, args);
+	o->callv(method, t->sig.array ? Array::make(args) : args);
 	command_sender = outer_sender;
 }
 
@@ -1914,20 +2087,18 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	if (rpc_stats) {
 		_rpc_stats_count(p_peer, p_object, p_method, p_args);
 	}
-	// A command stream's call rides the uplink instead (see _command_stream_id).
+	// A command stream's call rides the uplink instead (see _command_stream).
 	if (p_peer == 1 && inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() != 1) {
-		if (const uint32_t stream = _command_stream_id(p_object, p_method)) {
-			std::vector<uint8_t> payload;
-			if (p_args.size() == 1 && p_args[0].get_type() == Variant::PACKED_BYTE_ARRAY) {
-				const PackedByteArray b = p_args[0];
-				payload.push_back(COMMAND_ARGS_BYTES);
-				payload.insert(payload.end(), b.ptr(), b.ptr() + b.size());
-			} else {
-				const PackedByteArray b = UtilityFunctions::var_to_bytes(p_args);
-				payload.push_back(COMMAND_ARGS_VARIANT);
-				payload.insert(payload.end(), b.ptr(), b.ptr() + b.size());
+		if (const CommandSignature *sig = _command_stream(p_object, p_method)) {
+			goldnet::Command cmd;
+			if (!command_from_args(sig->forms, sig->array, p_method, p_args, cmd)) {
+				return ERR_INVALID_PARAMETER;
 			}
-			client.uplink().push(stream, payload.data(), payload.size(), (uint32_t)Time::get_singleton()->get_ticks_msec());
+			goldnet::CommandSender &up = client.uplink();
+			if (up.schema(sig->id) != sig->kinds) {
+				up.set_schema(sig->id, sig->kinds);
+			}
+			up.push(sig->id, std::move(cmd), (uint32_t)Time::get_singleton()->get_ticks_msec());
 			return OK;
 		}
 	}

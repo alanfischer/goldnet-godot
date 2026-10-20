@@ -97,28 +97,24 @@ func _make_cube(data: Variant) -> Node:
 	return cube
 
 
-## One command: its number and the height the client wants for Cube0. Declared reliable, as a
-## command stream must be: every call runs once on the server, in order.
+## One command: its number and the height the client wants for Cube0, in 64ths. Declared reliable,
+## as a command stream must be: every call runs once on the server, in order. The typed arguments
+## are its fields, so each call costs only its changes: a byte or two here.
 @rpc("any_peer", "call_remote", "reliable")
-func submit_input(cmd: PackedByteArray) -> void:
+func submit_input(n: int, height: int) -> void:
 	var sender := multiplayer.get_remote_sender_id()
-	var n := cmd.decode_u32(0)
 	if n != _expect.get(sender, 0):
 		_out_of_order += 1
 	_expect[sender] = n + 1
-	_height = cmd.decode_s8(4) / 64.0
+	_height = height / 64.0
 	_cmds += 1
 
 
 func _physics_process(_delta: float) -> void:
 	if _is_server or multiplayer.multiplayer_peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
 		return
-	var cmd := PackedByteArray()
-	cmd.resize(5)
-	cmd.encode_u32(0, _next_cmd)
-	cmd.encode_s8(4, roundi(sin(_t * 2.0) * 64.0))
+	submit_input.rpc_id(1, _next_cmd, roundi(sin(_t * 2.0) * 64.0))
 	_next_cmd += 1
-	submit_input.rpc_id(1, cmd)
 
 
 func _process(delta: float) -> void:

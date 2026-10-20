@@ -78,7 +78,7 @@ client calls once per command with `CommandStream.mark(node, &"method")`. Its co
 reliable RPC's — every call reaches the server once, in order — and goldnet keeps it the way
 Quake does instead of with ENet's reliable channel: each unreliable uplink packet carries the
 commands not sent yet, two backups, and any unacked one out longer than a round trip and a half,
-delta-coded against the command before it. The server's ack rides each snapshot header, and the
+delta-coded field by field against the command before it. The server's ack rides each snapshot header, and the
 client's snapshot ack rides each uplink packet. Without goldnet the marked method is just the
 reliable RPC it was declared as. See **Usage** and goldnet's [`docs/protocol.md`](https://github.com/alanfischer/goldnet/blob/main/docs/protocol.md).
 
@@ -562,8 +562,10 @@ something false.
    the next one is on its way, and a long loss costs at most a round trip and a half. Only a
    client's calls to the server are carried this way. A command still unacked after
    `COMMAND_RING` (about a second at 60 Hz) is given up on, the one way it is weaker than the
-   reliable RPC. A lone `PackedByteArray` argument goes as its own bytes; each command is
-   delta-coded bytewise against the previous one, so a fixed layout compresses best.
+   reliable RPC. The arguments are the command's fields, delta-coded field by field against the
+   previous call, so declare their types: a small step in an `int` costs a byte, an unchanged
+   argument nothing. A command laid out elsewhere can be one `Array` instead, with its element
+   types given to `mark` (see `command_stream.gd`).
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
    gn.auto_command_rate = true   # or let goldnet pick it
