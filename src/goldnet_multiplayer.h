@@ -23,7 +23,6 @@
 // GoldSrc's netchan (goldnet/netchan.h): a reliable one in the reliable stream, an unreliable one in
 // the datagram. See _send_message.
 
-#include "goldnet/auto_rate.h"
 #include "goldnet/client.h"
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
@@ -171,22 +170,9 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _reset_client_state();
 
 	// --- Command streams (uplink) ---
-	// Client: the rate and command rate the game set, and the automatic ones (auto_rate.h), which
-	// _apply_link_settings puts on client.uplink().
-	int rate_setting = 0;
-	bool auto_rate = false;
-	int update_rate_setting = 0;
-	int update_rate_granted = -1; // the server's last word on it; -1 = none yet this session
-	double command_rate_setting = 0.0;
-	bool auto_command_rate = false;
-	goldnet::DownlinkMeter downlink;
-	goldnet::CmdRateAuto cmd_auto;
-	uint32_t uplink_lag_ms = 0; // the server's last report of our uplink
-	uint32_t uplink_pps = 0;
-	void _apply_link_settings();
-	void _on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps);
-	void _on_server_time(uint32_t p_ms);
-	void _on_update_rate(uint32_t p_hz);
+	// Client: the update rate the server last granted, as update_rate_granted told the game; -1 = none
+	// yet this session. The rates themselves are goldnet's Client's (set_rate & co).
+	int update_rate_granted = -1;
 	// Client: object -> method -> stream id, 0 = an ordinary RPC. Resolved on the first call.
 	HashMap<uint64_t, HashMap<StringName, uint32_t>> command_stream_cache;
 	// Server: stream id -> the method it calls, found by scanning the tree for gn_commands metas.
@@ -348,7 +334,7 @@ public:
 	double get_command_rate() const;
 	void set_auto_command_rate(bool p_enabled);
 	bool get_auto_command_rate() const;
-	// SNAPSHOT_VERSION: two ends that differ can't talk, so a game's own join handshake can compare them.
+	// WIRE_VERSION: two ends that differ can't talk, so a game's own join handshake can compare them.
 	int get_protocol_version() const;
 	~GoldNetMultiplayer();
 
