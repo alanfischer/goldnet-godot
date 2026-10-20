@@ -15,9 +15,9 @@
 // wrapped so their spawns and despawns are streamed through the same path.
 //
 // Upstream, an @rpc a node lists in its "gn_commands" meta is a command stream (see
-// addons/goldnet/command_stream.gd): a client's calls to the server are carried by
-// goldnet::CommandSender instead of the inner, and the server's CommandReceiver calls the method
-// once per call, in order, the way a reliable RPC would.
+// addons/goldnet/command_stream.gd): a client's calls to the server are carried by its uplink
+// (goldnet::Client::uplink) instead of the inner, and the server calls the method once per call, in
+// order, the way a reliable RPC would.
 //
 // Every other RPC between the server and a client rides the same packets too, as a message on
 // GoldSrc's netchan (goldnet/netchan.h): a reliable one in the reliable stream, an unreliable one in
@@ -171,10 +171,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _reset_client_state();
 
 	// --- Command streams (uplink) ---
-	goldnet::CommandSender commands_out;  // client
-	goldnet::CommandReceiver commands_in; // server
-	// Client: the rate and command rate the game set, and the automatic ones (auto_rate.h). Kept
-	// here rather than only in commands_out, which a new session resets.
+	// Client: the rate and command rate the game set, and the automatic ones (auto_rate.h), which
+	// _apply_link_settings puts on client.uplink().
 	int rate_setting = 0;
 	bool auto_rate = false;
 	int update_rate_setting = 0;
@@ -189,10 +187,6 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	void _on_uplink_report(uint32_t p_lag_ms, uint32_t p_pps);
 	void _on_server_time(uint32_t p_ms);
 	void _on_update_rate(uint32_t p_hz);
-	// Client: the snapshot ack for the next uplink packet. While a command stream is active it waits
-	// for the next command packet rather than going alone, as GoldSrc's acks ride clc_move.
-	uint16_t snapshot_ack = 0;
-	bool snapshot_ack_new = false;
 	// Client: object -> method -> stream id, 0 = an ordinary RPC. Resolved on the first call.
 	HashMap<uint64_t, HashMap<StringName, uint32_t>> command_stream_cache;
 	// Server: stream id -> the method it calls, found by scanning the tree for gn_commands metas.

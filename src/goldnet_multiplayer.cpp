@@ -440,15 +440,12 @@ GoldNetMultiplayer::~GoldNetMultiplayer() {}
 void GoldNetMultiplayer::_reset_client_state() {
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
-	commands_out.reset();
 	downlink = goldnet::DownlinkMeter();
 	cmd_auto = goldnet::CmdRateAuto();
 	uplink_lag_ms = 0;
 	uplink_pps = 0;
 	update_rate_granted = -1;
 	_apply_link_settings();
-	snapshot_ack = 0;
-	snapshot_ack_new = false;
 	msg_registered.clear();
 	msg_targets.clear();
 }
@@ -475,7 +472,6 @@ void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
 }
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
 	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
-	commands_in.remove_peer((int32_t)p_id);
 	msg_registered.erase((int32_t)p_id);
 	msg_targets.erase((int32_t)p_id);
 	sim.forget_link((int32_t)p_id);
@@ -827,13 +823,13 @@ bool GoldNetMultiplayer::get_auto_rate() const {
 	return auto_rate;
 }
 
-// The rate and command rate commands_out goes by: the game's settings, or the automatic ones.
+// The rate and command rate the uplink goes by: the game's settings, or the automatic ones.
 void GoldNetMultiplayer::_apply_link_settings() {
-	commands_out.set_rate((uint32_t)(auto_rate ? downlink.rate() : rate_setting));
-	commands_out.set_update_rate((uint32_t)update_rate_setting);
+	client.uplink().set_rate((uint32_t)(auto_rate ? downlink.rate() : rate_setting));
+	client.uplink().set_update_rate((uint32_t)update_rate_setting);
 	const double hz = auto_command_rate ? cmd_auto.rate() : command_rate_setting;
 	const double ceiling = (double)Engine::get_singleton()->get_physics_ticks_per_second();
-	commands_out.set_interval_ms(hz > 0.0 && !(auto_command_rate && hz >= ceiling) ? (uint32_t)std::lround(1000.0 / hz) : 0);
+	client.uplink().set_interval_ms(hz > 0.0 && !(auto_command_rate && hz >= ceiling) ? (uint32_t)std::lround(1000.0 / hz) : 0);
 }
 
 // Client: each snapshot's server send time, for the downlink's meter.
@@ -980,20 +976,20 @@ Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
 	d["chokes"] = (int64_t)(on_server ? server.chokes(p_peer) : 0);
 	d["snapshots_received"] = (int64_t)arrivals.received;
 	d["snapshots_lost"] = (int64_t)arrivals.lost;
-	d["messages_queued"] = (int64_t)(on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued());
-	d["messages_delivered"] = (int64_t)(on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered());
-	d["commands_pending"] = (int64_t)(on_server ? 0 : commands_out.pending());
-	d["commands_dropped"] = (int64_t)(on_server ? 0 : commands_out.dropped());
-	d["command_rtt_ms"] = (int64_t)(on_server ? 0 : commands_out.rtt_ms());
+	d["messages_queued"] = (int64_t)(on_server ? server.reliable_queued(p_peer) : client.uplink().reliable_queued());
+	d["messages_delivered"] = (int64_t)(on_server ? server.reliable_delivered(p_peer) : client.uplink().reliable_delivered());
+	d["commands_pending"] = (int64_t)(on_server ? 0 : client.uplink().pending());
+	d["commands_dropped"] = (int64_t)(on_server ? 0 : client.uplink().dropped());
+	d["command_rtt_ms"] = (int64_t)(on_server ? 0 : client.uplink().rtt_ms());
 	d["recv_sim_bytes"] = sim_peer ? recv_peer->get_delivered_bytes() : (int64_t)0;
 	d["recv_sim_packets"] = sim_peer ? recv_peer->get_delivered_packets() : (int64_t)0;
-	const uint32_t iv = commands_out.interval_ms();
-	d["rate"] = (int64_t)(on_server ? server.peer_rate(p_peer) : commands_out.rate());
+	const uint32_t iv = client.uplink().interval_ms();
+	d["rate"] = (int64_t)(on_server ? server.peer_rate(p_peer) : client.uplink().rate());
 	d["update_rate"] = (int64_t)(on_server ? server.update_rate(p_peer) : std::max(update_rate_granted, 0));
 	d["command_rate"] = on_server || iv == 0 ? 0.0 : 1000.0 / (double)iv;
 	d["downlink_lag_ms"] = (int64_t)(on_server ? 0 : downlink.lag_ms());
-	d["uplink_lag_ms"] = (int64_t)(on_server ? commands_in.uplink_lag_ms(p_peer) : uplink_lag_ms);
-	d["uplink_pps"] = (int64_t)(on_server ? commands_in.uplink_pps(p_peer) : uplink_pps);
+	d["uplink_lag_ms"] = (int64_t)(on_server ? server.uplink_lag_ms(p_peer) : uplink_lag_ms);
+	d["uplink_pps"] = (int64_t)(on_server ? server.uplink_pps(p_peer) : uplink_pps);
 	d["delivered_bps"] = on_server ? 0.0 : downlink.delivered_bps();
 	return d;
 }
@@ -1411,19 +1407,7 @@ struct GoldNetMultiplayer::ClientHost {
 	void uplink_report(uint32_t lag_ms, uint32_t pps) { gn->_on_uplink_report(lag_ms, pps); }
 	void update_rate(uint32_t hz) { gn->_on_update_rate(hz); }
 
-	void command_ack(uint16_t seq) { gn->commands_out.on_ack(seq); }
-
-	void channel_ack(const goldnet::ChannelAck &ack) {
-		gn->commands_out.on_channel_ack(ack, (uint32_t)Time::get_singleton()->get_ticks_msec());
-	}
-
 	void message(const uint8_t *data, size_t size, bool) { gn->_deliver_message(1, data, size); }
-
-	// Carried by the next uplink packet (_send_uplink).
-	void send_ack(uint16_t seq) {
-		gn->snapshot_ack = seq;
-		gn->snapshot_ack_new = true;
-	}
 
 	bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
 		return gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
@@ -1523,7 +1507,7 @@ void GoldNetMultiplayer::on_uplink(int32_t p_peer, const PackedByteArray &p_byte
 		return;
 	}
 	UplinkHost host{ this };
-	server.receive_uplink(p_peer, commands_in, p_bytes.ptr(), (size_t)p_bytes.size(), host,
+	server.receive_uplink(p_peer, p_bytes.ptr(), (size_t)p_bytes.size(), host,
 			(uint32_t)Time::get_singleton()->get_ticks_msec());
 }
 
@@ -1659,7 +1643,7 @@ bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const Strin
 
 	HashMap<uint32_t, uint64_t> &registered = msg_registered[p_peer];
 	const uint64_t *reg_at = registered.getptr(id);
-	const uint64_t delivered = on_server ? server.reliable_delivered(p_peer) : commands_out.reliable_delivered();
+	const uint64_t delivered = on_server ? server.reliable_delivered(p_peer) : client.uplink().reliable_delivered();
 	const bool known = reg_at && delivered > *reg_at;
 	// A call is its target's id and its arguments. An unreliable one to a target the peer may not know
 	// yet carries the registration in front instead, so it can go in the datagram with the rest.
@@ -1677,11 +1661,11 @@ bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const Strin
 		if (on_server) {
 			server.queue_reliable(p_peer, w.data(), w.size());
 		} else {
-			commands_out.queue_reliable(w.data(), w.size());
+			client.uplink().queue_reliable(w.data(), w.size());
 		}
 	};
 	if (!reg_at) {
-		registered[id] = on_server ? server.reliable_queued(p_peer) : commands_out.reliable_queued();
+		registered[id] = on_server ? server.reliable_queued(p_peer) : client.uplink().reliable_queued();
 		queue_reliable(reg);
 	}
 	if (p_reliable) {
@@ -1689,7 +1673,7 @@ bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const Strin
 	} else if (on_server) {
 		server.queue_unreliable(p_peer, call.data(), call.size()); // a full datagram drops it, as GoldSrc's did
 	} else {
-		commands_out.queue_unreliable(call.data(), call.size());
+		client.uplink().queue_unreliable(call.data(), call.size());
 	}
 	return true;
 }
@@ -1706,9 +1690,9 @@ void GoldNetMultiplayer::_check_overflow(int32_t p_peer) {
 			server.remove_peer(p_peer);
 			mp->disconnect_peer(p_peer);
 		}
-	} else if (commands_out.overflowed()) {
+	} else if (client.uplink().overflowed()) {
 		UtilityFunctions::push_error("goldnet: reliable channel to the server overflowed; disconnecting.");
-		commands_out.reset();
+		client.uplink().reset();
 		mp->close();
 	}
 }
@@ -1841,9 +1825,7 @@ bool GoldNetMultiplayer::_netchan_rpc(int32_t p_peer, Object *p_object, const St
 	return true;
 }
 
-// Client: one uplink packet, when there are commands due or a snapshot ack to send. While a stream
-// is active the ack waits for the next command packet (which comes within the command interval)
-// rather than costing a packet of its own.
+// Client: one uplink packet, whenever the core says one is due (goldnet::Client::uplink_due).
 void GoldNetMultiplayer::_send_uplink() {
 	Ref<MultiplayerPeer> peer = inner->get_multiplayer_peer();
 	if (peer.is_null() || peer->get_connection_status() != MultiplayerPeer::CONNECTION_CONNECTED ||
@@ -1851,8 +1833,7 @@ void GoldNetMultiplayer::_send_uplink() {
 		return;
 	}
 	const uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
-	const bool streaming = commands_out.idle_ms(now) < commands_out.interval_ms() + 100;
-	if (!commands_out.due(now) && !(snapshot_ack_new && !streaming)) {
+	if (!client.uplink_due(now)) {
 		return;
 	}
 	GoldNetLink *l = _ensure_link();
@@ -1860,8 +1841,7 @@ void GoldNetMultiplayer::_send_uplink() {
 		return;
 	}
 	goldnet::Writer w;
-	commands_out.write(now, snapshot_ack, client.channel_ack(), w);
-	snapshot_ack_new = false;
+	client.write_uplink(now, w);
 	if (sim.loss_percent() > 0 && sim.loss_roll()) {
 		return; // simulated drop
 	}
@@ -2002,7 +1982,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 				payload.push_back(COMMAND_ARGS_VARIANT);
 				payload.insert(payload.end(), b.ptr(), b.ptr() + b.size());
 			}
-			commands_out.push(stream, payload.data(), payload.size(), (uint32_t)Time::get_singleton()->get_ticks_msec());
+			client.uplink().push(stream, payload.data(), payload.size(), (uint32_t)Time::get_singleton()->get_ticks_msec());
 			return OK;
 		}
 	}
