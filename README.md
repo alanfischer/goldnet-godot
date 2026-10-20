@@ -149,17 +149,19 @@ snapshot — is in goldnet's [`docs/protocol.md`](https://github.com/alanfischer
   the world is idle, and `ServerClock` would free-run on local time — a drift with no
   error message attached.
 
-**Compact value encoding.** Each changed slot is written with a 1-byte type tag
-plus a tight payload — `f32` for floats, zig-zag varint for ints, 3×`f32` for
-`Vector3`, a byte for bool, and a `put_var` fallback for anything else. This keeps
-the stream self-delimiting (any `Variant` still round-trips) while roughly halving
-per-entity bytes versus stock `put_var` (which tags every value with a 4-byte type
-header and stores floats/ints at 64-bit width): a moving player's ~8 props drop
-from ~112 B to ~48 B. Opt-in lossy tags (`gn_quant`, see **Usage**) go further:
-`angle16`/`angle8` fold a radian onto 2 or 1 bytes, `half`/`vec3_half` drop floats
-to binary16, and `time_delta` encodes an int ms stamp as a varint offset from the
-packet's own header time, so a same-tick stamp stays ~1 byte however long the server
-has been up. Every tag is self-describing, so the decoder needs no matching config.
+**Compact value encoding.** Each changed slot is coded by its **kind**, which both
+ends work out from the property's declared type and its hint, so it carries no tag:
+an `int` goes as its step from the value the peer holds at its baseline (a byte for a
+small one), a `bool` as a byte, a `float` as `f32`, a `Vector3` as 3×`f32`. Opt-in
+hints (`gn_quant`, `gn_grid`, see **Usage**) go further: `angle16`/`angle8` fold a
+radian onto 2 or 1 bytes, stepped like an int; `half`/`vec3_half` drop floats to
+binary16; `time_delta` encodes an int ms stamp as an offset from the packet's own
+header time; and a grid (`gn_grid`) sends a float or `Vector3` as steps of a fixed size,
+so a position that moved a little costs a byte or two an axis. A whole entity carries
+a one-byte check of its kinds, and a client whose properties are typed or hinted
+differently ignores it with an error rather than misreading it. An untyped property, or
+one of another type, goes behind a 1-byte type tag with a `put_var` fallback, as before,
+so any `Variant` still round-trips.
 
 **Per-peer visibility (PVS).** goldnet honors the synchronizer's *native*
 visibility — an entity is sent to a peer when `is_visibility_public()` or
@@ -419,7 +421,12 @@ something false.
    #                absolute ms timestamps only; ignored on non-int slots, since
    #                truncating a float here would corrupt it rather than shrink it.
    sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
+   # A float or Vector3 can travel on a grid instead: as whole steps of this size, coded
+   # as its change from what the peer holds. The value lands rounded to the grid.
+   sync.set_meta("gn_grid", { "pos": 0.001 })
    ```
+   Declare the replicated properties' types (`var pos := Vector3.ZERO`): the kinds come
+   from them, and an untyped property gets the tagged fallback.
    The hints and the replication config are two lists that have to agree (see **What we
    wish Godot had** #4), so prefer declaring them together and letting `SyncSpec` — the
    addon's GDScript helper — derive both. A hint keyed to a property the config does not
@@ -431,6 +438,7 @@ something false.
        "NetInterp:net_pos":   {"quant": "vec3_half", "push": true},
        "NetInterp:net_stamp": {"quant": "time_delta", "push": true},
        "NetInterp:net_anim":  {},   # replicated, full precision, polled every tick
+       ".:pos":               {"grid": 0.001, "push": true},
    }
    node.add_child(SyncSpec.build("NetSync", SPEC))
    # or, where the synchronizer is baked into a .tscn and the scene owns the config:
@@ -564,8 +572,8 @@ something false.
    `COMMAND_RING` (about a second at 60 Hz) is given up on, the one way it is weaker than the
    reliable RPC. The arguments are the command's fields, delta-coded field by field against the
    previous call, so declare their types: a small step in an `int` costs a byte, an unchanged
-   argument nothing. A command laid out elsewhere can be one `Array` instead, with its element
-   types given to `mark` (see `command_stream.gd`).
+   argument nothing. A command laid out elsewhere can be one `Dictionary` instead, declared by a
+   field table in `SyncSpec`'s shape and given to `mark` (see `command_stream.gd`).
    ```gdscript
    gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
    gn.auto_command_rate = true   # or let goldnet pick it

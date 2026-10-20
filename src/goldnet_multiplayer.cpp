@@ -92,18 +92,12 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 	return target;
 }
 
-// Compact, self-delimiting wire encoding for per-slot values (tags in goldnet/protocol.h). Stock
-// Variant put_var tags every value with a 4-byte type header and stores floats/ints at 64-bit
-// width — unaffordable on the hot per-tick delta path, where the same handful of property types
-// (float, int, Vector3, bool) recur across every entity. We pack those behind a 1-byte tag using
-// 32-bit floats and zig-zag varint ints (a moving player's ~8 props drop from ~112 to ~48 bytes),
-// and fall back to Godot's own Variant encoding (TAG_OPAQUE) for anything else, so any Variant
-// still round-trips.
-//
-// Optional per-property QUANTIZATION: a synchronizer may hint that a slot is an angle, or that a
-// float / Vector3 tolerates half precision, via its "gn_quant" meta (see _read_quant). We then pack
-// it lossily behind its own tag. The tags stay self-describing, so the DECODER needs no hint; only
-// the SENDER consults it.
+// Compact, self-delimiting tagged values (tags in goldnet/protocol.h), for RPC arguments and for a
+// slot whose kind is only known at runtime (see SlotKind). Stock Variant put_var tags every value
+// with a 4-byte type header and stores floats/ints at 64-bit width; these pack the common types
+// behind a 1-byte tag, 32-bit floats and zig-zag varint ints, and fall back to Godot's own Variant
+// encoding (TAG_OPAQUE) for anything else, so any Variant still round-trips. A "gn_quant" hint
+// (see _read_quant) picks a lossy tag; the tag says which, so the decoder needs no hint.
 using goldnet::QUANT_AUTO;
 
 static int rpc_wire_bytes(const Array &p_args);
@@ -146,79 +140,99 @@ static float gn_read_priority(MultiplayerSynchronizer *p_sync) {
 	return v > 0.0f ? v : 1.0f;
 }
 
-// p_now_ms is the CURRENT packet's own header timestamp — the reference TAG_TIME_DELTA encodes
-// against. Every call site has one on hand (it's already in every snapshot header), so this needs
-// no extra per-game config: the tag stays exactly as self-contained as angle16/half/vec3_half.
-static void gn_put_value(goldnet::Writer &w, const Variant &v, uint8_t quant, uint32_t p_now_ms) {
+// A tagged value's payload, after its tag. p_now_ms is the CURRENT packet's own header timestamp —
+// the reference TAG_TIME_DELTA encodes against. Every call site has one on hand (it's already in
+// every snapshot header), so this needs no extra per-game config.
+static void gn_put_payload(goldnet::Writer &w, uint8_t p_tag, const Variant &v, uint32_t p_now_ms) {
 	using namespace goldnet;
-	switch (quant) {
+	switch (p_tag) {
 		case TAG_ANGLE16:
-			w.put_u8(TAG_ANGLE16);
 			put_angle16(&w, (float)(double)v);
 			return;
 		case TAG_ANGLE8:
-			w.put_u8(TAG_ANGLE8);
 			put_angle8(&w, (float)(double)v);
 			return;
 		case TAG_HALF:
-			w.put_u8(TAG_HALF);
 			w.put_half((float)(double)v);
 			return;
 		case TAG_VEC3_HALF: {
-			w.put_u8(TAG_VEC3_HALF);
-			Vector3 vv = v;
+			const Vector3 vv = v;
 			w.put_half(vv.x);
 			w.put_half(vv.y);
 			w.put_half(vv.z);
 			return;
 		}
 		case TAG_TIME_DELTA:
-			// Only meaningful for an integer ms stamp. The decoder reconstructs an INT, so applying
-			// this to a float slot would silently truncate the value AND change its type on the
-			// client — a hint doing damage rather than saving bytes. Fall through to the type-based
-			// encoding instead, the same way an unknown hint name does.
-			if (v.get_type() != Variant::INT) {
-				break;
-			}
-			w.put_u8(TAG_TIME_DELTA);
 			// Zigzag varint of the signed gap to THIS packet's own send time. A stamp from the same
 			// tick (the overwhelmingly common case — an entity publishes its shadow state and the
 			// snapshot the instant after) encodes as ~0, one byte, forever — independent of how long
 			// the server has been up, unlike the raw absolute ms value this replaces.
 			put_varint(&w, (int64_t)v - (int64_t)p_now_ms);
 			return;
-		default:
-			break; // QUANT_AUTO (or a hint that can't apply) → type-based encoding below
-	}
-	switch (v.get_type()) {
-		case Variant::FLOAT:
-			w.put_u8(TAG_FLOAT);
+		case TAG_FLOAT:
 			w.put_float((float)(double)v);
-			break;
-		case Variant::INT:
-			w.put_u8(TAG_INT);
+			return;
+		case TAG_INT:
 			put_varint(&w, (int64_t)v);
-			break;
-		case Variant::VECTOR3: {
-			w.put_u8(TAG_VEC3);
-			Vector3 vv = v;
+			return;
+		case TAG_VEC3: {
+			const Vector3 vv = v;
 			w.put_float(vv.x);
 			w.put_float(vv.y);
 			w.put_float(vv.z);
-		} break;
-		case Variant::BOOL:
-			w.put_u8(TAG_BOOL);
+			return;
+		}
+		case TAG_BOOL:
 			w.put_u8((bool)v ? 1 : 0);
-			break;
+			return;
 		default: {
 			// Godot's Variant encoding behind a u32 length — byte-for-byte what StreamPeer::put_var
 			// writes, so this tag's wire format is unchanged from when packets were StreamPeerBuffers.
-			w.put_u8(TAG_OPAQUE);
 			PackedByteArray b = UtilityFunctions::var_to_bytes(v);
 			w.put_u32((uint32_t)b.size());
 			w.put_data(b.ptr(), (size_t)b.size());
-		} break;
+			return;
+		}
 	}
+}
+
+// The tag a value goes behind: its hint's, or its type's when there's no hint or it can't apply.
+// TAG_TIME_DELTA only fits an integer ms stamp: the decoder reconstructs an INT, so applying it to
+// a float slot would silently truncate the value AND change its type on the client.
+static uint8_t gn_tag_for(const Variant &v, uint8_t p_quant) {
+	using namespace goldnet;
+	switch (p_quant) {
+		case TAG_ANGLE16:
+		case TAG_ANGLE8:
+		case TAG_HALF:
+		case TAG_VEC3_HALF:
+			return p_quant;
+		case TAG_TIME_DELTA:
+			if (v.get_type() == Variant::INT) {
+				return p_quant;
+			}
+			break;
+		default:
+			break;
+	}
+	switch (v.get_type()) {
+		case Variant::FLOAT:
+			return TAG_FLOAT;
+		case Variant::INT:
+			return TAG_INT;
+		case Variant::VECTOR3:
+			return TAG_VEC3;
+		case Variant::BOOL:
+			return TAG_BOOL;
+		default:
+			return TAG_OPAQUE;
+	}
+}
+
+static void gn_put_value(goldnet::Writer &w, const Variant &v, uint8_t p_quant, uint32_t p_now_ms) {
+	const uint8_t tag = gn_tag_for(v, p_quant);
+	w.put_u8(tag);
+	gn_put_payload(w, tag, v, p_now_ms);
 }
 
 static Variant gn_bytes_to_var(const uint8_t *p_data, size_t p_size) {
@@ -273,6 +287,103 @@ static Variant gn_get_tagged(uint8_t t, goldnet::Reader &r, uint32_t p_ref_time_
 static Variant gn_get_value(goldnet::Reader &r, uint32_t p_ref_time_ms) {
 	const uint8_t t = r.get_u8();
 	return gn_get_tagged(t, r, p_ref_time_ms);
+}
+
+// A slot's kind: how its value goes on the wire, which both ends work out the same way (see
+// _make_slot_coding), so it carries no tag. A value tag (goldnet/protocol.h) means the slot goes
+// whole as that tag's payload. The kinds below go as their step from the value the peer holds at
+// its baseline when the core hands one over (`base`), and whole when it doesn't: an int as its
+// step, an angle or a grid value as its step in quanta. SK_TAGGED is a slot whose property has no
+// declared type the others fit: a tagged value, as gn_put_value writes it.
+enum SlotKind : uint8_t {
+	SK_INT_STEP = 32,
+	SK_ANGLE16_STEP,
+	SK_ANGLE8_STEP,
+	SK_FLOAT_GRID,
+	SK_VEC3_GRID,
+	SK_TAGGED,
+};
+
+static bool slot_kind_stepped(uint8_t p_kind) { return p_kind >= SK_INT_STEP && p_kind < SK_TAGGED; }
+
+// The shortest way round from one angle step to another, so a small turn across 0 is a small step.
+static int64_t angle_step(int64_t p_to, int64_t p_from, int p_bits) {
+	const int64_t full = (int64_t)1 << p_bits;
+	return ((p_to - p_from + full / 2) & (full - 1)) - full / 2;
+}
+
+static int64_t grid_q(double p_v, double p_grid) {
+	const double n = p_v / p_grid;
+	return std::isfinite(n) ? (int64_t)std::llround(n) : 0;
+}
+
+static void put_slot(goldnet::Writer &w, uint8_t p_kind, double p_grid, uint8_t p_quant, const Variant &v,
+		const Variant *p_base, uint32_t p_now_ms) {
+	using namespace goldnet;
+	switch (p_kind) {
+		case SK_INT_STEP:
+			put_varint(&w, (int64_t)((uint64_t)(int64_t)v - (uint64_t)(p_base ? (int64_t)*p_base : 0)));
+			return;
+		case SK_ANGLE16_STEP:
+		case SK_ANGLE8_STEP: {
+			const int bits = p_kind == SK_ANGLE16_STEP ? 16 : 8;
+			if (!p_base) {
+				gn_put_payload(w, bits == 16 ? TAG_ANGLE16 : TAG_ANGLE8, v, p_now_ms);
+				return;
+			}
+			put_varint(&w, angle_step(angle_quanta((float)(double)v, bits), angle_quanta((float)(double)*p_base, bits), bits));
+			return;
+		}
+		case SK_FLOAT_GRID:
+			put_varint(&w, grid_q((double)v, p_grid) - (p_base ? grid_q((double)*p_base, p_grid) : 0));
+			return;
+		case SK_VEC3_GRID: {
+			const Vector3 vv = v;
+			const Vector3 bv = p_base ? (Vector3)*p_base : Vector3();
+			for (int a = 0; a < 3; a++) {
+				put_varint(&w, grid_q(vv[a], p_grid) - (p_base ? grid_q(bv[a], p_grid) : 0));
+			}
+			return;
+		}
+		case SK_TAGGED:
+			gn_put_value(w, v, p_quant, p_now_ms);
+			return;
+		default:
+			gn_put_payload(w, p_kind, v, p_now_ms);
+			return;
+	}
+}
+
+static Variant get_slot(goldnet::Reader &r, uint8_t p_kind, double p_grid, const Variant *p_base, uint32_t p_ref_time_ms) {
+	using namespace goldnet;
+	switch (p_kind) {
+		case SK_INT_STEP:
+			return (int64_t)((uint64_t)(p_base ? (int64_t)*p_base : 0) + (uint64_t)get_varint(&r));
+		case SK_ANGLE16_STEP:
+		case SK_ANGLE8_STEP: {
+			const int bits = p_kind == SK_ANGLE16_STEP ? 16 : 8;
+			if (!p_base) {
+				return gn_get_tagged(bits == 16 ? TAG_ANGLE16 : TAG_ANGLE8, r, p_ref_time_ms);
+			}
+			const int64_t full = (int64_t)1 << bits;
+			const int64_t q = (angle_quanta((float)(double)*p_base, bits) + get_varint(&r)) & (full - 1);
+			return (double)(((float)q / (float)full) * TAU); // as get_angle16 / get_angle8 decode it
+		}
+		case SK_FLOAT_GRID:
+			return (double)((p_base ? grid_q((double)*p_base, p_grid) : 0) + get_varint(&r)) * p_grid;
+		case SK_VEC3_GRID: {
+			const Vector3 bv = p_base ? (Vector3)*p_base : Vector3();
+			Vector3 out;
+			for (int a = 0; a < 3; a++) {
+				out[a] = (real_t)((double)((p_base ? grid_q(bv[a], p_grid) : 0) + get_varint(&r)) * p_grid);
+			}
+			return out;
+		}
+		case SK_TAGGED:
+			return gn_get_value(r, p_ref_time_ms);
+		default:
+			return gn_get_tagged(p_kind, r, p_ref_time_ms);
+	}
 }
 
 // An RPC's arguments in a message (see _send_message): the snapshot's value tags where they fit, and
@@ -441,6 +552,8 @@ GoldNetMultiplayer::~GoldNetMultiplayer() {}
 void GoldNetMultiplayer::_reset_client_state() {
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
+	client_slot_codings.clear();
+	warned_kinds.clear();
 	update_rate_granted = -1;
 	client.set_auto_command_rate(client.auto_command_rate(), (double)Engine::get_singleton()->get_physics_ticks_per_second());
 	msg_registered.clear();
@@ -1163,30 +1276,31 @@ static void cache_slot_plan(MultiplayerSynchronizer *p_sync, Vector<uint64_t> &r
 // Build the per-slot quantization tags from a synchronizer's "gn_quant" meta: a Dictionary keyed
 // by the sync property's leaf name (e.g. "net_yaw") -> hint name ("angle16" | "half" | "vec3_half").
 // Leaves r_quant empty when there's no meta or no recognized hint (the common case = all-auto).
+// The name the gn_* metas key a slot by: its property path's last subname.
+static String slot_leaf(const NodePath &p_slot) {
+	const int sc = p_slot.get_subname_count();
+	return sc > 0 ? String(p_slot.get_subname(sc - 1)) : String();
+}
+
+// A synchronizer's leaf-keyed hint meta, or an empty Dictionary when it's absent or malformed.
+static Dictionary leaf_meta(MultiplayerSynchronizer *p_sync, const StringName &p_key) {
+	const Variant mv = p_sync->has_meta(p_key) ? p_sync->get_meta(p_key) : Variant();
+	return mv.get_type() == Variant::DICTIONARY ? Dictionary(mv) : Dictionary();
+}
+
 void GoldNetMultiplayer::_read_quant(MultiplayerSynchronizer *p_sync, std::vector<uint8_t> &r_quant) {
 	r_quant.clear();
-	const StringName meta_key("gn_quant");
-	if (!p_sync->has_meta(meta_key)) {
+	const Dictionary hints = leaf_meta(p_sync, "gn_quant");
+	if (hints.is_empty()) {
 		return;
 	}
-	Variant mv = p_sync->get_meta(meta_key);
-	if (mv.get_type() != Variant::DICTIONARY) {
-		return;
-	}
-	Dictionary hints = mv;
 	Vector<NodePath> slots;
 	get_sync_slots(p_sync, slots);
 	std::vector<uint8_t> q(slots.size());
 	bool any = false;
 	for (int s = 0; s < slots.size(); s++) {
-		uint8_t code = QUANT_AUTO;
-		int sc = slots[s].get_subname_count();
-		if (sc > 0) {
-			String leaf = slots[s].get_subname(sc - 1);
-			if (hints.has(leaf)) {
-				code = gn_quant_from_name(String(hints[leaf]));
-			}
-		}
+		const String leaf = slot_leaf(slots[s]);
+		const uint8_t code = hints.has(leaf) ? gn_quant_from_name(String(hints[leaf])) : QUANT_AUTO;
 		q[s] = code;
 		if (code != QUANT_AUTO) {
 			any = true;
@@ -1217,17 +1331,88 @@ void GoldNetMultiplayer::_read_push(MultiplayerSynchronizer *p_sync, std::vector
 	std::vector<uint8_t> q(slots.size());
 	bool any = false;
 	for (int s = 0; s < slots.size(); s++) {
-		uint8_t pushed = 0;
-		int sc = slots[s].get_subname_count();
-		if (sc > 0 && names.has(String(slots[s].get_subname(sc - 1)))) {
-			pushed = 1;
-			any = true;
-		}
-		q[s] = pushed;
+		const String leaf = slot_leaf(slots[s]);
+		q[s] = !leaf.is_empty() && names.has(leaf) ? 1 : 0;
+		any = any || q[s];
 	}
 	if (any) {
 		r_push = q;
 	}
+}
+
+// How each slot of a synchronizer goes on the wire (SlotKind), from its property's declared type and
+// its gn_quant / gn_grid hint, given the slots cache_slot_plan resolved. Both ends build it from the
+// same scene, so it travels with nothing but a one-byte check on whole entities: a client whose
+// coding differs refuses the entity rather than misreading it.
+void GoldNetMultiplayer::_make_slot_coding(MultiplayerSynchronizer *p_sync, const Vector<uint64_t> &p_target_ids,
+		const Vector<NodePath> &p_props, SlotCoding &r_coding) {
+	Vector<NodePath> slots;
+	get_sync_slots(p_sync, slots);
+	std::vector<uint8_t> quant;
+	_read_quant(p_sync, quant);
+	const Dictionary grids = leaf_meta(p_sync, "gn_grid");
+	const int n = MIN(slots.size(), p_props.size());
+	r_coding.kinds.assign(n, SK_TAGGED);
+	r_coding.grids.assign(n, 0.0);
+	r_coding.quant.assign(n, QUANT_AUTO);
+	// Slots nearly always share one target, so its property types are read once.
+	uint64_t types_of = 0;
+	Dictionary types; // property name -> declared Variant::Type
+	uint32_t h = 2166136261u; // FNV-1a
+	auto mix = [&h](uint8_t b) { h = (h ^ b) * 16777619u; };
+	for (int s = 0; s < n; s++) {
+		const uint8_t q = (size_t)s < quant.size() ? quant[s] : QUANT_AUTO;
+		const String leaf = slot_leaf(slots[s]);
+		const double grid = grids.has(leaf) ? (double)grids[leaf] : 0.0;
+		Object *target = p_target_ids[s] ? ObjectDB::get_instance(p_target_ids[s]) : nullptr;
+		if (target && p_target_ids[s] != types_of) {
+			types_of = p_target_ids[s];
+			types.clear();
+			const TypedArray<Dictionary> props = target->get_property_list();
+			for (int64_t i = 0; i < props.size(); i++) {
+				const Dictionary d = props[i];
+				types[d.get("name", "")] = d.get("type", (int)Variant::NIL);
+			}
+		}
+		// A property one subname deep with a declared type; untyped, nested or missing is NIL.
+		const Variant::Type type = target && p_props[s].get_subname_count() == 1
+				? (Variant::Type)(int)types.get(String(p_props[s].get_subname(0)), (int)Variant::NIL)
+				: Variant::NIL;
+		uint8_t kind = SK_TAGGED;
+		switch (type) {
+			case Variant::INT:
+				kind = q == goldnet::TAG_TIME_DELTA ? goldnet::TAG_TIME_DELTA : SK_INT_STEP;
+				break;
+			case Variant::BOOL:
+				kind = goldnet::TAG_BOOL;
+				break;
+			case Variant::FLOAT:
+				kind = grid > 0.0 ? SK_FLOAT_GRID
+						: q == goldnet::TAG_ANGLE16 ? SK_ANGLE16_STEP
+						: q == goldnet::TAG_ANGLE8 ? SK_ANGLE8_STEP
+						: q == goldnet::TAG_HALF ? goldnet::TAG_HALF
+												  : goldnet::TAG_FLOAT;
+				break;
+			case Variant::VECTOR3:
+				kind = grid > 0.0 ? SK_VEC3_GRID : q == goldnet::TAG_VEC3_HALF ? goldnet::TAG_VEC3_HALF : goldnet::TAG_VEC3;
+				break;
+			default:
+				break;
+		}
+		r_coding.kinds[s] = kind;
+		r_coding.grids[s] = grid;
+		r_coding.quant[s] = q;
+		mix(kind);
+		if (kind == SK_FLOAT_GRID || kind == SK_VEC3_GRID) {
+			const float g = (float)grid;
+			uint32_t bits;
+			memcpy(&bits, &g, sizeof(bits));
+			for (int b = 0; b < 4; b++) {
+				mix((uint8_t)(bits >> (8 * b)));
+			}
+		}
+	}
+	r_coding.check = (uint8_t)(h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24));
 }
 
 // The Godot side of goldnet::Server::tick: synchronizers are the entities, their properties the
@@ -1250,11 +1435,16 @@ struct GoldNetMultiplayer::ServerHost {
 	// change should express it through visibility (set_visibility_for), consulted every tick.
 	void prepare(CoreServer::Entity &e) {
 		MultiplayerSynchronizer *sync = e.user.sync;
-		_read_quant(sync, e.quant);
 		_read_push(sync, e.push);
 		e.priority = gn_read_priority(sync);
 		cache_slot_plan(sync, e.user.slot_target_id, e.user.slot_prop);
 		e.slots = e.user.slot_prop.size();
+		_make_slot_coding(sync, e.user.slot_target_id, e.user.slot_prop, e.user.coding);
+		e.stepped.clear();
+		for (uint8_t kind : e.user.coding.kinds) {
+			e.stepped.push_back(slot_kind_stepped(kind) ? 1 : 0);
+		}
+		e.kinds_check = e.user.coding.check;
 	}
 
 	// An entity's slots nearly always live on one object (its own node), so resolving the id once
@@ -1289,8 +1479,9 @@ struct GoldNetMultiplayer::ServerHost {
 		return s && (s->is_visibility_public() || s->get_visibility_for(peer));
 	}
 
-	void encode(goldnet::Writer &w, const Variant &v, uint8_t quant, uint32_t now) {
-		gn_put_value(w, v, quant, now);
+	void encode(goldnet::Writer &w, const CoreServer::Entity &e, int slot, const Variant *base, uint32_t now) {
+		const SlotCoding &c = e.user.coding;
+		put_slot(w, c.kinds[slot], c.grids[slot], c.quant[slot], e.vals[slot], base, now);
 	}
 
 	// GOLDNET_LOSS drops snapshots to exercise self-heal: the peer's ack stalls, so the next frame
@@ -1340,6 +1531,7 @@ struct GoldNetMultiplayer::ClientHost {
 	MultiplayerSynchronizer *sync = nullptr;
 	Node *root = nullptr;
 	Vector<NodePath> slots;
+	const SlotCoding *coding = nullptr;
 
 	void protocol_mismatch() {
 		UtilityFunctions::push_error("goldnet: snapshot protocol mismatch — the server and client are "
@@ -1367,9 +1559,10 @@ struct GoldNetMultiplayer::ClientHost {
 
 	bool registered(uint32_t net_id) { return gn->netid_to_objid.has(net_id); }
 
-	int begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer) {
+	int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) {
 		sync = nullptr;
 		root = nullptr;
+		coding = nullptr;
 		slots.clear();
 		if (const uint64_t *objid = gn->netid_to_objid.getptr(net_id)) {
 			MultiplayerSynchronizer *s = sync_from_objid(*objid);
@@ -1387,6 +1580,25 @@ struct GoldNetMultiplayer::ClientHost {
 		}
 		get_sync_slots(sync, slots);
 		root = sync->get_node_or_null(sync->get_root_path());
+		const uint64_t objid = sync->get_instance_id();
+		coding = gn->client_slot_codings.getptr(objid);
+		if (!coding) {
+			Vector<uint64_t> target_ids;
+			Vector<NodePath> props;
+			cache_slot_plan(sync, target_ids, props);
+			SlotCoding made;
+			_make_slot_coding(sync, target_ids, props, made);
+			gn->client_slot_codings[objid] = made;
+			coding = gn->client_slot_codings.getptr(objid);
+		}
+		if (whole && kinds_check != coding->check) {
+			if (!gn->warned_kinds.has(net_id)) {
+				gn->warned_kinds.insert(net_id);
+				UtilityFunctions::push_error("goldnet: ", sync->get_path(), "'s replicated properties are typed or "
+						"hinted differently here than on the server; its state is ignored. Rebuild both from the same project.");
+			}
+			return -1;
+		}
 		return slots.size();
 	}
 
@@ -1411,7 +1623,9 @@ struct GoldNetMultiplayer::ClientHost {
 		}
 	}
 
-	Variant decode(goldnet::Reader &r, uint32_t ref_time_ms) { return gn_get_value(r, ref_time_ms); }
+	Variant decode(goldnet::Reader &r, int slot, const Variant *base, uint32_t ref_time_ms) {
+		return get_slot(r, coding->kinds[slot], coding->grids[slot], base, ref_time_ms);
+	}
 };
 
 void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
@@ -1487,25 +1701,30 @@ static uint8_t command_arg_form(int p_type) {
 // A command stream's fields are its method's arguments, typed by their declarations: an int, float
 // or bool argument is a field of that kind (a float travels as f32), a PackedByteArray one is bytes,
 // and anything else, typed or not, is its Variant encoding as bytes. Or, when CommandStream.mark gave
-// element types (the node's gn_command_fields meta), the method takes one Array and each element is
-// a field of its given type. Both ends read the same script, so they agree with no handshake; the
-// signature is folded into the stream id, so two builds that declare it differently see different
-// streams rather than misreading each other's fields.
+// a field table (the node's gn_command_fields meta, SyncSpec's shape: name -> {"type": ...}), the
+// method takes one Dictionary and each entry the table names is a field of its given type, in the
+// table's order. Both ends read the same script, so they agree with no handshake; the signature is
+// folded into the stream id, so two builds that declare it differently see different streams rather
+// than misreading each other's fields.
 static bool command_signature(Object *p_object, const StringName &p_method, std::vector<uint8_t> &r_forms,
-		bool &r_array) {
+		std::vector<StringName> &r_names, bool &r_table) {
 	Node *n = Object::cast_to<Node>(p_object);
 	const Dictionary declared = n && n->has_meta("gn_command_fields") ? Dictionary(n->get_meta("gn_command_fields")) : Dictionary();
-	r_array = declared.has(p_method);
-	if (r_array) {
-		const Array types = declared[p_method];
-		if (types.size() > goldnet::MAX_COMMAND_FIELDS) {
+	r_table = declared.has(p_method);
+	r_forms.clear();
+	r_names.clear();
+	if (r_table) {
+		const Dictionary table = declared[p_method];
+		if (table.size() > goldnet::MAX_COMMAND_FIELDS) {
 			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' declares more than ",
 					goldnet::MAX_COMMAND_FIELDS, " fields.");
 			return false;
 		}
-		r_forms.clear();
-		for (int64_t i = 0; i < types.size(); i++) {
-			r_forms.push_back(command_arg_form((int)types[i]));
+		const Array keys = table.keys();
+		for (int64_t i = 0; i < keys.size(); i++) {
+			const Dictionary opts = table[keys[i]];
+			r_names.push_back(StringName(keys[i]));
+			r_forms.push_back(command_arg_form((int)opts.get("type", (int)Variant::NIL)));
 		}
 		return true;
 	}
@@ -1521,9 +1740,10 @@ static bool command_signature(Object *p_object, const StringName &p_method, std:
 					goldnet::MAX_COMMAND_FIELDS, " arguments.");
 			return false;
 		}
-		r_forms.clear();
 		for (int64_t a = 0; a < args.size(); a++) {
-			r_forms.push_back(command_arg_form((int)Dictionary(args[a]).get("type", (int)Variant::NIL)));
+			const Dictionary arg = args[a];
+			r_names.push_back(StringName(arg.get("name", "")));
+			r_forms.push_back(command_arg_form((int)arg.get("type", (int)Variant::NIL)));
 		}
 		return true;
 	}
@@ -1544,19 +1764,19 @@ static goldnet::FieldKind command_field_kind(uint8_t p_form) {
 }
 
 // The signature for p_node's p_method, id 0 if it isn't a command stream or can't be one.
-static void make_command_signature(Node *p_node, const StringName &p_method, uint32_t &r_id,
-		goldnet::Schema &r_kinds, std::vector<uint8_t> &r_forms, bool &r_array) {
+static void make_command_signature(Node *p_node, const StringName &p_method, uint32_t &r_id, goldnet::Schema &r_kinds,
+		std::vector<uint8_t> &r_forms, std::vector<StringName> &r_names, bool &r_table) {
 	r_id = 0;
-	if (!command_signature(p_node, p_method, r_forms, r_array)) {
+	if (!command_signature(p_node, p_method, r_forms, r_names, r_table)) {
 		return;
 	}
-	String sig = r_array ? "[" : "";
+	String sig = r_table ? "{" : "(";
 	r_kinds.clear();
-	for (uint8_t form : r_forms) {
-		r_kinds.push_back(command_field_kind(form));
-		sig += String::chr('a' + form);
+	for (size_t k = 0; k < r_forms.size(); k++) {
+		r_kinds.push_back(command_field_kind(r_forms[k]));
+		sig += String(r_names[k]) + ":" + String::chr('a' + r_forms[k]) + ",";
 	}
-	r_id = (String(p_node->get_path()) + "::" + String(p_method) + "(" + sig + ")").hash();
+	r_id = (String(p_node->get_path()) + "::" + String(p_method) + sig).hash();
 	r_id = r_id ? r_id : 1;
 }
 
@@ -1573,7 +1793,7 @@ const GoldNetMultiplayer::CommandSignature *GoldNetMultiplayer::_command_stream(
 	if (n && n->has_meta("gn_commands") && Array(n->get_meta("gn_commands")).has(p_method)) {
 		Dictionary cfg;
 		if (rpc_method_config(p_object, p_method, cfg)) {
-			make_command_signature(n, p_method, sig.id, sig.kinds, sig.forms, sig.array);
+			make_command_signature(n, p_method, sig.id, sig.kinds, sig.forms, sig.names, sig.table);
 		} else {
 			UtilityFunctions::push_error("goldnet: '", p_method, "' is in gn_commands but isn't an @rpc; "
 					"calling it as an ordinary RPC.");
@@ -1585,17 +1805,33 @@ const GoldNetMultiplayer::CommandSignature *GoldNetMultiplayer::_command_stream(
 }
 
 // A call's arguments as its command's fields. False, with an error, if they don't fit the signature.
-static bool command_from_args(const std::vector<uint8_t> &p_forms, bool p_array, const StringName &p_method,
-		const Array &p_call_args, goldnet::Command &r_cmd) {
-	if (p_array && (p_call_args.size() != 1 || p_call_args[0].get_type() != Variant::ARRAY)) {
-		UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes one Array, its fields; "
-				"the call is dropped.");
-		return false;
-	}
-	const Array args = p_array ? Array(p_call_args[0]) : p_call_args;
-	if ((size_t)args.size() != p_forms.size()) {
+static bool command_from_args(const std::vector<uint8_t> &p_forms, const std::vector<StringName> &p_names, bool p_table,
+		const StringName &p_method, const Array &p_call_args, goldnet::Command &r_cmd) {
+	Array args = p_call_args;
+	if (p_table) {
+		if (p_call_args.size() != 1 || p_call_args[0].get_type() != Variant::DICTIONARY) {
+			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes one Dictionary, its fields; "
+					"the call is dropped.");
+			return false;
+		}
+		const Dictionary d = p_call_args[0];
+		args = Array();
+		for (const StringName &name : p_names) {
+			if (!d.has(name)) {
+				UtilityFunctions::push_error("goldnet: command stream '", p_method, "' is missing its field '", name,
+						"'; the call is dropped.");
+				return false;
+			}
+			args.push_back(d[name]);
+		}
+		if ((size_t)d.size() != p_names.size()) {
+			UtilityFunctions::push_error("goldnet: command stream '", p_method, "' was given a field its table "
+					"doesn't declare; the call is dropped.");
+			return false;
+		}
+	} else if ((size_t)args.size() != p_forms.size()) {
 		UtilityFunctions::push_error("goldnet: command stream '", p_method, "' takes ", (int64_t)p_forms.size(),
-				p_array ? " fields" : " arguments", " but was called with ", args.size(), "; the call is dropped.");
+				" arguments but was called with ", args.size(), "; the call is dropped.");
 		return false;
 	}
 	r_cmd.assign(p_forms.size(), goldnet::Field());
@@ -1646,7 +1882,7 @@ void GoldNetMultiplayer::_scan_command_targets(Node *p_node) {
 			CommandTarget t;
 			t.object_id = p_node->get_instance_id();
 			t.method = methods[i];
-			make_command_signature(p_node, t.method, t.sig.id, t.sig.kinds, t.sig.forms, t.sig.array);
+			make_command_signature(p_node, t.method, t.sig.id, t.sig.kinds, t.sig.forms, t.sig.names, t.sig.table);
 			if (t.sig.id) {
 				command_targets[t.sig.id] = t;
 			}
@@ -1731,7 +1967,14 @@ void GoldNetMultiplayer::_deliver_command(int32_t p_peer, uint32_t p_stream, con
 	const StringName method = t->method;
 	const int32_t outer_sender = command_sender;
 	command_sender = p_peer;
-	o->callv(method, t->sig.array ? Array::make(args) : args);
+	if (t->sig.table) {
+		Dictionary fields;
+		for (size_t k = 0; k < t->sig.names.size(); k++) {
+			fields[t->sig.names[k]] = args[(int64_t)k];
+		}
+		args = Array::make(fields);
+	}
+	o->callv(method, args);
 	command_sender = outer_sender;
 }
 
@@ -2091,7 +2334,7 @@ Error GoldNetMultiplayer::_rpc(int32_t p_peer, Object *p_object, const StringNam
 	if (p_peer == 1 && inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() != 1) {
 		if (const CommandSignature *sig = _command_stream(p_object, p_method)) {
 			goldnet::Command cmd;
-			if (!command_from_args(sig->forms, sig->array, p_method, p_args, cmd)) {
+			if (!command_from_args(sig->forms, sig->names, sig->table, p_method, p_args, cmd)) {
 				return ERR_INVALID_PARAMETER;
 			}
 			goldnet::CommandSender &up = client.uplink();
@@ -2238,6 +2481,7 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 	MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(p_config);
 	if (sync) {
 		uint64_t objid = sync->get_instance_id();
+		client_slot_codings.erase(objid);
 		if (CoreServer::Entity *e = server.find(objid)) {
 			netid_to_objid.erase(e->net_id);
 			server.remove_entity(objid);

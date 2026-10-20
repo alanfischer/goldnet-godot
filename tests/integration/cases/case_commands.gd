@@ -4,7 +4,7 @@ extends "res://test_case.gd"
 ##
 ## The client sends at 60 Hz, cycling through three marked RPCs so ordering is checked across
 ## streams and every field kind (int, float, bool, bytes, and an untyped argument's Variant) is
-## covered, declared both by a signature and as an Array's element types.
+## covered, declared both by a signature and by a field table.
 ## The server records what arrived and who get_remote_sender_id() said sent it, and reports
 ## back once the client has stopped.
 ##
@@ -77,7 +77,7 @@ func client_step(t: float) -> void:
 		if _sent % 3 == 0:
 			main._case_command.rpc_id(1, _sent, "c%d" % _sent)
 		elif _sent % 3 == 1:
-			main._case_typed.rpc_id(1, [_sent, _sent * 0.25, _sent % 2 == 0, Vector3(_sent, 1, 2)])
+			main._case_typed.rpc_id(1, {"n": _sent, "f": _sent * 0.25, "b": _sent % 2 == 0, "v": Vector3(_sent, 1, 2)})
 		else:
 			var b := PackedByteArray([0, 0, 7, 7, 7, 7])
 			b.encode_u16(0, _sent)

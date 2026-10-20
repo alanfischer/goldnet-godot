@@ -28,23 +28,37 @@ extends RefCounted
 ## and predict with the same values the server will get: a float travels as f32. Every call must
 ## pass every argument. The pace is set by GoldNetMultiplayer.command_rate (GoldSrc cl_cmdrate).
 ##
-## A command whose layout something else owns (a struct's fields, in its own order) can instead be
-## one Array argument, with the element types given here; each element is then a field, coded as
-## above. The owner keeps the order and the types in one place, and the RPC just carries the array:
+## A command whose layout something else owns (a struct's fields) can instead be one Dictionary
+## argument, declared by a field table in SyncSpec's shape: each name, in order, with its options.
+## The owner keeps the table, and the RPC carries its fields by name:
 ##
-##   func submit_input(fields: Array) -> void: ...
-##   CommandStream.mark(self, &"submit_input", [TYPE_INT, TYPE_INT, TYPE_FLOAT])
-##   submit_input.rpc_id(1, [seq, yaw, head_x])
+##   const FIELDS := {"seq": {"type": TYPE_INT}, "yaw": {"type": TYPE_INT}, "head_x": {"type": TYPE_FLOAT}}
+##   func submit_input(fields: Dictionary) -> void: ...
+##   CommandStream.mark(self, &"submit_input", FIELDS)
+##   submit_input.rpc_id(1, {"seq": seq, "yaw": yaw, "head_x": head_x})
 ##
-## Every call must then pass exactly that many elements. Stock sends the Array as it is.
-static func mark(node: Node, method: StringName, fields: Array = []) -> void:
+## Field options: "type" (a Variant.Type; absent = any Variant). The names never go on the wire, and
+## the table's order is the coding order, so put the fields that change most first. A call must give
+## exactly the declared names. Stock sends the Dictionary as it is.
+static func mark(node: Node, method: StringName, fields: Dictionary = {}) -> void:
 	var methods: Array = node.get_meta(&"gn_commands", [])
 	if not methods.has(method):
 		methods.append(method)
 	node.set_meta(&"gn_commands", methods)
-	var typed: Dictionary = node.get_meta(&"gn_command_fields", {})
+	for field: Variant in fields:
+		var opts: Variant = fields[field]
+		if typeof(opts) != TYPE_DICTIONARY:
+			push_error("CommandStream: field '%s' of '%s' needs an options Dictionary" % [field, method])
+			continue
+		for key: Variant in opts:
+			if not key in _FIELD_KEYS:
+				push_error("CommandStream: field '%s' of '%s' has an unknown option '%s'" % [field, method, key])
+	var tables: Dictionary = node.get_meta(&"gn_command_fields", {})
 	if fields.is_empty():
-		typed.erase(method)
+		tables.erase(method)
 	else:
-		typed[method] = fields.duplicate()
-	node.set_meta(&"gn_command_fields", typed)
+		tables[method] = fields.duplicate(true)
+	node.set_meta(&"gn_command_fields", tables)
+
+
+const _FIELD_KEYS := ["type"]

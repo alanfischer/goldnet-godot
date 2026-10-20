@@ -53,6 +53,15 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// Delegate for everything except the state-replication of intercepted synchronizers.
 	Ref<MultiplayerAPI> inner;
 
+	// How each of a synchronizer's slots goes on the wire, the same on both ends: its kind, from the
+	// property's declared type and its gn_quant / gn_grid hint (see _make_slot_coding).
+	struct SlotCoding {
+		std::vector<uint8_t> kinds;
+		std::vector<double> grids;
+		std::vector<uint8_t> quant; // a tagged slot's hint
+		uint8_t check = 0;          // a hash of the kinds and grids, for Entity::kinds_check
+	};
+
 	// The protocol itself (goldnet core): change tracking, per-peer deltas, acks, spawns, leaves
 	// and the packet budget on the server; baseline reconstruction on the client. Everything below
 	// is the Godot side of it — synchronizers, spawners, Variants, and the inner SceneMultiplayer.
@@ -69,6 +78,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		// the wire position.
 		Vector<uint64_t> slot_target_id; // object id owning each slot's property
 		Vector<NodePath> slot_prop;      // property path to read on that object
+		SlotCoding coding;
 	};
 	typedef goldnet::Server<Variant, SyncData> CoreServer;
 	CoreServer server;
@@ -76,6 +86,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	struct ServerHost;
 	struct ClientHost;
 	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id -> synchronizer ObjectID (client apply lookup)
+	HashMap<uint64_t, SlotCoding> client_slot_codings; // synchronizer ObjectID -> its slot coding, made on first apply
+	HashSet<uint32_t> warned_kinds;                // net_ids whose slot kinds differ from the server's
 
 	// --- Phase 3: spawn / despawn (agnostic — projectiles & players stream like movers) ---
 	// We own every MultiplayerSpawner too, so runtime entities flow through this stream
@@ -174,13 +186,14 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// yet this session. The rates themselves are goldnet's Client's (set_rate & co).
 	int update_rate_granted = -1;
 	// A command stream's signature: each argument is one field, typed by its declaration, or each
-	// element of a lone Array argument, typed by CommandStream.mark (see command_signature in the
-	// .cpp). id 0 = an ordinary RPC.
+	// entry of a lone Dictionary argument, named and typed by CommandStream.mark's table (see
+	// command_signature in the .cpp). id 0 = an ordinary RPC.
 	struct CommandSignature {
 		uint32_t id = 0;
 		goldnet::Schema kinds;
 		std::vector<uint8_t> forms; // how each field maps back to the argument's Variant
-		bool array = false;         // the fields are one Array argument's elements (CommandStream.mark)
+		std::vector<StringName> names;
+		bool table = false; // the fields are one Dictionary argument's entries (CommandStream.mark)
 	};
 	// Client: object -> method -> its signature. Resolved on the first call.
 	HashMap<uint64_t, HashMap<StringName, CommandSignature>> command_stream_cache;
@@ -233,6 +246,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	bool _should_intercept(MultiplayerSynchronizer *p_sync) const;  // has streamable sync props
 	// Build the per-slot quantization tags from a synchronizer's "gn_quant" meta (see gn_put_value).
 	static void _read_quant(MultiplayerSynchronizer *p_sync, std::vector<uint8_t> &r_quant);
+	static void _make_slot_coding(MultiplayerSynchronizer *p_sync, const Vector<uint64_t> &p_target_ids,
+			const Vector<NodePath> &p_props, SlotCoding &r_coding);
 	static void _read_push(MultiplayerSynchronizer *p_sync, std::vector<uint8_t> &r_push);
 
 public:
