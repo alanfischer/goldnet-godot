@@ -2,8 +2,9 @@ extends "res://test_case.gd"
 ## Command streams: a client's calls to a marked @rpc reach the server once each, in order,
 ## under loss both ways and a blackout, the way a reliable RPC would.
 ##
-## The client sends at 60 Hz, alternating the two marked RPCs so ordering is checked across
-## streams and both payload forms (ordinary arguments, a lone PackedByteArray) are covered.
+## The client sends at 60 Hz, cycling through three marked RPCs so ordering is checked across
+## streams and every field kind (int, float, bool, bytes, and an untyped argument's Variant) is
+## covered, declared both by a signature and as an Array's element types.
 ## The server records what arrived and who get_remote_sender_id() said sent it, and reports
 ## back once the client has stopped.
 ##
@@ -40,16 +41,24 @@ func setup(_is_server: bool) -> void:
 	goldnet().sim_config = LOSSY
 
 
+## Server-side checks don't reach the client's verdict, so a command whose arguments came through
+## wrong is reported as -1, which the client's order check catches.
 func on_command(sender: int, args: Array) -> void:
 	var n: int
+	var ok := true
 	if args.size() == 2:
 		n = args[0]
-		check_eq(args[1], "c%d" % n, "argument form carries its arguments")
+		ok = check_eq(args[1], "c%d" % n, "argument form carries its arguments")
+	elif args.size() == 4:
+		n = args[0]
+		ok = check_eq(args[1], n * 0.25, "a float field carries its value")
+		ok = check_eq(args[2], n % 2 == 0, "a bool field carries its value") and ok
+		ok = check_eq(args[3], Vector3(n, 1, 2), "an untyped argument carries its Variant") and ok
 	else:
 		var b: PackedByteArray = args[0]
 		n = b.decode_u16(0)
-		check_eq(b.size(), 6, "byte form carries its bytes")
-	_received.append(n)
+		ok = check_eq(b.size(), 6, "byte form carries its bytes")
+	_received.append(n if ok else -1)
 	check(sender > 1, "get_remote_sender_id() names the client (got %d)" % sender)
 
 
@@ -65,8 +74,10 @@ func client_step(t: float) -> void:
 	if at(t, BLACKOUT_END, "blackout_off"):
 		goldnet().sim_config = LOSSY
 	while _sent < COUNT and t >= START + _sent / RATE:
-		if _sent % 2 == 0:
+		if _sent % 3 == 0:
 			main._case_command.rpc_id(1, _sent, "c%d" % _sent)
+		elif _sent % 3 == 1:
+			main._case_typed.rpc_id(1, [_sent, _sent * 0.25, _sent % 2 == 0, Vector3(_sent, 1, 2)])
 		else:
 			var b := PackedByteArray([0, 0, 7, 7, 7, 7])
 			b.encode_u16(0, _sent)

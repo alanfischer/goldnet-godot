@@ -173,20 +173,31 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// Client: the update rate the server last granted, as update_rate_granted told the game; -1 = none
 	// yet this session. The rates themselves are goldnet's Client's (set_rate & co).
 	int update_rate_granted = -1;
-	// Client: object -> method -> stream id, 0 = an ordinary RPC. Resolved on the first call.
-	HashMap<uint64_t, HashMap<StringName, uint32_t>> command_stream_cache;
+	// A command stream's signature: each argument is one field, typed by its declaration, or each
+	// element of a lone Array argument, typed by CommandStream.mark (see command_signature in the
+	// .cpp). id 0 = an ordinary RPC.
+	struct CommandSignature {
+		uint32_t id = 0;
+		goldnet::Schema kinds;
+		std::vector<uint8_t> forms; // how each field maps back to the argument's Variant
+		bool array = false;         // the fields are one Array argument's elements (CommandStream.mark)
+	};
+	// Client: object -> method -> its signature. Resolved on the first call.
+	HashMap<uint64_t, HashMap<StringName, CommandSignature>> command_stream_cache;
 	// Server: stream id -> the method it calls, found by scanning the tree for gn_commands metas.
 	struct CommandTarget {
 		uint64_t object_id = 0;
 		StringName method;
+		CommandSignature sig;
 	};
 	HashMap<uint32_t, CommandTarget> command_targets;
 	uint64_t command_scan_ms = 0;
 	// The peer whose command or message is being delivered, for get_remote_sender_id().
 	int32_t command_sender = 0;
-	uint32_t _command_stream_id(Object *p_object, const StringName &p_method);
+	const CommandSignature *_command_stream(Object *p_object, const StringName &p_method);
 	void _scan_command_targets(Node *p_node);
-	void _deliver_command(int32_t p_peer, uint32_t p_stream, const uint8_t *p_data, size_t p_size);
+	const CommandTarget *_command_target(uint32_t p_stream);
+	void _deliver_command(int32_t p_peer, uint32_t p_stream, const goldnet::Command &p_cmd);
 	void _send_uplink();
 	struct UplinkHost;
 
