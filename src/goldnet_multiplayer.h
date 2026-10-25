@@ -66,13 +66,13 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// and the packet budget on the server; baseline reconstruction on the client. Everything below
 	// is the Godot side of it — synchronizers, spawners, Variants, and the inner SceneMultiplayer.
 	//
-	// The server registers every synchronizer we own (sync-only config), keyed by its stable
+	// The server replicates every synchronizer we own (sync-only config), keyed by its stable
 	// ObjectID; the wire net_id is a hash of its scene path (identical on server & client, since the
 	// same node lives at the same path on both — map entities and spawner-created nodes alike).
 	struct SyncData {
 		// Refreshed each tick by ServerHost::live, so the per-peer passes need no ObjectDB lookup.
 		MultiplayerSynchronizer *sync = nullptr;
-		// Resolved read plan, built once in ServerHost::prepare. The config and the node layout are
+		// Resolved read plan, built once in _add_entities. The config and the node layout are
 		// fixed once the entity is in the tree, so all that has to happen per tick is the
 		// get_indexed itself. An unresolved slot is a hole (id 0), never dropped: the slot INDEX is
 		// the wire position.
@@ -85,7 +85,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	goldnet::Client<Variant> client;
 	struct ServerHost;
 	struct ClientHost;
-	HashMap<uint32_t, uint64_t> netid_to_objid;  // net_id -> synchronizer ObjectID (client apply lookup)
+	// Every synchronizer we own, on both ends: ObjectID -> net_id, and back.
+	HashMap<uint64_t, uint32_t> owned;
+	HashMap<uint32_t, uint64_t> netid_to_objid;
+	// Owned synchronizers the server hasn't handed the core yet: each goes in on its first live tick,
+	// once the game has set its metas (see _add_entities).
+	HashSet<uint64_t> entities_to_add;
 	HashMap<uint64_t, SlotCoding> client_slot_codings; // synchronizer ObjectID -> its slot coding, made on first apply
 	HashSet<uint32_t> warned_kinds;                // net_ids whose slot kinds differ from the server's
 
@@ -260,6 +265,7 @@ public:
 
 private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
+	void _add_entities();                                        // hand the core the newly live synchronizers
 	void _server_tick();                                         // build + send delta snapshots
 	uint64_t _min_interval_us() const;
 	void _refresh_interval(); // recompute the cached send cadence
