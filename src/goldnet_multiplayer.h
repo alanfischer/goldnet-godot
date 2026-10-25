@@ -180,6 +180,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<uint64_t, HashMap<StringName, bool>> _rpc_unreliable_cache; // object_id -> method -> is-unreliable
 
 	void _reset_client_state();
+	void _forget_peer(int32_t p_id);  // a peer's state, here and in the core
+	void _end_server_session();       // every peer's, when a hosted session ends
 
 	// --- Command streams (uplink) ---
 	// Client: the update rate the server last granted, as update_rate_granted told the game; -1 = none
@@ -259,7 +261,6 @@ public:
 private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
-	void _sync_server_peers();                                   // the core's peers to the inner's
 	uint64_t _min_interval_us() const;
 	void _refresh_interval(); // recompute the cached send cadence
 

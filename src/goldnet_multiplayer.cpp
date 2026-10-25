@@ -576,6 +576,24 @@ static void hold_enet_throttle(const Ref<MultiplayerPeer> &p_peer, int32_t p_id)
 	}
 }
 
+// Everything kept for one peer goes with it.
+void GoldNetMultiplayer::_forget_peer(int32_t p_id) {
+	server.remove_peer(p_id); // its send history, and its place in any pending despawn
+	msg_registered.erase(p_id);
+	msg_targets.erase(p_id);
+	sim.forget_link(p_id);
+}
+
+// A hosted session ended, and its peers with it. SceneMultiplayer drops them without a
+// peer_disconnected for any: when the host's own peer closes, which it reports as
+// server_disconnected, and in silence when the peer is swapped.
+void GoldNetMultiplayer::_end_server_session() {
+	const std::vector<int32_t> peers = server.peers(); // a copy: _forget_peer edits the list
+	for (int32_t peer : peers) {
+		_forget_peer(peer);
+	}
+}
+
 void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
 	hold_enet_throttle(_get_multiplayer_peer(), (int32_t)p_id);
 	if (inner->get_unique_id() == 1) {
@@ -584,10 +602,7 @@ void GoldNetMultiplayer::_relay_peer_connected(int64_t p_id) {
 	emit_signal("peer_connected", p_id);
 }
 void GoldNetMultiplayer::_relay_peer_disconnected(int64_t p_id) {
-	server.remove_peer((int32_t)p_id); // its send history, and its place in any pending despawn
-	msg_registered.erase((int32_t)p_id);
-	msg_targets.erase((int32_t)p_id);
-	sim.forget_link((int32_t)p_id);
+	_forget_peer((int32_t)p_id);
 	emit_signal("peer_disconnected", p_id);
 }
 void GoldNetMultiplayer::_relay_connected_to_server() {
@@ -596,6 +611,7 @@ void GoldNetMultiplayer::_relay_connected_to_server() {
 }
 void GoldNetMultiplayer::_relay_connection_failed() { emit_signal("connection_failed"); }
 void GoldNetMultiplayer::_relay_server_disconnected() {
+	_end_server_session(); // a host's own peer closing comes here too
 	_reset_client_state();
 	sim.forget_link(1);
 	emit_signal("server_disconnected");
@@ -1035,44 +1051,32 @@ Dictionary GoldNetMultiplayer::get_recv_sim_config() const {
 Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
 	const bool on_server = inner->get_multiplayer_peer().is_valid() && inner->get_unique_id() == 1;
 	const bool sim_peer = !on_server && recv_peer.is_valid();
+	// Only one end's stats apply; the other's stay at their zeros.
+	CoreServer::PeerStats sv;
+	goldnet::Client<Variant>::Stats cl;
+	if (on_server) {
+		sv = server.peer_stats(p_peer);
+	} else {
+		cl = client.stats();
+	}
 	Dictionary d;
+	d["chokes"] = (int64_t)sv.chokes;
+	d["snapshots_received"] = (int64_t)cl.snapshots_received;
+	d["snapshots_lost"] = (int64_t)cl.snapshots_lost;
+	d["messages_queued"] = (int64_t)(on_server ? sv.messages_queued : cl.messages_queued);
+	d["messages_delivered"] = (int64_t)(on_server ? sv.messages_delivered : cl.messages_delivered);
+	d["commands_pending"] = (int64_t)cl.commands_pending;
+	d["commands_dropped"] = (int64_t)cl.commands_dropped;
+	d["command_rtt_ms"] = (int64_t)cl.command_rtt_ms;
 	d["recv_sim_bytes"] = sim_peer ? recv_peer->get_delivered_bytes() : (int64_t)0;
 	d["recv_sim_packets"] = sim_peer ? recv_peer->get_delivered_packets() : (int64_t)0;
-	if (on_server) {
-		const CoreServer::PeerStats st = server.peer_stats(p_peer);
-		d["chokes"] = (int64_t)st.chokes;
-		d["snapshots_received"] = (int64_t)0;
-		d["snapshots_lost"] = (int64_t)0;
-		d["messages_queued"] = (int64_t)st.messages_queued;
-		d["messages_delivered"] = (int64_t)st.messages_delivered;
-		d["commands_pending"] = (int64_t)0;
-		d["commands_dropped"] = (int64_t)0;
-		d["command_rtt_ms"] = (int64_t)0;
-		d["rate"] = (int64_t)st.rate;
-		d["update_rate"] = (int64_t)st.update_rate;
-		d["command_rate"] = 0.0;
-		d["downlink_lag_ms"] = (int64_t)0;
-		d["uplink_lag_ms"] = (int64_t)st.uplink_lag_ms;
-		d["uplink_pps"] = (int64_t)st.uplink_pps;
-		d["delivered_bps"] = 0.0;
-		return d;
-	}
-	const goldnet::Client<Variant>::Stats st = client.stats();
-	d["chokes"] = (int64_t)0;
-	d["snapshots_received"] = (int64_t)st.snapshots_received;
-	d["snapshots_lost"] = (int64_t)st.snapshots_lost;
-	d["messages_queued"] = (int64_t)st.messages_queued;
-	d["messages_delivered"] = (int64_t)st.messages_delivered;
-	d["commands_pending"] = (int64_t)st.commands_pending;
-	d["commands_dropped"] = (int64_t)st.commands_dropped;
-	d["command_rtt_ms"] = (int64_t)st.command_rtt_ms;
-	d["rate"] = (int64_t)st.rate;
-	d["update_rate"] = (int64_t)std::max(st.update_rate_granted, 0);
-	d["command_rate"] = st.command_interval_ms == 0 ? 0.0 : 1000.0 / (double)st.command_interval_ms;
-	d["downlink_lag_ms"] = (int64_t)st.downlink_lag_ms;
-	d["uplink_lag_ms"] = (int64_t)st.uplink_lag_ms;
-	d["uplink_pps"] = (int64_t)st.uplink_pps;
-	d["delivered_bps"] = st.delivered_bps;
+	d["rate"] = (int64_t)(on_server ? sv.rate : cl.rate);
+	d["update_rate"] = (int64_t)(on_server ? sv.update_rate : std::max(cl.update_rate_granted, 0));
+	d["command_rate"] = cl.command_interval_ms == 0 ? 0.0 : 1000.0 / (double)cl.command_interval_ms;
+	d["downlink_lag_ms"] = (int64_t)cl.downlink_lag_ms;
+	d["uplink_lag_ms"] = (int64_t)(on_server ? sv.uplink_lag_ms : cl.uplink_lag_ms);
+	d["uplink_pps"] = (int64_t)(on_server ? sv.uplink_pps : cl.uplink_pps);
+	d["delivered_bps"] = cl.delivered_bps;
 	return d;
 }
 
@@ -1525,29 +1529,11 @@ struct GoldNetMultiplayer::ServerHost {
 	}
 };
 
-// The core serves only the peers it is given, and the inner's are the truth. A peer is added the
-// moment it connects (_relay_peer_connected), before the game's handlers can send to it; this
-// catches the rest, above all the ones that go without a peer_disconnected, as every peer does when
-// the server's own peer closes.
-void GoldNetMultiplayer::_sync_server_peers() {
-	const PackedInt32Array ids = inner->get_peers();
-	const std::vector<int32_t> served = server.peers();
-	for (int32_t peer : served) {
-		if (!ids.has(peer)) {
-			server.remove_peer(peer);
-		}
-	}
-	for (int i = 0; i < ids.size(); i++) {
-		server.add_peer(ids[i]);
-	}
-}
-
 void GoldNetMultiplayer::_server_tick() {
 	GoldNetLink *l = _ensure_link();
 	if (!l) {
 		return;
 	}
-	_sync_server_peers();
 	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 	ServerHost host{ this, l };
 	server.tick(now, host);
@@ -2044,7 +2030,17 @@ bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const Strin
 
 	HashMap<uint32_t, uint64_t> &registered = msg_registered[p_peer];
 	const uint64_t *reg_at = registered.getptr(id);
-	const uint64_t delivered = on_server ? server.peer_stats(p_peer).messages_delivered : client.stats().messages_delivered;
+	uint64_t queued;
+	uint64_t delivered;
+	if (on_server) {
+		const CoreServer::PeerStats st = server.peer_stats(p_peer);
+		queued = st.messages_queued;
+		delivered = st.messages_delivered;
+	} else {
+		const goldnet::Client<Variant>::Stats st = client.stats();
+		queued = st.messages_queued;
+		delivered = st.messages_delivered;
+	}
 	const bool known = reg_at && delivered > *reg_at;
 	// A call is its target's id and its arguments. An unreliable one to a target the peer may not know
 	// yet carries the registration in front instead, so it can go in the datagram with the rest.
@@ -2066,7 +2062,7 @@ bool GoldNetMultiplayer::_send_message(int32_t p_peer, Node *p_node, const Strin
 		}
 	};
 	if (!reg_at) {
-		registered[id] = on_server ? server.peer_stats(p_peer).messages_queued : client.stats().messages_queued;
+		registered[id] = queued;
 		queue_reliable(reg);
 	}
 	if (p_reliable) {
@@ -2330,6 +2326,7 @@ void GoldNetMultiplayer::_set_multiplayer_peer(const Ref<MultiplayerPeer> &p_pee
 	// Second arming point: the moment a session starts, covering a game that spawns after setting the
 	// peer but before our first poll. Idempotent.
 	capture_spawners();
+	_end_server_session();
 	// A client's peer goes in behind the receive sim; a server (id 1) or no peer goes in as is.
 	recv_peer.unref();
 	if (p_peer.is_valid() && p_peer->get_unique_id() != 1) {
