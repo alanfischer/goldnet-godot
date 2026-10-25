@@ -293,7 +293,7 @@ private:
 	bool _apply_bind(uint32_t p_net_id, const uint8_t *p_data, size_t p_size);                            // client
 	void _apply_despawn(uint32_t p_net_id);                                                                 // client
 	uint32_t _spawner_net_id(uint64_t p_spawner_objid); // server: bound for every peer on first ask
-	void _add_bind(uint32_t p_net_id, Node *p_node, bool p_gated); // server
+	CoreServer::SpawnRecord _bind_record(Node *p_node, uint32_t p_net_id, bool p_gated) const; // server
 	bool _under_spawned(Node *p_node) const;                       // server
 
 protected:
