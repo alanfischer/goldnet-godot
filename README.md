@@ -42,10 +42,14 @@ object-configuration + poll path that drives state replication, and the `@rpc` p
 **RPCs on the netchan**). It relays the inner's lifecycle signals up to itself so the consuming
 game listens on one object.
 
-**Path-hash identity, no handshake.** Every owned node is keyed by
-`net_id = hash(scene_path)`. The same node lives at the same path on server and
-client, so ids match with no negotiation and no path-cache to poison — a client
-simply drops a `net_id` it doesn't yet hold and self-heals.
+**Server-given ids.** The server hands every replicated node its `net_id`, counting from 1, so
+ids stay small on the wire: a byte each under 128, two under 16384. A client learns them as the
+nodes reach it. A spawn record lists the ids of the synchronizers its node brings, in the order
+both ends find them in the built node. A node placed in the scene (a synchronizer, or a spawner)
+gets a *bind* record, a spawn with no spawner whose data is the node's path, which the client binds
+to its own node at that path. Both ride the reliable-until-acked spawn section, and a node's state
+counts as delivered only once its record has, so a client never holds state under an id it can't
+place. The same node still has to live at the same path on server and client.
 
 **Two registries, by lifecycle — not by entity kind.** goldnet is fully
 entity-agnostic; players, bots, projectiles, and map movers all flow through one
@@ -99,10 +103,10 @@ server emits one unreliable snapshot:
 ```
 [u8 version]     wire version — a mismatched build is dropped, not misparsed
 [u16 seq][u16 base_seq][u32 server_time][u16 command_ack]
-[u16 spawn_ct]   { [u32 net_id][u32 spawner_net_id][var data] } *   (reliable-until-acked)
-[u16 despawn_ct] { [u32 net_id] } *                                 (reliable-until-acked)
-[u16 leave_ct]   { [u32 net_id] } *                                 (reliable-until-acked, opt-in — see PVS below)
-[u16 changed]    { [u32 net_id][uvarint changed_mask]{ value } per set bit } *
+[u16 spawn_ct]   { [uvarint net_id][uvarint spawner_net_id][data] } *   (reliable-until-acked)
+[u16 despawn_ct] { [uvarint net_id] } *                                    (reliable-until-acked)
+[u16 leave_ct]   { [uvarint net_id] } *                                    (reliable-until-acked — see PVS below)
+[u16 changed]    { [uvarint net_id][uvarint changed_mask]{ value } per set bit } *
 ```
 
 The byte-level contract — primitives, every value tag, the ack, and what each end does with a

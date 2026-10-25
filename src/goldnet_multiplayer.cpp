@@ -44,9 +44,6 @@ static const int RPC_WIRE_OVERHEAD = 38;
 // derive it the same way from the same path, so it matches without a handshake. Used for
 // synchronizers (state), spawned nodes (spawn record), and spawners — must stay in sync
 // everywhere, hence one helper.
-static uint32_t net_id_for(Node *p_node) {
-	return (uint32_t)String(p_node->get_path()).hash();
-}
 
 // Split a replication-config property path (relative to the synchronizer's root
 // node, e.g. ".:position" or "NetInterp:net_pos") into the target node under
@@ -564,6 +561,15 @@ GoldNetMultiplayer::GoldNetMultiplayer() {
 GoldNetMultiplayer::~GoldNetMultiplayer() {}
 
 void GoldNetMultiplayer::_reset_client_state() {
+	// The ids a server gave this end mean nothing to the next one. (A host's own ids are its
+	// server's, never in client_bound.)
+	std::vector<uint32_t> bound;
+	for (const KeyValue<uint32_t, uint64_t> &kv : client_bound) {
+		bound.push_back(kv.key);
+	}
+	for (uint32_t id : bound) {
+		_unbind(id);
+	}
 	client.reset();
 	client_spawned.clear(); // spawner nodes are torn down with the session
 	client_slot_codings.clear();
@@ -705,11 +711,11 @@ static MultiplayerSynchronizer *sync_from_objid(uint64_t p_objid) {
 	return Object::cast_to<MultiplayerSynchronizer>(ObjectDB::get_instance(p_objid));
 }
 
-// Collect the net_ids of every MultiplayerSynchronizer at or under p_node (used to gate a spawn
-// on the entity's per-peer visibility — see goldnet::Server::SpawnRecord::entities).
-static void collect_syncs(Node *p_node, std::vector<uint32_t> &r_out) {
-	if (Object::cast_to<MultiplayerSynchronizer>(p_node)) {
-		r_out.push_back(net_id_for(p_node));
+// Every MultiplayerSynchronizer at or under p_node, depth first: the order a spawn record names
+// their ids in, which the client walks the same node it built in.
+static void collect_syncs(Node *p_node, std::vector<MultiplayerSynchronizer *> &r_out) {
+	if (MultiplayerSynchronizer *s = Object::cast_to<MultiplayerSynchronizer>(p_node)) {
+		r_out.push_back(s);
 	}
 	TypedArray<Node> children = p_node->get_children();
 	for (int i = 0; i < children.size(); i++) {
@@ -735,10 +741,8 @@ void GoldNetMultiplayer::_wrap_spawner(MultiplayerSpawner *p_spawner) {
 		return;
 	}
 	SpawnerEntry e;
-	e.net_id = net_id_for(p_spawner);
 	e.orig_fn = p_spawner->get_spawn_function();
 	spawners[objid] = e;
-	spawner_netid_to_objid[e.net_id] = objid;
 	p_spawner->set_spawn_function(
 			callable_mp(this, &GoldNetMultiplayer::_spawn_trampoline).bind((int64_t)objid));
 }
@@ -808,15 +812,30 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 		if (!node->is_inside_tree()) {
 			continue; // wait for spawn() to add it
 		}
+		done.push_back(kv.key);
+		if (!spawners.has(kv.value.spawner_objid)) {
+			continue; // only a wrapped spawner's trampoline captures a spawn, so this can't happen
+		}
+		// The record: the synchronizers' ids, in the order the client finds them in the node it
+		// builds, then the spawn's data. They also gate it on their visibility.
 		CoreServer::SpawnRecord rec;
-		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
+		rec.spawner_net_id = _spawner_net_id(kv.value.spawner_objid);
+		std::vector<MultiplayerSynchronizer *> syncs;
+		collect_syncs(node, syncs);
+		goldnet::Writer w;
+		goldnet::put_uvarint(&w, (uint32_t)syncs.size());
+		for (MultiplayerSynchronizer *s : syncs) {
+			const uint32_t id = _sync_net_id(s);
+			goldnet::put_uvarint(&w, id);
+			rec.entities.push_back(id);
+		}
 		PackedByteArray data = UtilityFunctions::var_to_bytes(kv.value.data);
-		rec.data.assign(data.ptr(), data.ptr() + data.size());
-		collect_syncs(node, rec.entities); // for lazy, visibility-gated spawning
-		const uint32_t net_id = net_id_for(node);
+		w.put_data(data.ptr(), (size_t)data.size());
+		rec.data.assign(w.data(), w.data() + w.size());
+		const uint32_t net_id = next_net_id++;
 		server.add_spawn(net_id, std::move(rec));
 		server_spawned[net_id] = kv.key;
-		done.push_back(kv.key);
+		spawned_nodes.insert(kv.key);
 	}
 	for (int i = 0; i < done.size(); i++) {
 		pending_spawns.erase(done[i]);
@@ -832,19 +851,98 @@ void GoldNetMultiplayer::_detect_despawns() {
 		}
 	}
 	for (uint32_t net_id : gone) {
+		spawned_nodes.erase(server_spawned[net_id]);
 		server_spawned.erase(net_id);
 		server.despawn(net_id);
 	}
+	// And a bind record's node freed without unregistering (a spawner, which never does).
+	gone.clear();
+	for (const KeyValue<uint32_t, uint64_t> &kv : server_bound) {
+		if (!ObjectDB::get_instance(kv.value)) {
+			gone.push_back(kv.key);
+		}
+	}
+	for (uint32_t net_id : gone) {
+		server_bound.erase(net_id);
+		server.despawn(net_id);
+	}
+}
+
+// Server: p_sync's net_id, handing it one the first time it's asked.
+uint32_t GoldNetMultiplayer::_sync_net_id(MultiplayerSynchronizer *p_sync) {
+	const uint64_t objid = p_sync->get_instance_id();
+	if (uint32_t *id = owned.getptr(objid)) {
+		if (*id == 0) {
+			*id = next_net_id++;
+			netid_to_objid[*id] = objid;
+		}
+		return *id;
+	}
+	if (const uint32_t *id = other_sync_ids.getptr(objid)) {
+		return *id;
+	}
+	const uint32_t id = next_net_id++; // one we don't own: only ever asked about its visibility
+	other_sync_ids[objid] = id;
+	other_syncs[id] = objid;
+	return id;
+}
+
+// Server: a spawner's net_id, which every peer is told with a bind record before any spawn through
+// it can be created there.
+uint32_t GoldNetMultiplayer::_spawner_net_id(uint64_t p_spawner_objid) {
+	SpawnerEntry &e = spawners[p_spawner_objid];
+	if (e.net_id == 0) {
+		e.net_id = next_net_id++;
+		spawner_netid_to_objid[e.net_id] = p_spawner_objid;
+		_add_bind(e.net_id, Object::cast_to<Node>(ObjectDB::get_instance(p_spawner_objid)), false);
+	}
+	return e.net_id;
+}
+
+// Server: tell each peer which of its nodes p_net_id is, by path, reliably (a core spawn with no
+// spawner). Gated, it reaches a peer once the node at p_net_id is visible to it.
+void GoldNetMultiplayer::_add_bind(uint32_t p_net_id, Node *p_node, bool p_gated) {
+	if (!p_node) {
+		return;
+	}
+	CoreServer::SpawnRecord rec;
+	const CharString path = String(p_node->get_path()).utf8();
+	rec.data.assign((const uint8_t *)path.get_data(), (const uint8_t *)path.get_data() + path.length());
+	if (p_gated) {
+		rec.entities.push_back(p_net_id);
+	}
+	server.add_spawn(p_net_id, std::move(rec));
+	server_bound[p_net_id] = p_node->get_instance_id();
+}
+
+// Server: whether p_node came with a spawn record, which names its synchronizers' ids.
+bool GoldNetMultiplayer::_under_spawned(Node *p_node) const {
+	for (Node *n = p_node; n; n = n->get_parent()) {
+		if (spawned_nodes.has(n->get_instance_id())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Client: build a spawned node from its recipe, add it under the spawner's spawn_path, and
 // fire the spawner's `spawned` signal so the game runs its per-node bookkeeping. The node's
 // child synchronizer auto-registers on enter-tree and streams state like any other entity.
 // False when it can't be built yet; goldnet::Client then takes a later resend.
-bool GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data) {
+bool GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const uint8_t *p_data,
+		size_t p_size) {
 	if (!spawner_netid_to_objid.has(p_spawner_net_id)) {
-		return false; // spawner not registered here yet
+		return false; // its bind record hasn't come yet
 	}
+	goldnet::Reader r(p_data, p_size);
+	std::vector<uint32_t> ids((size_t)std::min<uint32_t>(goldnet::get_uvarint(&r), (uint32_t)p_size));
+	for (uint32_t &id : ids) {
+		id = goldnet::get_uvarint(&r);
+	}
+	if (r.failed()) {
+		return true; // nothing to build it from; holding the ack wouldn't bring a better record
+	}
+	const Variant spawn_data = gn_bytes_to_var(p_data + (p_size - r.remaining()), r.remaining());
 	uint64_t sobj = spawner_netid_to_objid[p_spawner_net_id];
 	MultiplayerSpawner *spawner = Object::cast_to<MultiplayerSpawner>(ObjectDB::get_instance(sobj));
 	if (!spawner || !spawners.has(sobj)) {
@@ -854,20 +952,83 @@ bool GoldNetMultiplayer::_apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_
 	if (!spawn_root) {
 		return false;
 	}
-	Variant node_v = spawners[sobj].orig_fn.callv(Array::make(p_data));
+	Variant node_v = spawners[sobj].orig_fn.callv(Array::make(spawn_data));
 	Node *node = Object::cast_to<Node>(node_v);
 	if (!node) {
 		return false;
 	}
 	spawn_root->add_child(node);
 	client_spawned[p_net_id] = node->get_instance_id();
+	// Its synchronizers registered as it entered the tree; the record names their ids, in order.
+	std::vector<MultiplayerSynchronizer *> syncs;
+	collect_syncs(node, syncs);
+	if (syncs.size() != ids.size()) {
+		UtilityFunctions::push_warning("goldnet: ", node->get_path(), " has ", (int64_t)syncs.size(),
+				" synchronizers here and ", (int64_t)ids.size(), " on the server; only the first of each replicate.");
+	}
+	for (size_t i = 0; i < syncs.size() && i < ids.size(); i++) {
+		const uint64_t objid = syncs[i]->get_instance_id();
+		if (uint32_t *id = owned.getptr(objid)) {
+			*id = ids[i];
+			netid_to_objid[ids[i]] = objid;
+			client_bound[ids[i]] = objid;
+		}
+	}
 	spawner->emit_signal("spawned", node);
 	return true;
+}
+
+// Client: the node a bind record names (by path) is p_net_id from here on. False while it isn't
+// here yet, or is a synchronizer that hasn't registered, so the record comes again.
+bool GoldNetMultiplayer::_apply_bind(uint32_t p_net_id, const uint8_t *p_data, size_t p_size) {
+	SceneTree *tree = Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop());
+	Node *node = tree && tree->get_root() ?
+			tree->get_root()->get_node_or_null(NodePath(String::utf8((const char *)p_data, (int64_t)p_size))) :
+			nullptr;
+	if (!node) {
+		return false;
+	}
+	const uint64_t objid = node->get_instance_id();
+	if (MultiplayerSpawner *sp = Object::cast_to<MultiplayerSpawner>(node)) {
+		_wrap_spawner(sp);
+		spawners[objid].net_id = p_net_id;
+		spawner_netid_to_objid[p_net_id] = objid;
+	} else if (uint32_t *id = owned.getptr(objid)) {
+		*id = p_net_id;
+		netid_to_objid[p_net_id] = objid;
+	} else {
+		return false; // a synchronizer that hasn't registered yet
+	}
+	client_bound[p_net_id] = objid;
+	return true;
+}
+
+// Client: forget what the server's id p_net_id named here.
+void GoldNetMultiplayer::_unbind(uint32_t p_net_id) {
+	const uint64_t *objid = client_bound.getptr(p_net_id);
+	if (!objid) {
+		return;
+	}
+	if (uint32_t *id = owned.getptr(*objid)) {
+		if (*id == p_net_id) {
+			*id = 0;
+		}
+	}
+	if (SpawnerEntry *e = spawners.getptr(*objid)) {
+		if (e->net_id == p_net_id) {
+			e->net_id = 0;
+		}
+	}
+	netid_to_objid.erase(p_net_id);
+	spawner_netid_to_objid.erase(p_net_id);
+	client.forget(p_net_id);
+	client_bound.erase(p_net_id);
 }
 
 // Client: free a spawned node and fire the spawner's `despawned` signal.
 void GoldNetMultiplayer::_apply_despawn(uint32_t p_net_id) {
 	if (!client_spawned.has(p_net_id)) {
+		_unbind(p_net_id); // a bind record's: its node stays, and stops being p_net_id
 		return;
 	}
 	uint64_t objid = client_spawned[p_net_id];
@@ -1202,7 +1363,7 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 	// Passed the synchronizer itself — the direct case. One the core doesn't have yet is read whole
 	// when it does.
 	if (const uint32_t *net_id = owned.getptr(id)) {
-		server.mark_dirty(*net_id);
+		server.mark_dirty(*net_id); // 0 before it's the core's, which reads it whole anyway
 		return;
 	}
 	// Passed the node whose state is replicated. Games think in entities, so this is the call
@@ -1582,7 +1743,11 @@ void GoldNetMultiplayer::_add_entities() {
 			layout.stepped.push_back(slot_kind_stepped(kind) ? 1 : 0);
 		}
 		layout.kinds_check = d.coding.check;
-		server.add_entity(owned[objid], std::move(layout)).user = std::move(d);
+		const uint32_t net_id = _sync_net_id(sync);
+		if (!server_bound.has(net_id) && !_under_spawned(sync)) {
+			_add_bind(net_id, sync, true); // placed in the scene: each peer is told its id
+		}
+		server.add_entity(net_id, std::move(layout)).user = std::move(d);
 		done.push_back(objid);
 	}
 	for (int i = 0; i < done.size(); i++) {
@@ -1625,7 +1790,8 @@ struct GoldNetMultiplayer::ClientHost {
 	void message(const uint8_t *data, size_t size, bool) { gn->_deliver_message(1, data, size); }
 
 	bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size) {
-		return gn->_apply_spawn(net_id, spawner_net_id, gn_bytes_to_var(data, size));
+		return spawner_net_id == 0 ? gn->_apply_bind(net_id, data, size)
+								   : gn->_apply_spawn(net_id, spawner_net_id, data, size);
 	}
 
 	void despawn(uint32_t net_id) { gn->_apply_despawn(net_id); }
@@ -2554,23 +2720,11 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 	}
 
 	MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(p_config);
-	if (sync && !_should_intercept(sync)) {
-		other_syncs[net_id_for(sync)] = sync->get_instance_id();
-	}
 	if (sync && _should_intercept(sync)) {
 		uint64_t objid = sync->get_instance_id();
-		uint32_t net_id = net_id_for(sync);
-		// The same net_id from a synchronizer still in the tree is two paths hashing alike: both
-		// can't replicate. (One out of the tree is the same path's old synchronizer, on its way out.)
-		if (const uint64_t *prev = netid_to_objid.getptr(net_id)) {
-			MultiplayerSynchronizer *other = *prev != objid ? sync_from_objid(*prev) : nullptr;
-			if (other && other->is_inside_tree()) {
-				ERR_PRINT(String("goldnet: ") + String(sync->get_path()) + " and " + String(other->get_path()) +
-						" hash to the same net_id; only the newer one replicates. Rename one of them.");
-			}
+		if (!owned.has(objid)) {
+			owned[objid] = 0; // its id comes from the server: handed out there, bound here
 		}
-		owned[objid] = net_id;
-		netid_to_objid[net_id] = objid;
 		entities_to_add.insert(objid); // the server's core takes it once it's live (_add_entities)
 		_refresh_interval(); // intervals are set before the sync enters the tree
 		return OK; // we own it — do not forward to the inner
@@ -2593,20 +2747,21 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 			const uint32_t net_id = *net_id_ptr;
 			owned.erase(objid);
 			entities_to_add.erase(objid);
-			// Unless a newer synchronizer at the same path has the net_id already.
-			const uint64_t *current = netid_to_objid.getptr(net_id);
-			if (current && *current == objid) {
+			if (net_id != 0) {
 				netid_to_objid.erase(net_id);
 				client.forget(net_id); // freed with no despawn to say so (a map change, say)
+				client_bound.erase(net_id);
 				server.remove_entity(net_id);
+				if (server_bound.erase(net_id)) {
+					server.despawn(net_id); // and its bind record, so a peer stops holding it as that id
+				}
 			}
 			_refresh_interval();
 			return OK;
 		}
-		const uint32_t net_id = net_id_for(sync);
-		const uint64_t *other = other_syncs.getptr(net_id);
-		if (other && *other == objid) {
-			other_syncs.erase(net_id);
+		if (const uint32_t *net_id = other_sync_ids.getptr(objid)) {
+			other_syncs.erase(*net_id);
+			other_sync_ids.erase(objid);
 		}
 	}
 	return inner->object_configuration_remove(p_object, p_config);

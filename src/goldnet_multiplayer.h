@@ -86,12 +86,24 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	goldnet::Client<Variant> client;
 	struct ServerHost;
 	struct ClientHost;
-	// Every synchronizer we own, on both ends: ObjectID -> net_id, and back.
+	// Every synchronizer we own, on both ends: ObjectID -> net_id (0 until it has one), and back for
+	// those that have one.
 	HashMap<uint64_t, uint32_t> owned;
 	HashMap<uint32_t, uint64_t> netid_to_objid;
-	// Synchronizers we don't own (nothing they replicate is a slot), net_id -> ObjectID: a spawn's
-	// visibility can still be asked of one (SpawnRecord::entities).
+	// Server: synchronizers we don't own (nothing they replicate is a slot), net_id -> ObjectID and
+	// back. A spawn's visibility can still be asked of one (SpawnRecord::entities).
 	HashMap<uint32_t, uint64_t> other_syncs;
+	HashMap<uint64_t, uint32_t> other_sync_ids;
+
+	// Net ids. The server hands every one out, counting from 1 and never twice in a session, so
+	// they stay small on the wire (a byte under 128, two under 16384). A client learns them from
+	// the server: a spawn record names the ids of the synchronizers its node brings, and a bind
+	// record (a core spawn with spawner id 0 and a node's path for its data) names the id of a node
+	// both ends already have, a synchronizer or spawner placed in the scene.
+	uint32_t next_net_id = 1;
+	HashMap<uint32_t, uint64_t> server_bound; // server: each bind record's id -> the node it names
+	HashMap<uint32_t, uint64_t> client_bound; // client: each id the server gave a node here -> the node
+	HashSet<uint64_t> spawned_nodes;          // server: the nodes behind spawn records
 	// Owned synchronizers the server hasn't handed the core yet: each goes in on its first live tick,
 	// once the game has set its metas (see _add_entities).
 	HashSet<uint64_t> entities_to_add;
@@ -101,13 +113,12 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 
 	// --- Phase 3: spawn / despawn (agnostic — projectiles & players stream like movers) ---
 	// We own every MultiplayerSpawner too, so runtime entities flow through this stream
-	// instead of the inner. Spawns and their STATE use independent hash-id spaces that both
-	// match across peers: the spawn record is keyed by the spawned NODE's path hash; its
-	// child synchronizer registers under its OWN path hash and streams state exactly like a
-	// map mover. Creating the node on the client makes the child synchronizer auto-register;
-	// freeing it auto-unregisters. Nothing distinguishes a mover from a projectile downstream.
+	// instead of the inner. A spawn record is keyed by the spawned NODE's net_id and names its
+	// synchronizers' ids, which then stream state exactly like a map mover's. Creating the node on
+	// the client makes the child synchronizers auto-register; freeing it auto-unregisters. Nothing
+	// distinguishes a mover from a projectile downstream.
 	struct SpawnerEntry {
-		uint32_t net_id = 0; // hash of the spawner's path
+		uint32_t net_id = 0; // 0 until the server gives it one (a bind record, see Net ids)
 		Callable orig_fn;    // the game's real spawn_function (we wrap it to capture spawn data)
 	};
 	HashMap<uint64_t, SpawnerEntry> spawners;       // spawner ObjectID -> entry
@@ -289,8 +300,14 @@ private:
 	Variant _spawn_trampoline(Variant p_data, int64_t p_spawner_objid); // wraps the game's spawn_function
 	void _drain_pending_spawns();  // promote captured spawns (now in-tree) to core spawn records
 	void _detect_despawns();       // poll: spawned nodes that were freed become despawns
-	bool _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const Variant &p_data); // client
-	void _apply_despawn(uint32_t p_net_id);                                                  // client
+	bool _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const uint8_t *p_data, size_t p_size); // client
+	bool _apply_bind(uint32_t p_net_id, const uint8_t *p_data, size_t p_size);                            // client
+	void _apply_despawn(uint32_t p_net_id);                                                                 // client
+	void _unbind(uint32_t p_net_id);                                                                        // client
+	uint32_t _sync_net_id(MultiplayerSynchronizer *p_sync);  // server: its id, handed out on first ask
+	uint32_t _spawner_net_id(uint64_t p_spawner_objid);      // server: the same, bound for every peer
+	void _add_bind(uint32_t p_net_id, Node *p_node, bool p_gated); // server
+	bool _under_spawned(Node *p_node) const;                 // server
 
 protected:
 	static void _bind_methods();
