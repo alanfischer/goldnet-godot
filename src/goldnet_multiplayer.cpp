@@ -568,6 +568,7 @@ void GoldNetMultiplayer::_reset_client_state() {
 	client_spawned.clear(); // spawner nodes are torn down with the session
 	client_slot_codings.clear();
 	warned_kinds.clear();
+	warned_given_up.clear();
 	update_rate_granted = -1;
 	client.set_auto_command_rate(client.auto_command_rate(), (double)Engine::get_singleton()->get_physics_ticks_per_second());
 	msg_registered.clear();
@@ -1692,6 +1693,19 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 	ClientHost host{ this };
 	goldnet::Client<Variant>::ApplyInfo info = client.apply(p_bytes.ptr(), (size_t)p_bytes.size(), host,
 			(uint32_t)Time::get_singleton()->get_ticks_msec());
+	// A spawn the game kept refusing, or a synchronizer that never got into the tree, held the ack
+	// until the core gave up and acked anyway: the server now counts it as delivered.
+	for (uint32_t net_id : info.given_up) {
+		if (warned_given_up.has(net_id)) {
+			continue;
+		}
+		warned_given_up.insert(net_id);
+		const uint64_t *objid = netid_to_objid.getptr(net_id);
+		MultiplayerSynchronizer *sync = objid ? sync_from_objid(*objid) : nullptr;
+		UtilityFunctions::push_warning("goldnet: gave up waiting on ", sync ? String(sync->get_path()) : String("net_id ") + itos(net_id),
+				" to spawn or take its state; the server now counts it as delivered, so a spawn won't come again and "
+				"its state may stay stale.");
+	}
 	const int granted = client.stats().update_rate_granted;
 	if (granted != update_rate_granted) {
 		update_rate_granted = granted;
