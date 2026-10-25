@@ -16,7 +16,7 @@
 //
 // Upstream, an @rpc a node lists in its "gn_commands" meta is a command stream (see
 // addons/goldnet/command_stream.gd): a client's calls to the server are carried by its uplink
-// (goldnet::Client::uplink) instead of the inner, and the server calls the method once per call, in
+// (goldnet::Client::push_command) instead of the inner, and the server calls the method once per call, in
 // order, the way a reliable RPC would.
 //
 // Every other RPC between the server and a client rides the same packets too, as a message on
@@ -259,6 +259,7 @@ public:
 private:
 	GoldNetLink *_ensure_link();                                 // create/find /root/__GoldNetLink
 	void _server_tick();                                         // build + send delta snapshots
+	void _sync_server_peers();                                   // the core's peers to the inner's
 	uint64_t _min_interval_us() const;
 	void _refresh_interval(); // recompute the cached send cadence
 
