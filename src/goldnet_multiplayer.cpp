@@ -911,17 +911,18 @@ uint32_t GoldNetMultiplayer::_spawner_net_id(uint64_t p_spawner_objid) {
 	uint32_t net_id = ids.id(p_spawner_objid);
 	if (net_id == 0) {
 		net_id = ids.assign(p_spawner_objid);
-		_add_bind(net_id, Object::cast_to<Node>(ObjectDB::get_instance(p_spawner_objid)), false);
+		if (Node *spawner = Object::cast_to<Node>(ObjectDB::get_instance(p_spawner_objid))) {
+			server.add_spawn(net_id, _bind_record(spawner, net_id, false)); // not an entity: a spawn on its own
+			bind_ids.insert(net_id);
+		}
 	}
 	return net_id;
 }
 
 // Server: a bind record telling each peer which of its nodes p_net_id is. Gated, it reaches a peer
 // once the node is visible to it.
-void GoldNetMultiplayer::_add_bind(uint32_t p_net_id, Node *p_node, bool p_gated) {
-	if (!p_node) {
-		return;
-	}
+GoldNetMultiplayer::CoreServer::SpawnRecord GoldNetMultiplayer::_bind_record(Node *p_node, uint32_t p_net_id,
+		bool p_gated) const {
 	CoreServer::SpawnRecord rec;
 	rec.spawner_net_id = BIND_SPAWNER;
 	const CharString path = String(p_node->get_path()).utf8();
@@ -929,8 +930,7 @@ void GoldNetMultiplayer::_add_bind(uint32_t p_net_id, Node *p_node, bool p_gated
 	if (p_gated) {
 		rec.entities.push_back(p_net_id);
 	}
-	server.add_spawn(p_net_id, std::move(rec));
-	bind_ids.insert(p_net_id);
+	return rec;
 }
 
 // Server: whether p_node came with a spawn record, which names its synchronizers' ids.
@@ -1720,10 +1720,13 @@ void GoldNetMultiplayer::_add_entities() {
 		}
 		layout.kinds_check = d.coding.check;
 		const uint32_t net_id = ids.assign(objid);
-		if (!bind_ids.has(net_id) && !_under_spawned(sync)) {
-			_add_bind(net_id, sync, true); // placed in the scene: each peer is told its id
+		if (_under_spawned(sync)) {
+			server.add_entity(net_id, std::move(layout)).user = std::move(d); // its spawn record names it
+		} else {
+			// Placed in the scene: each peer is told its id by a bind record, its entity's own spawn.
+			server.add_entity(net_id, std::move(layout), _bind_record(sync, net_id, true)).user = std::move(d);
+			bind_ids.insert(net_id);
 		}
-		server.add_entity(net_id, std::move(layout)).user = std::move(d);
 		done.push_back(objid);
 	}
 	for (int i = 0; i < done.size(); i++) {
@@ -2720,10 +2723,8 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 			entities_to_add.erase(objid);
 			if (net_id != 0) {
 				client.forget(net_id); // freed with no despawn to say so (a map change, say)
-				server.remove_entity(net_id);
-				if (bind_ids.erase(net_id)) {
-					server.despawn(net_id); // and its bind record, so a peer stops holding it as that id
-				}
+				server.remove_entity(net_id); // and its bind record, if it has one
+				bind_ids.erase(net_id);
 			}
 			_refresh_interval();
 			return OK;
