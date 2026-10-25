@@ -93,6 +93,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashSet<uint64_t> entities_to_add;
 	HashMap<uint64_t, SlotCoding> client_slot_codings; // synchronizer ObjectID -> its slot coding, made on first apply
 	HashSet<uint32_t> warned_kinds;                // net_ids whose slot kinds differ from the server's
+	HashSet<uint32_t> warned_given_up;             // net_ids the client stopped holding a snapshot for
 
 	// --- Phase 3: spawn / despawn (agnostic — projectiles & players stream like movers) ---
 	// We own every MultiplayerSpawner too, so runtime entities flow through this stream
