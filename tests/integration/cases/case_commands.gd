@@ -100,6 +100,7 @@ func client_step(t: float) -> void:
 		check_eq(stats["commands_pending"], 0, "all acked by the end")
 		check_eq(stats["commands_dropped"], 0, "none given up on")
 		check(stats["command_rtt_ms"] >= 50, "the command round trip includes both legs (%d ms)" % stats["command_rtt_ms"])
+		check(stats["silent_ms"] < 1000, "the server is heard from: quiet for %d ms" % stats["silent_ms"])
 		finish()
 
 

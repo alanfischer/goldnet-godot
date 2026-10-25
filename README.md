@@ -134,8 +134,8 @@ snapshot — is in goldnet's [`docs/protocol.md`](https://github.com/alanfischer
   until the peer acks a frame carrying them. A spawn's source record outlives
   delivery, so each peer keeps a durable `spawn_acked` set — a spawn is delivered
   exactly once, never re-armed frame after frame.
-- The **leave** section is the opt-in PVS-relevance channel (off by default;
-  `leave_ct` is 0 and costs 2 bytes when disabled): net_ids that dropped out of the
+- The **leave** section is the PVS-relevance channel (on by default;
+  `set_relevance_events(false)` leaves `leave_ct` 0, at 2 bytes): net_ids that dropped out of the
   peer's PVS since last tick, delivered reliable-until-acked so the client can hide
   them. Re-entry needs no event — the entity simply reappears in `changed` with a
   full baseline. See **Per-peer visibility** below.
@@ -189,13 +189,13 @@ see its `register_pvs_sync` / `push_pvs_visibility`.)
 > loop below would become optional. Until then, use the push API.
 
 Culling alone stops sending an out-of-PVS entity, but the client still holds its last
-state and would render it frozen through a wall. So goldnet also exposes an **opt-in
-relevance channel**: enable it with `set_relevance_events(true)`, and the server emits
-reliable-until-acked *leave* markers (the section above) for owned syncs that drop out
-of a peer's PVS, surfaced to the game as the `entity_relevance_lost(sync)` signal so it
-can hide/despawn its view of them. It is off by default — with it off goldnet stays a
-pure state-replication transport and games drive relevance however they like.
-(WizardWars turns it on and connects `NetworkManager._on_entity_relevance_lost`.)
+state and would render it frozen through a wall. So goldnet also has a **relevance
+channel**, on by default as GoldSrc's was: the server emits reliable-until-acked *leave*
+markers (the section above) for owned syncs that drop out of a peer's PVS, surfaced to
+the game as the `entity_relevance_lost(sync)` signal so it can hide/despawn its view of
+them. Turn it off with `set_relevance_events(false)` and goldnet stays a pure
+state-replication transport, leaving games to drive relevance however they like.
+(WizardWars connects `NetworkManager._on_entity_relevance_lost`.)
 
 ## Performance
 
@@ -529,9 +529,9 @@ something false.
    which **replaces** the whole config on write, so `sim_config = {}`
    is the off switch, a read-back matches what was written, and an unknown key is an
    error rather than a silent reset. To change one knob, read-modify-write; every
-   setter is idempotent, so that disturbs nothing else (including the seed). To receive
-   PVS leave events, `set_relevance_events(true)` and connect the
-   `entity_relevance_lost(sync)` signal (see **How it works → Per-peer visibility**).
+   setter is idempotent, so that disturbs nothing else (including the seed). To act on
+   PVS leave events, connect the `entity_relevance_lost(sync)` signal; they're on by default,
+   and `set_relevance_events(false)` turns them off (see **How it works → Per-peer visibility**).
 
    The link cap models a modem or BLE connection rather than a lossy one: sending over
    `link_bps` queues, so delay grows, and only once a link has `link_queue_ms` of backlog
@@ -603,7 +603,8 @@ something false.
    #         recv_sim_config let through; count these, not the transport's counters, while it is on)
    # current values:
    # both:   rate (bytes/sec in force), update_rate (snapshots/sec granted),
-   #         uplink_lag_ms, uplink_pps (measured by the server)
+   #         uplink_lag_ms, uplink_pps (measured by the server),
+   #         silent_ms (how long since the other end was last heard from: time it out on this)
    # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
    ```
 12. Two builds with different wire versions can't talk: each drops the other's packets. `get_protocol_version()`

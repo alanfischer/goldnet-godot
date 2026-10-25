@@ -705,11 +705,11 @@ static MultiplayerSynchronizer *sync_from_objid(uint64_t p_objid) {
 	return Object::cast_to<MultiplayerSynchronizer>(ObjectDB::get_instance(p_objid));
 }
 
-// Collect the instance ids of every MultiplayerSynchronizer at or under p_node (used to gate a spawn
-// on the entity's per-peer visibility — see goldnet::Server::SpawnRecord::vis_keys).
-static void collect_syncs(Node *p_node, std::vector<uint64_t> &r_out) {
+// Collect the net_ids of every MultiplayerSynchronizer at or under p_node (used to gate a spawn
+// on the entity's per-peer visibility — see goldnet::Server::SpawnRecord::entities).
+static void collect_syncs(Node *p_node, std::vector<uint32_t> &r_out) {
 	if (Object::cast_to<MultiplayerSynchronizer>(p_node)) {
-		r_out.push_back(p_node->get_instance_id());
+		r_out.push_back(net_id_for(p_node));
 	}
 	TypedArray<Node> children = p_node->get_children();
 	for (int i = 0; i < children.size(); i++) {
@@ -812,7 +812,7 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
 		PackedByteArray data = UtilityFunctions::var_to_bytes(kv.value.data);
 		rec.data.assign(data.ptr(), data.ptr() + data.size());
-		collect_syncs(node, rec.vis_keys); // for lazy, visibility-gated spawning
+		collect_syncs(node, rec.entities); // for lazy, visibility-gated spawning
 		const uint32_t net_id = net_id_for(node);
 		server.add_spawn(net_id, std::move(rec));
 		server_spawned[net_id] = kv.key;
@@ -1071,12 +1071,14 @@ Dictionary GoldNetMultiplayer::get_peer_stats(int p_peer) const {
 	// Only one end's stats apply; the other's stay at their zeros.
 	CoreServer::PeerStats sv;
 	goldnet::Client<Variant>::Stats cl;
+	const uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 	if (on_server) {
 		sv = server.peer_stats(p_peer);
 	} else {
 		cl = client.stats();
 	}
 	Dictionary d;
+	d["silent_ms"] = (int64_t)(on_server ? server.silent_ms(p_peer, now) : client.silent_ms(now));
 	d["chokes"] = (int64_t)sv.chokes;
 	d["snapshots_received"] = (int64_t)cl.snapshots_received;
 	d["snapshots_lost"] = (int64_t)cl.snapshots_lost;
@@ -1199,15 +1201,17 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 	uint64_t id = (uint64_t)p_obj->get_instance_id();
 	// Passed the synchronizer itself — the direct case. One the core doesn't have yet is read whole
 	// when it does.
-	if (owned.has(id)) {
-		server.mark_dirty(id);
+	if (const uint32_t *net_id = owned.getptr(id)) {
+		server.mark_dirty(*net_id);
 		return;
 	}
 	// Passed the node whose state is replicated. Games think in entities, so this is the call
 	// site that actually reads well; the node -> sync answer is memoized because finding it
 	// means scanning children.
 	if (const uint64_t *routed = dirty_route.getptr(id)) {
-		server.mark_dirty(*routed);
+		if (const uint32_t *net_id = owned.getptr(*routed)) {
+			server.mark_dirty(*net_id);
+		}
 		return; // a stale route just means the sync is gone; nothing to mark
 	}
 	Node *node = Object::cast_to<Node>(p_obj);
@@ -1220,8 +1224,8 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 			continue;
 		}
 		uint64_t sid = (uint64_t)sync->get_instance_id();
-		if (owned.has(sid)) {
-			server.mark_dirty(sid);
+		if (const uint32_t *net_id = owned.getptr(sid)) {
+			server.mark_dirty(*net_id);
 			dirty_route[id] = sid;
 			return;
 		}
@@ -1481,7 +1485,7 @@ struct GoldNetMultiplayer::ServerHost {
 	GoldNetLink *link;
 
 	bool live(CoreServer::Entity &e) {
-		MultiplayerSynchronizer *sync = sync_from_objid(e.key());
+		MultiplayerSynchronizer *sync = sync_from_objid(e.user.objid);
 		if (!sync || !sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
 			return false;
 		}
@@ -1516,8 +1520,12 @@ struct GoldNetMultiplayer::ServerHost {
 		return e.user.sync->is_visibility_public() || e.user.sync->get_visibility_for(peer);
 	}
 
-	bool spawn_visible(uint64_t key, int32_t peer) {
-		MultiplayerSynchronizer *s = sync_from_objid(key);
+	bool spawn_visible(uint32_t net_id, int32_t peer) {
+		const uint64_t *objid = gn->netid_to_objid.getptr(net_id);
+		if (!objid) {
+			objid = gn->other_syncs.getptr(net_id);
+		}
+		MultiplayerSynchronizer *s = objid ? sync_from_objid(*objid) : nullptr;
 		return s && (s->is_visibility_public() || s->get_visibility_for(peer));
 	}
 
@@ -1562,6 +1570,7 @@ void GoldNetMultiplayer::_add_entities() {
 			continue;
 		}
 		SyncData d;
+		d.objid = objid;
 		d.sync = sync;
 		goldnet::EntityLayout layout;
 		_read_push(sync, layout.push);
@@ -1573,7 +1582,7 @@ void GoldNetMultiplayer::_add_entities() {
 			layout.stepped.push_back(slot_kind_stepped(kind) ? 1 : 0);
 		}
 		layout.kinds_check = d.coding.check;
-		server.add_entity(objid, owned[objid], std::move(layout)).user = std::move(d);
+		server.add_entity(owned[objid], std::move(layout)).user = std::move(d);
 		done.push_back(objid);
 	}
 	for (int i = 0; i < done.size(); i++) {
@@ -2545,9 +2554,21 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 	}
 
 	MultiplayerSynchronizer *sync = Object::cast_to<MultiplayerSynchronizer>(p_config);
+	if (sync && !_should_intercept(sync)) {
+		other_syncs[net_id_for(sync)] = sync->get_instance_id();
+	}
 	if (sync && _should_intercept(sync)) {
 		uint64_t objid = sync->get_instance_id();
 		uint32_t net_id = net_id_for(sync);
+		// The same net_id from a synchronizer still in the tree is two paths hashing alike: both
+		// can't replicate. (One out of the tree is the same path's old synchronizer, on its way out.)
+		if (const uint64_t *prev = netid_to_objid.getptr(net_id)) {
+			MultiplayerSynchronizer *other = *prev != objid ? sync_from_objid(*prev) : nullptr;
+			if (other && other->is_inside_tree()) {
+				ERR_PRINT(String("goldnet: ") + String(sync->get_path()) + " and " + String(other->get_path()) +
+						" hash to the same net_id; only the newer one replicates. Rename one of them.");
+			}
+		}
 		owned[objid] = net_id;
 		netid_to_objid[net_id] = objid;
 		entities_to_add.insert(objid); // the server's core takes it once it's live (_add_entities)
@@ -2568,14 +2589,24 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 	if (sync) {
 		uint64_t objid = sync->get_instance_id();
 		client_slot_codings.erase(objid);
-		if (const uint32_t *net_id = owned.getptr(objid)) {
-			netid_to_objid.erase(*net_id);
-			client.forget(*net_id); // freed with no despawn to say so (a map change, say)
+		if (const uint32_t *net_id_ptr = owned.getptr(objid)) {
+			const uint32_t net_id = *net_id_ptr;
 			owned.erase(objid);
 			entities_to_add.erase(objid);
-			server.remove_entity(objid);
+			// Unless a newer synchronizer at the same path has the net_id already.
+			const uint64_t *current = netid_to_objid.getptr(net_id);
+			if (current && *current == objid) {
+				netid_to_objid.erase(net_id);
+				client.forget(net_id); // freed with no despawn to say so (a map change, say)
+				server.remove_entity(net_id);
+			}
 			_refresh_interval();
 			return OK;
+		}
+		const uint32_t net_id = net_id_for(sync);
+		const uint64_t *other = other_syncs.getptr(net_id);
+		if (other && *other == objid) {
+			other_syncs.erase(net_id);
 		}
 	}
 	return inner->object_configuration_remove(p_object, p_config);
