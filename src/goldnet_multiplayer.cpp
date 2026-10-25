@@ -92,32 +92,46 @@ static Node *resolve_property(Node *p_root, const NodePath &p_cfg_path, NodePath
 	return target;
 }
 
-// Compact, self-delimiting tagged values (tags in goldnet/protocol.h), for RPC arguments and for a
-// slot whose kind is only known at runtime (see SlotKind). Stock Variant put_var tags every value
-// with a 4-byte type header and stores floats/ints at 64-bit width; these pack the common types
-// behind a 1-byte tag, 32-bit floats and zig-zag varint ints, and fall back to Godot's own Variant
-// encoding (TAG_OPAQUE) for anything else, so any Variant still round-trips. A "gn_quant" hint
-// (see _read_quant) picks a lossy tag; the tag says which, so the decoder needs no hint.
-using goldnet::QUANT_AUTO;
+// Compact, self-delimiting tagged values, for RPC arguments and for a slot whose kind is only known
+// at runtime (see SlotKind). Stock Variant put_var tags every value with a 4-byte type header and
+// stores floats/ints at 64-bit width; these pack the common types behind a 1-byte tag, 32-bit floats
+// and zig-zag varint ints, and fall back to Godot's own Variant encoding (TAG_OPAQUE) for anything
+// else, so any Variant still round-trips. A "gn_quant" hint (see _read_quant) picks a lossy tag; the
+// tag says which, so the decoder needs no hint. The tags are on the wire (docs/protocol.md, Values).
+enum ValueTag : uint8_t {
+	TAG_OPAQUE = 0,     // u32 length + bytes in Godot's Variant encoding
+	TAG_FLOAT = 1,      // f32
+	TAG_INT = 2,        // zig-zag varint
+	TAG_VEC3 = 3,       // 3x f32
+	TAG_BOOL = 4,       // u8
+	TAG_ANGLE16 = 5,    // float radians -> u16 over [0, TAU)
+	TAG_HALF = 6,       // float -> IEEE binary16
+	TAG_VEC3_HALF = 7,  // vec3 -> 3x binary16
+	TAG_ANGLE8 = 8,     // float radians -> u8 over [0, TAU) — GoldSrc-classic angle precision
+	TAG_TIME_DELTA = 9, // int ms timestamp -> zig-zag varint of (value - this packet's header time)
+};
+
+// A slot's quantization hint meaning "none — pick the tag from the value's runtime type".
+static const uint8_t QUANT_AUTO = 255;
 
 static int rpc_wire_bytes(const Array &p_args);
 
 // Map a "gn_quant" hint name to its tag, or QUANT_AUTO if the name is unknown.
 static uint8_t gn_quant_from_name(const String &name) {
 	if (name == "angle16") {
-		return goldnet::TAG_ANGLE16;
+		return TAG_ANGLE16;
 	}
 	if (name == "angle8") {
-		return goldnet::TAG_ANGLE8;
+		return TAG_ANGLE8;
 	}
 	if (name == "half") {
-		return goldnet::TAG_HALF;
+		return TAG_HALF;
 	}
 	if (name == "vec3_half") {
-		return goldnet::TAG_VEC3_HALF;
+		return TAG_VEC3_HALF;
 	}
 	if (name == "time_delta") {
-		return goldnet::TAG_TIME_DELTA;
+		return TAG_TIME_DELTA;
 	}
 	return QUANT_AUTO;
 }
@@ -445,7 +459,7 @@ static void put_arg(goldnet::Writer &w, const Variant &v) {
 		default:
 			break;
 	}
-	gn_put_value(w, v, goldnet::QUANT_AUTO, 0);
+	gn_put_value(w, v, QUANT_AUTO, 0);
 }
 
 static Variant get_arg(goldnet::Reader &r) {
@@ -795,11 +809,12 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 		}
 		CoreServer::SpawnRecord rec;
 		rec.spawner_net_id = spawners.has(kv.value.spawner_objid) ? spawners[kv.value.spawner_objid].net_id : 0;
-		rec.node_key = kv.key;
 		PackedByteArray data = UtilityFunctions::var_to_bytes(kv.value.data);
 		rec.data.assign(data.ptr(), data.ptr() + data.size());
 		collect_syncs(node, rec.vis_keys); // for lazy, visibility-gated spawning
-		server.add_spawn(net_id_for(node), std::move(rec));
+		const uint32_t net_id = net_id_for(node);
+		server.add_spawn(net_id, std::move(rec));
+		server_spawned[net_id] = kv.key;
 		done.push_back(kv.key);
 	}
 	for (int i = 0; i < done.size(); i++) {
@@ -810,12 +825,13 @@ void GoldNetMultiplayer::_drain_pending_spawns() {
 // Server: a spawned node that has been freed becomes a despawn (see goldnet::Server::despawn).
 void GoldNetMultiplayer::_detect_despawns() {
 	std::vector<uint32_t> gone;
-	for (const auto &kv : server.spawns()) {
-		if (!ObjectDB::get_instance(kv.second.node_key)) {
-			gone.push_back(kv.first);
+	for (const KeyValue<uint32_t, uint64_t> &kv : server_spawned) {
+		if (!ObjectDB::get_instance(kv.value)) {
+			gone.push_back(kv.key);
 		}
 	}
 	for (uint32_t net_id : gone) {
+		server_spawned.erase(net_id);
 		server.despawn(net_id);
 	}
 }
@@ -975,7 +991,7 @@ void GoldNetMultiplayer::_charge_rpc(int32_t p_peer, const Array &p_args) {
 		if (bytes < 0) {
 			bytes = rpc_wire_bytes(p_args) + RPC_WIRE_OVERHEAD;
 		}
-		server.charge(targets[i], now, (size_t)bytes);
+		server.charge(targets[i], (size_t)bytes, now);
 	}
 }
 
@@ -1134,7 +1150,7 @@ Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const Stri
 	if (sim.bandwidth_bps() > 0 && p_bytes < 0) {
 		p_bytes = rpc_wire_bytes(p_args);
 	}
-	int d = sim.schedule(now, p_peer, p_bytes > 0 ? (size_t)p_bytes : 0, p_droppable);
+	int d = sim.schedule(p_peer, p_bytes > 0 ? (size_t)p_bytes : 0, p_droppable, now);
 	if (d < 0) {
 		return OK; // the link's buffer is full: dropped, as a real one would
 	}
@@ -1146,7 +1162,7 @@ Error GoldNetMultiplayer::_sim_send(int32_t p_peer, Object *p_object, const Stri
 	ps.object_id = p_object->get_instance_id();
 	ps.method = p_method;
 	ps.args = p_args;
-	sim.enqueue(now, p_peer, d, ps);
+	sim.enqueue(p_peer, d, ps, now);
 	return OK;
 }
 
@@ -1408,21 +1424,35 @@ void GoldNetMultiplayer::_make_slot_coding(MultiplayerSynchronizer *p_sync, cons
 				: Variant::NIL;
 		uint8_t kind = SK_TAGGED;
 		switch (type) {
+			// A kind is a tag or an SK_ kind, two enums, so each branch sets one rather than a ternary
+			// mixing them.
 			case Variant::INT:
-				kind = q == goldnet::TAG_TIME_DELTA ? goldnet::TAG_TIME_DELTA : SK_INT_STEP;
+				if (q == TAG_TIME_DELTA) {
+					kind = TAG_TIME_DELTA;
+				} else {
+					kind = SK_INT_STEP;
+				}
 				break;
 			case Variant::BOOL:
-				kind = goldnet::TAG_BOOL;
+				kind = TAG_BOOL;
 				break;
 			case Variant::FLOAT:
-				kind = grid > 0.0 ? SK_FLOAT_GRID
-						: q == goldnet::TAG_ANGLE16 ? SK_ANGLE16_STEP
-						: q == goldnet::TAG_ANGLE8 ? SK_ANGLE8_STEP
-						: q == goldnet::TAG_HALF ? goldnet::TAG_HALF
-												  : goldnet::TAG_FLOAT;
+				if (grid > 0.0) {
+					kind = SK_FLOAT_GRID;
+				} else if (q == TAG_ANGLE16) {
+					kind = SK_ANGLE16_STEP;
+				} else if (q == TAG_ANGLE8) {
+					kind = SK_ANGLE8_STEP;
+				} else {
+					kind = q == TAG_HALF ? TAG_HALF : TAG_FLOAT;
+				}
 				break;
 			case Variant::VECTOR3:
-				kind = grid > 0.0 ? SK_VEC3_GRID : q == goldnet::TAG_VEC3_HALF ? goldnet::TAG_VEC3_HALF : goldnet::TAG_VEC3;
+				if (grid > 0.0) {
+					kind = SK_VEC3_GRID;
+				} else {
+					kind = q == TAG_VEC3_HALF ? TAG_VEC3_HALF : TAG_VEC3;
+				}
 				break;
 			default:
 				break;
@@ -1558,7 +1588,7 @@ void GoldNetMultiplayer::_server_tick() {
 	_add_entities();
 	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 	ServerHost host{ this, l };
-	server.tick(now, host);
+	server.tick(host, now);
 
 	if (dbg && now - dbg_last_ms > 2000) {
 		double kbps = (double)dbg_bytes / (double)(now - dbg_last_ms); // bytes/ms == KB/s
@@ -1667,7 +1697,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 		update_rate_granted = granted;
 		emit_signal("update_rate_granted", (int64_t)update_rate_granted);
 	}
-	if (dbg && info.committed) {
+	if (dbg && info) {
 		uint64_t now = Time::get_singleton()->get_ticks_msec();
 		if (now - dbg_last_ms > 2000) {
 			dbg_last_ms = now;
@@ -2244,7 +2274,7 @@ void GoldNetMultiplayer::_send_uplink() {
 		return;
 	}
 	goldnet::Writer w;
-	client.write_uplink(now, w);
+	client.write_uplink(w, now);
 	if (sim.loss_percent() > 0 && sim.loss_roll()) {
 		return; // simulated drop
 	}
@@ -2280,12 +2310,12 @@ Error GoldNetMultiplayer::_poll() {
 	uint64_t now = Time::get_singleton()->get_ticks_msec();
 	// Pump the send-side sim every poll on BOTH ends: a client delays its input RPCs here (the
 	// client→server leg), a server its snapshots + RPCs (server→client). Also advances the spike timer.
-	sim.pump(now, [this](PendingSend &ps) {
+	sim.pump([this](PendingSend &ps) {
 		Object *o = ObjectDB::get_instance(ps.object_id);
 		if (o) {
 			inner->rpc(ps.peer, o, ps.method, ps.args);
 		}
-	});
+	}, now);
 	// A peerless MultiplayerAPI has no unique id to report, and asking for one logs an error.
 	// That is a normal state, not a broken one — the API sits peerless before the first session
 	// and again after one ends (including a join the server refused because it was full) — and

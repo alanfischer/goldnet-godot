@@ -114,6 +114,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		Variant data;
 	};
 	HashMap<uint64_t, PendingSpawn> pending_spawns; // spawned-node ObjectID -> captured data
+	// Server: the nodes behind the core's spawn records, so one that's freed becomes a despawn.
+	HashMap<uint32_t, uint64_t> server_spawned;     // node net_id -> node ObjectID
 
 	// Client: nodes we spawned, so a despawn can free the right one. Also lets us emit the
 	// spawner's spawned/despawned signals (the game hangs bookkeeping off them).

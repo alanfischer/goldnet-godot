@@ -52,13 +52,13 @@ void GoldNetSimPeer::_poll() {
 		if (droppable && sim.loss_roll()) {
 			continue;
 		}
-		const int d = sim.schedule(now, p.from, (size_t)p.data.size(), droppable);
+		const int d = sim.schedule(p.from, (size_t)p.data.size(), droppable, now);
 		if (d < 0) {
 			continue;
 		}
-		sim.enqueue(now, p.from, d, std::move(p));
+		sim.enqueue(p.from, d, std::move(p), now);
 	}
-	sim.pump(now, [this](Packet &p) { _deliver(std::move(p)); });
+	sim.pump([this](Packet &p) { _deliver(std::move(p)); }, now);
 }
 
 void GoldNetSimPeer::_deliver(Packet &&p_packet) {
