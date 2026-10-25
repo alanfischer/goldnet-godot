@@ -877,8 +877,8 @@ uint64_t GoldNetMultiplayer::_min_interval_us() const {
 		return std::max<uint64_t>(1, (uint64_t)(1000000.0 / snapshot_rate_setting + 0.5));
 	}
 	uint64_t best = 0;
-	for (const CoreServer::Entity &e : server.entities()) {
-		MultiplayerSynchronizer *s = sync_from_objid(e.key());
+	for (const KeyValue<uint64_t, uint32_t> &kv : owned) {
+		MultiplayerSynchronizer *s = sync_from_objid(kv.key);
 		if (!s) {
 			continue;
 		}
@@ -1180,8 +1180,10 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 		return;
 	}
 	uint64_t id = (uint64_t)p_obj->get_instance_id();
-	// Passed the synchronizer itself — the direct case.
-	if (server.mark_dirty(id)) {
+	// Passed the synchronizer itself — the direct case. One the core doesn't have yet is read whole
+	// when it does.
+	if (owned.has(id)) {
+		server.mark_dirty(id);
 		return;
 	}
 	// Passed the node whose state is replicated. Games think in entities, so this is the call
@@ -1201,7 +1203,8 @@ void GoldNetMultiplayer::mark_dirty(Object *p_obj) {
 			continue;
 		}
 		uint64_t sid = (uint64_t)sync->get_instance_id();
-		if (server.mark_dirty(sid)) {
+		if (owned.has(sid)) {
+			server.mark_dirty(sid);
 			dirty_route[id] = sid;
 			return;
 		}
@@ -1455,24 +1458,6 @@ struct GoldNetMultiplayer::ServerHost {
 		return true;
 	}
 
-	// Read once, on the entity's first live tick — by then the game has set the metas. Changing
-	// gn_quant / gn_priority / gn_push afterwards has no effect; a game needing a runtime importance
-	// change should express it through visibility (set_visibility_for), consulted every tick.
-	goldnet::EntityLayout prepare(CoreServer::Entity &e) {
-		MultiplayerSynchronizer *sync = e.user.sync;
-		goldnet::EntityLayout l;
-		_read_push(sync, l.push);
-		l.priority = gn_read_priority(sync);
-		cache_slot_plan(sync, e.user.slot_target_id, e.user.slot_prop);
-		l.slots = e.user.slot_prop.size();
-		_make_slot_coding(sync, e.user.slot_target_id, e.user.slot_prop, e.user.coding);
-		for (uint8_t kind : e.user.coding.kinds) {
-			l.stepped.push_back(slot_kind_stepped(kind) ? 1 : 0);
-		}
-		l.kinds_check = e.user.coding.check;
-		return l;
-	}
-
 	// An entity's slots nearly always live on one object (its own node), so resolving the id once
 	// and reusing it across the run turns N lookups per entity into one. A target that has since
 	// been freed reads as nil, exactly as an unresolved one does.
@@ -1529,11 +1514,48 @@ struct GoldNetMultiplayer::ServerHost {
 	}
 };
 
+// Hand the core each owned synchronizer on its first live tick (in the tree, and ours), as
+// ServerHost::live would first say yes: by then the game has set the metas its layout is made from.
+// They're read once — changing gn_quant / gn_priority / gn_push afterwards has no effect; a game
+// needing a runtime importance change should express it through visibility (set_visibility_for),
+// consulted every tick.
+void GoldNetMultiplayer::_add_entities() {
+	Vector<uint64_t> done;
+	for (const uint64_t &objid : entities_to_add) {
+		MultiplayerSynchronizer *sync = sync_from_objid(objid);
+		if (!sync) {
+			done.push_back(objid); // freed before it went live
+			continue;
+		}
+		if (!sync->is_inside_tree() || !sync->is_multiplayer_authority()) {
+			continue;
+		}
+		SyncData d;
+		d.sync = sync;
+		goldnet::EntityLayout layout;
+		_read_push(sync, layout.push);
+		layout.priority = gn_read_priority(sync);
+		cache_slot_plan(sync, d.slot_target_id, d.slot_prop);
+		layout.slots = d.slot_prop.size();
+		_make_slot_coding(sync, d.slot_target_id, d.slot_prop, d.coding);
+		for (uint8_t kind : d.coding.kinds) {
+			layout.stepped.push_back(slot_kind_stepped(kind) ? 1 : 0);
+		}
+		layout.kinds_check = d.coding.check;
+		server.add_entity(objid, owned[objid], std::move(layout)).user = std::move(d);
+		done.push_back(objid);
+	}
+	for (int i = 0; i < done.size(); i++) {
+		entities_to_add.erase(done[i]);
+	}
+}
+
 void GoldNetMultiplayer::_server_tick() {
 	GoldNetLink *l = _ensure_link();
 	if (!l) {
 		return;
 	}
+	_add_entities();
 	uint32_t now = (uint32_t)Time::get_singleton()->get_ticks_msec();
 	ServerHost host{ this, l };
 	server.tick(now, host);
@@ -1551,11 +1573,6 @@ void GoldNetMultiplayer::_server_tick() {
 // their properties, and spawns / despawns / leaves to the spawners and signals the game listens to.
 struct GoldNetMultiplayer::ClientHost {
 	GoldNetMultiplayer *gn;
-	// The entity begin_entity() resolved, for the set_slot / end_entity calls that follow it.
-	MultiplayerSynchronizer *sync = nullptr;
-	Node *root = nullptr;
-	Vector<NodePath> slots;
-	const SlotCoding *coding = nullptr;
 
 	void protocol_mismatch() {
 		UtilityFunctions::push_error("goldnet: snapshot protocol mismatch — the server and client are "
@@ -1581,74 +1598,63 @@ struct GoldNetMultiplayer::ClientHost {
 		}
 	}
 
-	bool registered(uint32_t net_id) { return gn->netid_to_objid.has(net_id); }
-
-	int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) {
-		sync = nullptr;
-		root = nullptr;
-		coding = nullptr;
-		slots.clear();
-		if (const uint64_t *objid = gn->netid_to_objid.getptr(net_id)) {
-			MultiplayerSynchronizer *s = sync_from_objid(*objid);
-			if (s && s->is_inside_tree()) {
-				sync = s;
-			} else if (s && mask != 0) {
-				// Registered and still alive, but not in the tree yet: a warmup miss we should retry
-				// rather than silently swallow. Freed/unknown ids fall through (s == null) — nothing to
-				// wait for — so they don't defer and can't stall the stream.
-				r_defer = true;
-			}
-		}
+	// One synchronizer's replicated properties: decoded by their slot coding, set on the nodes they
+	// name, and then the synchronizer's `synchronized` signal, which the game reacts to replicated
+	// state in (only when something actually changed).
+	goldnet::EntityResult entity(goldnet::EntityUpdate<Variant> &u) {
+		const uint32_t net_id = u.net_id();
+		const uint64_t *objid = gn->netid_to_objid.getptr(net_id);
+		MultiplayerSynchronizer *sync = objid ? sync_from_objid(*objid) : nullptr;
 		if (!sync) {
-			return -1;
+			return goldnet::ENTITY_SKIP; // freed or unknown: nothing to wait for, so it can't stall the stream
 		}
+		if (!sync->is_inside_tree()) {
+			// Registered and still alive, but not in the tree yet: a warmup miss we should retry
+			// rather than silently swallow.
+			return goldnet::ENTITY_NOT_READY;
+		}
+		Vector<NodePath> slots;
 		get_sync_slots(sync, slots);
-		root = sync->get_node_or_null(sync->get_root_path());
-		const uint64_t objid = sync->get_instance_id();
-		coding = gn->client_slot_codings.getptr(objid);
+		const SlotCoding *coding = gn->client_slot_codings.getptr(*objid);
 		if (!coding) {
 			Vector<uint64_t> target_ids;
 			Vector<NodePath> props;
 			cache_slot_plan(sync, target_ids, props);
 			SlotCoding made;
 			_make_slot_coding(sync, target_ids, props, made);
-			gn->client_slot_codings[objid] = made;
-			coding = gn->client_slot_codings.getptr(objid);
+			gn->client_slot_codings[*objid] = made;
+			coding = gn->client_slot_codings.getptr(*objid);
 		}
-		if (whole && kinds_check != coding->check) {
+		if (u.whole() && u.kinds_check() != coding->check) {
 			if (!gn->warned_kinds.has(net_id)) {
 				gn->warned_kinds.insert(net_id);
 				UtilityFunctions::push_error("goldnet: ", sync->get_path(), "'s replicated properties are typed or "
 						"hinted differently here than on the server; its state is ignored. Rebuild both from the same project.");
 			}
-			return -1;
+			return goldnet::ENTITY_SKIP;
 		}
-		return slots.size();
-	}
-
-	bool set_slot(int s, const Variant &v) {
-		if (!root) {
-			return false;
+		Node *root = sync->get_node_or_null(sync->get_root_path());
+		bool applied = false;
+		for (int s : u.changed()) {
+			if (s >= slots.size() || s >= (int)coding->kinds.size()) {
+				break; // a slot this end doesn't have: left unset, so the client doesn't ack the snapshot
+			}
+			const Variant v = get_slot(u.reader(), coding->kinds[s], coding->grids[s], u.base(s), u.server_time());
+			if (u.reader().failed()) {
+				break;
+			}
+			u.set(s, v);
+			NodePath prop;
+			Node *target = root ? resolve_property(root, slots[s], prop) : nullptr;
+			if (target) {
+				target->set_indexed(prop, v);
+				applied = true;
+			}
 		}
-		NodePath prop;
-		Node *target = resolve_property(root, slots[s], prop);
-		if (!target) {
-			return false;
-		}
-		target->set_indexed(prop, v);
-		return true;
-	}
-
-	// The game reacts to replicated state in the synchronizer's `synchronized` signal handler, so
-	// re-emit it (only when something actually changed).
-	void end_entity(bool applied) {
 		if (applied) {
 			sync->emit_signal("synchronized");
 		}
-	}
-
-	Variant decode(goldnet::Reader &r, int slot, const Variant *base, uint32_t ref_time_ms) {
-		return get_slot(r, coding->kinds[slot], coding->grids[slot], base, ref_time_ms);
+		return goldnet::ENTITY_APPLIED;
 	}
 };
 
@@ -1668,7 +1674,7 @@ void GoldNetMultiplayer::apply_snapshot(const PackedByteArray &p_bytes) {
 			UtilityFunctions::print("[goldnet] recv seq=", info.seq, " base=", info.base_seq,
 					" spawn=", info.spawns, " despawn=", info.despawns,
 					" changed=", info.changed, " bytes=", (int)p_bytes.size(),
-					" registered=", (int)server.entities().size());
+					" registered=", (int)owned.size());
 		}
 	}
 }
@@ -2498,8 +2504,9 @@ Error GoldNetMultiplayer::_object_configuration_add(Object *p_object, const Vari
 	if (sync && _should_intercept(sync)) {
 		uint64_t objid = sync->get_instance_id();
 		uint32_t net_id = net_id_for(sync);
-		server.add_entity(objid, net_id);
+		owned[objid] = net_id;
 		netid_to_objid[net_id] = objid;
+		entities_to_add.insert(objid); // the server's core takes it once it's live (_add_entities)
 		_refresh_interval(); // intervals are set before the sync enters the tree
 		return OK; // we own it — do not forward to the inner
 	}
@@ -2517,8 +2524,11 @@ Error GoldNetMultiplayer::_object_configuration_remove(Object *p_object, const V
 	if (sync) {
 		uint64_t objid = sync->get_instance_id();
 		client_slot_codings.erase(objid);
-		if (CoreServer::Entity *e = server.find(objid)) {
-			netid_to_objid.erase(e->net_id());
+		if (const uint32_t *net_id = owned.getptr(objid)) {
+			netid_to_objid.erase(*net_id);
+			client.forget(*net_id); // freed with no despawn to say so (a map change, say)
+			owned.erase(objid);
+			entities_to_add.erase(objid);
 			server.remove_entity(objid);
 			_refresh_interval();
 			return OK;
