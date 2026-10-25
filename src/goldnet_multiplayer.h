@@ -16,7 +16,7 @@
 //
 // Upstream, an @rpc a node lists in its "gn_commands" meta is a command stream (see
 // addons/goldnet/command_stream.gd): a client's calls to the server are carried by its uplink
-// (goldnet::Client::uplink) instead of the inner, and the server calls the method once per call, in
+// (goldnet::Client::push_command) instead of the inner, and the server calls the method once per call, in
 // order, the way a reliable RPC would.
 //
 // Every other RPC between the server and a client rides the same packets too, as a message on
@@ -180,6 +180,8 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	HashMap<uint64_t, HashMap<StringName, bool>> _rpc_unreliable_cache; // object_id -> method -> is-unreliable
 
 	void _reset_client_state();
+	void _forget_peer(int32_t p_id);  // a peer's state, here and in the core
+	void _end_server_session();       // every peer's, when a hosted session ends
 
 	// --- Command streams (uplink) ---
 	// Client: the update rate the server last granted, as update_rate_granted told the game; -1 = none
