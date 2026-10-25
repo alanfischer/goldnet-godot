@@ -27,6 +27,7 @@
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
 #include "goldnet/uplink.h"
+#include "goldnet_net_ids.h"
 #include "goldnet_sim_peer.h"
 
 #include <vector>
@@ -86,24 +87,13 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	goldnet::Client<Variant> client;
 	struct ServerHost;
 	struct ClientHost;
-	// Every synchronizer we own, on both ends: ObjectID -> net_id (0 until it has one), and back for
-	// those that have one.
-	HashMap<uint64_t, uint32_t> owned;
-	HashMap<uint32_t, uint64_t> netid_to_objid;
-	// Server: synchronizers we don't own (nothing they replicate is a slot), net_id -> ObjectID and
-	// back. A spawn's visibility can still be asked of one (SpawnRecord::entities).
-	HashMap<uint32_t, uint64_t> other_syncs;
-	HashMap<uint64_t, uint32_t> other_sync_ids;
-
-	// Net ids. The server hands every one out, counting from 1 and never twice in a session, so
-	// they stay small on the wire (a byte under 128, two under 16384). A client learns them from
-	// the server: a spawn record names the ids of the synchronizers its node brings, and a bind
-	// record (a core spawn with spawner id 0 and a node's path for its data) names the id of a node
-	// both ends already have, a synchronizer or spawner placed in the scene.
-	uint32_t next_net_id = 1;
-	HashMap<uint32_t, uint64_t> server_bound; // server: each bind record's id -> the node it names
-	HashMap<uint32_t, uint64_t> client_bound; // client: each id the server gave a node here -> the node
-	HashSet<uint64_t> spawned_nodes;          // server: the nodes behind spawn records
+	// Which node each net_id names: synchronizers, spawners and spawned nodes. The server hands
+	// them out; a client learns them from its spawn and bind records (see the records in the .cpp).
+	NetIds ids;
+	// Every synchronizer we own, on both ends, by ObjectID.
+	HashSet<uint64_t> owned;
+	// Server: the ids with a bind record, which tells each peer the node one names by its path.
+	HashSet<uint32_t> bind_ids;
 	// Owned synchronizers the server hasn't handed the core yet: each goes in on its first live tick,
 	// once the game has set its metas (see _add_entities).
 	HashSet<uint64_t> entities_to_add;
@@ -118,11 +108,9 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// the client makes the child synchronizers auto-register; freeing it auto-unregisters. Nothing
 	// distinguishes a mover from a projectile downstream.
 	struct SpawnerEntry {
-		uint32_t net_id = 0; // 0 until the server gives it one (a bind record, see Net ids)
-		Callable orig_fn;    // the game's real spawn_function (we wrap it to capture spawn data)
+		Callable orig_fn; // the game's real spawn_function (we wrap it to capture spawn data)
 	};
-	HashMap<uint64_t, SpawnerEntry> spawners;       // spawner ObjectID -> entry
-	HashMap<uint32_t, uint64_t> spawner_netid_to_objid;
+	HashMap<uint64_t, SpawnerEntry> spawners; // spawner ObjectID -> entry
 
 	// Server: spawn data captured by the trampoline before the node is in the tree.
 	struct PendingSpawn {
@@ -130,12 +118,13 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 		Variant data;
 	};
 	HashMap<uint64_t, PendingSpawn> pending_spawns; // spawned-node ObjectID -> captured data
-	// Server: the nodes behind the core's spawn records, so one that's freed becomes a despawn.
-	HashMap<uint32_t, uint64_t> server_spawned;     // node net_id -> node ObjectID
+	// Server: the ids of the nodes behind the core's spawn records, so one that's freed becomes a
+	// despawn.
+	HashSet<uint32_t> server_spawned;
 
-	// Client: nodes we spawned, so a despawn can free the right one. Also lets us emit the
-	// spawner's spawned/despawned signals (the game hangs bookkeeping off them).
-	HashMap<uint32_t, uint64_t> client_spawned;     // node net_id -> node ObjectID
+	// Client: the ids of nodes we spawned, so a despawn frees the node rather than unbinding it. Also
+	// lets us emit the spawner's spawned/despawned signals (the game hangs bookkeeping off them).
+	HashSet<uint32_t> client_spawned;
 
 	// mark_dirty() accepts either a synchronizer or the node whose state it replicates, since a
 	// game thinks in entities, not synchronizers. Resolving node -> sync means scanning children,
@@ -303,11 +292,9 @@ private:
 	bool _apply_spawn(uint32_t p_net_id, uint32_t p_spawner_net_id, const uint8_t *p_data, size_t p_size); // client
 	bool _apply_bind(uint32_t p_net_id, const uint8_t *p_data, size_t p_size);                            // client
 	void _apply_despawn(uint32_t p_net_id);                                                                 // client
-	void _unbind(uint32_t p_net_id);                                                                        // client
-	uint32_t _sync_net_id(MultiplayerSynchronizer *p_sync);  // server: its id, handed out on first ask
-	uint32_t _spawner_net_id(uint64_t p_spawner_objid);      // server: the same, bound for every peer
+	uint32_t _spawner_net_id(uint64_t p_spawner_objid); // server: bound for every peer on first ask
 	void _add_bind(uint32_t p_net_id, Node *p_node, bool p_gated); // server
-	bool _under_spawned(Node *p_node) const;                 // server
+	bool _under_spawned(Node *p_node) const;                       // server
 
 protected:
 	static void _bind_methods();

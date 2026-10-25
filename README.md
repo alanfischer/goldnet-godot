@@ -44,8 +44,8 @@ game listens on one object.
 
 **Server-given ids.** The server hands every replicated node its `net_id`, counting from 1, so
 ids stay small on the wire: a byte each under 128, two under 16384. A client learns them as the
-nodes reach it. A spawn record lists the ids of the synchronizers its node brings, in the order
-both ends find them in the built node. A node placed in the scene (a synchronizer, or a spawner)
+nodes reach it. A spawn record lists the ids of the synchronizers its node brings, each with its
+path from the node. A node placed in the scene (a synchronizer, or a spawner)
 gets a *bind* record, a spawn with no spawner whose data is the node's path, which the client binds
 to its own node at that path. Both ride the reliable-until-acked spawn section, and a node's state
 counts as delivered only once its record has, so a client never holds state under an id it can't
