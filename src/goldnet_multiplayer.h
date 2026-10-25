@@ -70,6 +70,7 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// ObjectID; the wire net_id is a hash of its scene path (identical on server & client, since the
 	// same node lives at the same path on both — map entities and spawner-created nodes alike).
 	struct SyncData {
+		uint64_t objid = 0; // the synchronizer's ObjectID; the core knows it by its net_id
 		// Refreshed each tick by ServerHost::live, so the per-peer passes need no ObjectDB lookup.
 		MultiplayerSynchronizer *sync = nullptr;
 		// Resolved read plan, built once in _add_entities. The config and the node layout are
@@ -88,6 +89,9 @@ class GoldNetMultiplayer : public MultiplayerAPIExtension {
 	// Every synchronizer we own, on both ends: ObjectID -> net_id, and back.
 	HashMap<uint64_t, uint32_t> owned;
 	HashMap<uint32_t, uint64_t> netid_to_objid;
+	// Synchronizers we don't own (nothing they replicate is a slot), net_id -> ObjectID: a spawn's
+	// visibility can still be asked of one (SpawnRecord::entities).
+	HashMap<uint32_t, uint64_t> other_syncs;
 	// Owned synchronizers the server hasn't handed the core yet: each goes in on its first live tick,
 	// once the game has set its metas (see _add_entities).
 	HashSet<uint64_t> entities_to_add;
