@@ -1424,21 +1424,35 @@ void GoldNetMultiplayer::_make_slot_coding(MultiplayerSynchronizer *p_sync, cons
 				: Variant::NIL;
 		uint8_t kind = SK_TAGGED;
 		switch (type) {
+			// A kind is a tag or an SK_ kind, two enums, so each branch sets one rather than a ternary
+			// mixing them.
 			case Variant::INT:
-				kind = q == TAG_TIME_DELTA ? TAG_TIME_DELTA : SK_INT_STEP;
+				if (q == TAG_TIME_DELTA) {
+					kind = TAG_TIME_DELTA;
+				} else {
+					kind = SK_INT_STEP;
+				}
 				break;
 			case Variant::BOOL:
 				kind = TAG_BOOL;
 				break;
 			case Variant::FLOAT:
-				kind = grid > 0.0 ? SK_FLOAT_GRID
-						: q == TAG_ANGLE16 ? SK_ANGLE16_STEP
-						: q == TAG_ANGLE8 ? SK_ANGLE8_STEP
-						: q == TAG_HALF ? TAG_HALF
-												  : TAG_FLOAT;
+				if (grid > 0.0) {
+					kind = SK_FLOAT_GRID;
+				} else if (q == TAG_ANGLE16) {
+					kind = SK_ANGLE16_STEP;
+				} else if (q == TAG_ANGLE8) {
+					kind = SK_ANGLE8_STEP;
+				} else {
+					kind = q == TAG_HALF ? TAG_HALF : TAG_FLOAT;
+				}
 				break;
 			case Variant::VECTOR3:
-				kind = grid > 0.0 ? SK_VEC3_GRID : q == TAG_VEC3_HALF ? TAG_VEC3_HALF : TAG_VEC3;
+				if (grid > 0.0) {
+					kind = SK_VEC3_GRID;
+				} else {
+					kind = q == TAG_VEC3_HALF ? TAG_VEC3_HALF : TAG_VEC3;
+				}
 				break;
 			default:
 				break;
