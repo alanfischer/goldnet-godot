@@ -21,6 +21,237 @@ the next snapshot simply re-carries whatever changed since the acked baseline, s
 the stream self-heals. The result is steady bandwidth and connections that survive
 loss levels where reliable replication drops clients (see **Performance** below).
 
+## Usage
+
+1. Build it (see **Building**), then symlink or copy `addons/goldnet/` into your project's
+   `addons/`.
+2. Install it **before** any `MultiplayerSynchronizer` / `MultiplayerSpawner` enters
+   the tree:
+   ```gdscript
+   get_tree().set_multiplayer(GoldNetMultiplayer.new())
+   ```
+   Naming the class makes the script depend on the extension: where it isn't loaded, the
+   script fails to compile. A game that should fall back to stock replication instead
+   checks `ClassDB.class_exists(&"GoldNetMultiplayer")` and creates it with
+   `ClassDB.instantiate(&"GoldNetMultiplayer")`.
+3. Keep your stock synchronizers, spawners, and `@rpc` methods as-is.
+4. For PVS bandwidth culling, drive per-peer visibility through the push API rather
+   than `add_visibility_filter` (goldnet can't read filters — see **How it works**):
+   ```gdscript
+   sync.set_visibility_public(false)
+   # each net tick, per peer:
+   sync.set_visibility_for(peer_id, my_pvs_predicate(peer_id))
+   ```
+5. (Optional) Tune the installed API and opt into lossy per-property quantization:
+   ```gdscript
+   var gn := GoldNetMultiplayer.new()
+   gn.snapshot_rate = 30.0   # snapshots/sec; 0 = derive from synchronizers' replication_interval
+   get_tree().set_multiplayer(gn)
+
+   # Per property, keyed by the sync property's leaf name. Set before the sync enters
+   # the tree. Recognized hints:
+   #   "angle16"    radians → u16   (~0.0055° steps, 2 B)
+   #   "angle8"     radians → u8    (~1.4° steps, 1 B — classic GoldSrc precision)
+   #   "half"       float   → binary16
+   #   "vec3_half"  Vector3 → 3x binary16
+   #   "time_delta" int ms stamp → varint offset from the packet's header time. For
+   #                absolute ms timestamps only; ignored on non-int slots, since
+   #                truncating a float here would corrupt it rather than shrink it.
+   sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
+   # A float or Vector3 can travel on a grid instead: as whole steps of this size, coded
+   # as its change from what the peer holds. The value lands rounded to the grid.
+   sync.set_meta("gn_grid", { "pos": 0.001 })
+   ```
+   Declare the replicated properties' types (`var pos := Vector3.ZERO`): the kinds come
+   from them, and an untyped property gets the tagged fallback.
+   The hints and the replication config are two lists that have to agree (see **What we
+   wish Godot had** #4), so prefer declaring them together and letting `SyncSpec` — the
+   addon's GDScript helper — derive both. A hint keyed to a property the config does not
+   replicate is ignored in silence; a table cannot make that mistake, and `SyncSpec`
+   reports the ones it cannot rule out (an unrecognised hint name, two properties sharing
+   a leaf name):
+   ```gdscript
+   const SPEC := {
+       "NetInterp:net_pos":   {"quant": "vec3_half", "push": true},
+       "NetInterp:net_stamp": {"quant": "time_delta", "push": true},
+       "NetInterp:net_anim":  {},   # replicated, full precision, polled every tick
+       ".:pos":               {"grid": 0.001, "push": true},
+   }
+   node.add_child(SyncSpec.build("NetSync", SPEC))
+   # or, where the synchronizer is baked into a .tscn and the scene owns the config:
+   SyncSpec.apply($NetSync, SPEC)   # stamps the metas, reports drift from the config
+   ```
+6. (Optional) Weight an entity for the snapshot's entity budget. When more entities
+   change in a tick than fit in one packet, candidates are ordered by ticks-waited x
+   this weight, so a heavier entity wins the budget more often — without goldnet
+   knowing what any of them are. Default 1.0; read **once**, on the entity's first
+   tick, so set it before the sync enters the tree. Ticks-waited keeps rising for
+   whatever loses, so a weight biases the order without starving anything.
+   ```gdscript
+   sync.set_meta("gn_priority", 4.0)   # players over debris
+   ```
+7. (Optional) Limit a client's downlink with its **rate** (GoldSrc's `rate`): the most bytes per
+   second the server may send it, snapshots and `@rpc` traffic both counted. The client sets it,
+   and every uplink packet tells the server. Each send pushes the peer's
+   clear time out by its size over the rate; while that's in the future the peer is
+   **choked** — it gets no snapshot that tick, and the next one it does get deltas against
+   its acked baseline, so it carries the latest state rather than a backlog. A slow link
+   then gets fewer snapshots instead of a queue in front of every one of them. RPCs on the
+   netchan wait for the peer's next snapshot like everything else; ones on the inner (see
+   **RPCs on the netchan**) still go out when choked, but they count.
+   ```gdscript
+   gn.rate = 5000                    # client, bytes/sec; 0 = unlimited (the default)
+   gn.auto_rate = true               # or let goldnet pick it
+   ```
+
+   With `auto_rate` on, the client picks its rate from how far behind its best each snapshot
+   arrives, by the server's send time: no limit until the downlink queues, then a limit just under
+   what is arriving, a sharp cut while it still queues and a slow climb while it doesn't. A queue full
+   from the first snapshot shows no lag, so before the first limit, lost snapshots count as queueing
+   too. The server applies at least 1000 B/s.
+
+   A client can also ask to be served less often than the server ticks, with its **update rate**
+   (GoldSrc's `cl_updaterate`), without slowing anyone else: the tick still runs at full rate and
+   only skips that peer. The server grants it under its `snapshot_rate`, rounded down to every nth
+   tick, and under what the client's rate can carry: idle snapshots may take at most 30% of it, so
+   a slow link is served at a lower, steady rate rather than choking unevenly. It grants at least
+   10. Each snapshot tells the client what it was granted, which is what to size an
+   interpolation delay by.
+   ```gdscript
+   gn.update_rate = 20               # client, snapshots/sec; 0 = as many as the server sends (the default)
+   gn.update_rate_granted.connect(func(hz: int) -> void: interp_delay = 2.0 / hz)
+   ```
+
+   By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
+   `replication_interval`. A game with a fixed server tick can instead send them itself,
+   once per tick after writing that tick's state — GoldSrc's `SV_SendClientMessages` at the
+   end of `SV_Frame`. A timer that isn't locked to the tick drifts against it: some ticks go
+   out twice (the second with nothing new) and some never go out on their own, which a
+   client sees as uneven gaps. Per-peer intervals and rates still apply.
+   Set `snapshot_rate` to that tick's rate, so goldnet knows what it can grant.
+   ```gdscript
+   gn.manual_send = true             # goldnet's timer sends nothing
+   gn.snapshot_rate = 60.0           # the rate send_snapshots() is called at
+   gn.send_snapshots()               # call once per server tick, after the tick's writes
+   ```
+
+8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
+   Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
+   game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a
+   2.8 ms/tick poll down to 0.21 ms.
+
+   There is no switch to flip: **the `gn_push` meta IS the opt-in**, and the promise is
+   **per property, not per entity**. The meta lists the leaf names the game commits to
+   announcing; every property it does not name is polled every tick, and a sync that
+   declares nothing is polled entirely. So it is bounded — the worst a wrong declaration
+   can do is stall the properties it explicitly named, and a property added to the config
+   later can never silently go stale because nobody promised for it.
+   ```gdscript
+   # position is written by one publish funnel that calls mark_dirty; anything else on
+   # this sync is left undeclared and keeps being polled.
+   sync.set_meta("gn_push", ["position"])
+   ...
+   node.position = p
+   gn.mark_dirty(node)   # accepts the sync, or the node whose state it replicates
+   ```
+   `SyncSpec` carries this in the same table as the quantization hints — `{"push": true}`
+   per property — so the promise sits next to the property it is made about.
+   Read **once**, on the entity's first tick, like `gn_quant` and `gn_priority`.
+
+   Per-peer snapshot stats go to stdout via `GOLDNET_DEBUG=1` (env only — there is no
+   runtime property for it). Network-condition
+   simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
+   `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
+   `spike_duration_s`, and a slow link's `link_bps` / `link_queue_ms` / `link_overhead` —
+   which **replaces** the whole config on write, so `sim_config = {}`
+   is the off switch, a read-back matches what was written, and an unknown key is an
+   error rather than a silent reset. To change one knob, read-modify-write; every
+   setter is idempotent, so that disturbs nothing else (including the seed). To act on
+   PVS leave events, connect the `entity_relevance_lost(sync)` signal; they're on by default,
+   and `set_relevance_events(false)` turns them off (see **How it works → Per-peer visibility**).
+
+   The link cap models a modem or BLE connection rather than a lossy one: sending over
+   `link_bps` queues, so delay grows, and only once a link has `link_queue_ms` of backlog
+   are unreliable sends dropped (reliable ones keep queuing, as ENet would keep
+   retransmitting them). Each endpoint caps its own send leg, per peer: a server's
+   cap applies to each client's link separately, a client's to its one uplink. Headless,
+   `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
+   `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
+
+   `sim_config` is this endpoint's send leg, so on its own a client can only slow its uplink.
+   `recv_sim_config` takes the same keys and applies them to what a client **receives**, so a
+   client alone can play over a slow, lossy downlink with nothing set on the server: loss
+   drops unreliable packets, latency and spikes delay every packet, and `link_bps` queues
+   them. goldnet puts a client's peer behind a wrapper that holds arriving packets in the
+   same sim, and `multiplayer_peer` still returns the peer the game installed. It applies
+   live at any point in a session, and passes packets straight through while it is off.
+   ```gdscript
+   # 28.8k modem, both legs, from the client alone
+   gn.sim_config      = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
+   gn.recv_sim_config = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
+   ```
+9. (Optional) Send client input as a **command stream**. Declare the method a client calls once
+   per command as a reliable `@rpc`, and mark it before the first call:
+   ```gdscript
+   @rpc("any_peer", "call_remote", "reliable")
+   func submit_input(cmd: PackedByteArray) -> void:
+       var sender := multiplayer.get_remote_sender_id()
+       ...
+
+   func _ready() -> void:
+       CommandStream.mark(self, &"submit_input")
+   ```
+   The game code is the same with goldnet or without: every `submit_input.rpc_id(1, cmd)` runs
+   once on the server, in order, with the right sender. goldnet carries it over the uplink (see
+   **How it works**) instead of ENet's reliable channel, so a lost packet costs nothing while
+   the next one is on its way, and a long loss costs at most a round trip and a half. Only a
+   client's calls to the server are carried this way. A command still unacked after
+   `COMMAND_RING` (about a second at 60 Hz) is given up on, the one way it is weaker than the
+   reliable RPC. The arguments are the command's fields, delta-coded field by field against the
+   previous call, so declare their types: a small step in an `int` costs a byte, an unchanged
+   argument nothing. A command laid out elsewhere can be one `Dictionary` instead, declared by a
+   field table in `SyncSpec`'s shape and given to `mark` (see `command_stream.gd`).
+   ```gdscript
+   gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
+   gn.auto_command_rate = true   # or let goldnet pick it
+   ```
+10. (Optional) Keep an RPC off the netchan by declaring it on a channel other than 0. It goes
+   through the inner `SceneMultiplayer` straight away, ordered only against its own channel, as stock
+   orders each channel apart. That suits traffic with its own pacing, like voice, which shouldn't
+   compete with the snapshot's budget, and a call that can't wait for the next snapshot, like a
+   kick reason sent just before the disconnect.
+   ```gdscript
+   @rpc("authority", "call_remote", "unreliable", 1)
+   func sync_voice(packet: PackedByteArray) -> void: ...
+   ```
+   With `auto_command_rate` on, the client picks its command rate from the server's report of how
+   far behind its uplink packets arrive, carried in each snapshot header. It starts at 20 packets a
+   second and climbs quickly until the uplink first queues, so a slow link isn't flooded before a
+   report can say so; then it cuts under the rate the server sees packets arrive at, and climbs
+   slowly. It never goes past the physics tick rate.
+11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). Every key is present on both
+   ends and 0 where it doesn't apply.
+   ```gdscript
+   gn.get_peer_stats(peer)
+   # running totals, so diff two reads for a rate:
+   # server: chokes (snapshots withheld by the rate), messages_queued, messages_delivered
+   # client: snapshots_received, snapshots_lost, messages_queued, messages_delivered,
+   #         commands_pending, commands_dropped, recv_sim_bytes, recv_sim_packets (what
+   #         recv_sim_config let through; count these, not the transport's counters, while it is on)
+   # current values:
+   # both:   rate (bytes/sec in force), update_rate (snapshots/sec granted),
+   #         uplink_lag_ms, uplink_pps (measured by the server),
+   #         silent_ms (how long since the other end was last heard from: time it out on this)
+   # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
+   ```
+12. Two builds with different wire versions can't talk: each drops the other's packets. `get_protocol_version()`
+   returns the version, for a game's own join handshake to compare and refuse with a reason.
+
+> **Headless note:** Godot registers `.gdextension` files via
+> `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
+> To add the extension without opening the editor, append
+> `res://addons/goldnet/goldnet.gdextension` to that file manually.
+
 ## How it works
 
 **An engine-agnostic core, adapted to Godot.** The protocol itself is
@@ -386,232 +617,6 @@ a `SCOPE` note recording exactly that, usually because the code in question is d
 and unreachable through the public API. Those notes are load-bearing documentation: the
 next person to look will otherwise redo the analysis, or "fix" the test by asserting
 something false.
-
-## Usage
-
-1. Symlink or copy `addons/goldnet/` into your project's `addons/`.
-2. Install it **before** any `MultiplayerSynchronizer` / `MultiplayerSpawner` enters
-   the tree:
-   ```gdscript
-   get_tree().set_multiplayer(ClassDB.instantiate(&"GoldNetMultiplayer"))
-   ```
-3. Keep your stock synchronizers, spawners, and `@rpc` methods as-is.
-4. For PVS bandwidth culling, drive per-peer visibility through the push API rather
-   than `add_visibility_filter` (goldnet can't read filters — see **How it works**):
-   ```gdscript
-   sync.set_visibility_public(false)
-   # each net tick, per peer:
-   sync.set_visibility_for(peer_id, my_pvs_predicate(peer_id))
-   ```
-5. (Optional) Tune the installed API and opt into lossy per-property quantization:
-   ```gdscript
-   var gn := ClassDB.instantiate(&"GoldNetMultiplayer")
-   gn.snapshot_rate = 30.0   # snapshots/sec; 0 = derive from synchronizers' replication_interval
-   get_tree().set_multiplayer(gn)
-
-   # Per property, keyed by the sync property's leaf name. Set before the sync enters
-   # the tree. Recognized hints:
-   #   "angle16"    radians → u16   (~0.0055° steps, 2 B)
-   #   "angle8"     radians → u8    (~1.4° steps, 1 B — classic GoldSrc precision)
-   #   "half"       float   → binary16
-   #   "vec3_half"  Vector3 → 3x binary16
-   #   "time_delta" int ms stamp → varint offset from the packet's header time. For
-   #                absolute ms timestamps only; ignored on non-int slots, since
-   #                truncating a float here would corrupt it rather than shrink it.
-   sync.set_meta("gn_quant", { "yaw": "angle16", "pitch": "angle16" })
-   # A float or Vector3 can travel on a grid instead: as whole steps of this size, coded
-   # as its change from what the peer holds. The value lands rounded to the grid.
-   sync.set_meta("gn_grid", { "pos": 0.001 })
-   ```
-   Declare the replicated properties' types (`var pos := Vector3.ZERO`): the kinds come
-   from them, and an untyped property gets the tagged fallback.
-   The hints and the replication config are two lists that have to agree (see **What we
-   wish Godot had** #4), so prefer declaring them together and letting `SyncSpec` — the
-   addon's GDScript helper — derive both. A hint keyed to a property the config does not
-   replicate is ignored in silence; a table cannot make that mistake, and `SyncSpec`
-   reports the ones it cannot rule out (an unrecognised hint name, two properties sharing
-   a leaf name):
-   ```gdscript
-   const SPEC := {
-       "NetInterp:net_pos":   {"quant": "vec3_half", "push": true},
-       "NetInterp:net_stamp": {"quant": "time_delta", "push": true},
-       "NetInterp:net_anim":  {},   # replicated, full precision, polled every tick
-       ".:pos":               {"grid": 0.001, "push": true},
-   }
-   node.add_child(SyncSpec.build("NetSync", SPEC))
-   # or, where the synchronizer is baked into a .tscn and the scene owns the config:
-   SyncSpec.apply($NetSync, SPEC)   # stamps the metas, reports drift from the config
-   ```
-6. (Optional) Weight an entity for the snapshot's entity budget. When more entities
-   change in a tick than fit in one packet, candidates are ordered by ticks-waited x
-   this weight, so a heavier entity wins the budget more often — without goldnet
-   knowing what any of them are. Default 1.0; read **once**, on the entity's first
-   tick, so set it before the sync enters the tree. Ticks-waited keeps rising for
-   whatever loses, so a weight biases the order without starving anything.
-   ```gdscript
-   sync.set_meta("gn_priority", 4.0)   # players over debris
-   ```
-7. (Optional) Limit a client's downlink with its **rate** (GoldSrc's `rate`): the most bytes per
-   second the server may send it, snapshots and `@rpc` traffic both counted. The client sets it,
-   and every uplink packet tells the server. Each send pushes the peer's
-   clear time out by its size over the rate; while that's in the future the peer is
-   **choked** — it gets no snapshot that tick, and the next one it does get deltas against
-   its acked baseline, so it carries the latest state rather than a backlog. A slow link
-   then gets fewer snapshots instead of a queue in front of every one of them. RPCs on the
-   netchan wait for the peer's next snapshot like everything else; ones on the inner (see
-   **RPCs on the netchan**) still go out when choked, but they count.
-   ```gdscript
-   gn.rate = 5000                    # client, bytes/sec; 0 = unlimited (the default)
-   gn.auto_rate = true               # or let goldnet pick it
-   ```
-
-   With `auto_rate` on, the client picks its rate from how far behind its best each snapshot
-   arrives, by the server's send time: no limit until the downlink queues, then a limit just under
-   what is arriving, a sharp cut while it still queues and a slow climb while it doesn't. A queue full
-   from the first snapshot shows no lag, so before the first limit, lost snapshots count as queueing
-   too. The server applies at least 1000 B/s.
-
-   A client can also ask to be served less often than the server ticks, with its **update rate**
-   (GoldSrc's `cl_updaterate`), without slowing anyone else: the tick still runs at full rate and
-   only skips that peer. The server grants it under its `snapshot_rate`, rounded down to every nth
-   tick, and under what the client's rate can carry: idle snapshots may take at most 30% of it, so
-   a slow link is served at a lower, steady rate rather than choking unevenly. It grants at least
-   10. Each snapshot tells the client what it was granted, which is what to size an
-   interpolation delay by.
-   ```gdscript
-   gn.update_rate = 20               # client, snapshots/sec; 0 = as many as the server sends (the default)
-   gn.update_rate_granted.connect(func(hz: int) -> void: interp_delay = 2.0 / hz)
-   ```
-
-   By default snapshots go out on goldnet's own clock, from poll, at the synchronizers'
-   `replication_interval`. A game with a fixed server tick can instead send them itself,
-   once per tick after writing that tick's state — GoldSrc's `SV_SendClientMessages` at the
-   end of `SV_Frame`. A timer that isn't locked to the tick drifts against it: some ticks go
-   out twice (the second with nothing new) and some never go out on their own, which a
-   client sees as uneven gaps. Per-peer intervals and rates still apply.
-   Set `snapshot_rate` to that tick's rate, so goldnet knows what it can grant.
-   ```gdscript
-   gn.manual_send = true             # goldnet's timer sends nothing
-   gn.snapshot_rate = 60.0           # the rate send_snapshots() is called at
-   gn.send_snapshots()               # call once per server tick, after the tick's writes
-   ```
-
-8. (Optional) Skip the per-tick poll for properties your game already knows it wrote.
-   Declaring a property in a sync's `gn_push` meta makes goldnet read it only when the
-   game announced it with `mark_dirty(node_or_sync)`; on a 390-entity map that is a
-   2.8 ms/tick poll down to 0.21 ms.
-
-   There is no switch to flip: **the `gn_push` meta IS the opt-in**, and the promise is
-   **per property, not per entity**. The meta lists the leaf names the game commits to
-   announcing; every property it does not name is polled every tick, and a sync that
-   declares nothing is polled entirely. So it is bounded — the worst a wrong declaration
-   can do is stall the properties it explicitly named, and a property added to the config
-   later can never silently go stale because nobody promised for it.
-   ```gdscript
-   # position is written by one publish funnel that calls mark_dirty; anything else on
-   # this sync is left undeclared and keeps being polled.
-   sync.set_meta("gn_push", ["position"])
-   ...
-   node.position = p
-   gn.mark_dirty(node)   # accepts the sync, or the node whose state it replicates
-   ```
-   `SyncSpec` carries this in the same table as the quantization hints — `{"push": true}`
-   per property — so the promise sits next to the property it is made about.
-   Read **once**, on the entity's first tick, like `gn_quant` and `gn_priority`.
-
-   Per-peer snapshot stats go to stdout via `GOLDNET_DEBUG=1` (env only — there is no
-   runtime property for it). Network-condition
-   simulation is one `sim_config` dictionary property — keys `loss_percent`, `seed`,
-   `latency_min_ms`, `latency_max_ms`, `spike_ms`, `spike_interval_s`,
-   `spike_duration_s`, and a slow link's `link_bps` / `link_queue_ms` / `link_overhead` —
-   which **replaces** the whole config on write, so `sim_config = {}`
-   is the off switch, a read-back matches what was written, and an unknown key is an
-   error rather than a silent reset. To change one knob, read-modify-write; every
-   setter is idempotent, so that disturbs nothing else (including the seed). To act on
-   PVS leave events, connect the `entity_relevance_lost(sync)` signal; they're on by default,
-   and `set_relevance_events(false)` turns them off (see **How it works → Per-peer visibility**).
-
-   The link cap models a modem or BLE connection rather than a lossy one: sending over
-   `link_bps` queues, so delay grows, and only once a link has `link_queue_ms` of backlog
-   are unreliable sends dropped (reliable ones keep queuing, as ENet would keep
-   retransmitting them). Each endpoint caps its own send leg, per peer: a server's
-   cap applies to each client's link separately, a client's to its one uplink. Headless,
-   `GOLDNET_LINK=bytes_per_sec[,queue_ms]` sets it, alongside `GOLDNET_LOSS`,
-   `GOLDNET_LATENCY=min,max`, `GOLDNET_SPIKE=ms,interval,duration` and `GOLDNET_SIM_SEED`.
-
-   `sim_config` is this endpoint's send leg, so on its own a client can only slow its uplink.
-   `recv_sim_config` takes the same keys and applies them to what a client **receives**, so a
-   client alone can play over a slow, lossy downlink with nothing set on the server: loss
-   drops unreliable packets, latency and spikes delay every packet, and `link_bps` queues
-   them. goldnet puts a client's peer behind a wrapper that holds arriving packets in the
-   same sim, and `multiplayer_peer` still returns the peer the game installed. It applies
-   live at any point in a session, and passes packets straight through while it is off.
-   ```gdscript
-   # 28.8k modem, both legs, from the client alone
-   gn.sim_config      = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
-   gn.recv_sim_config = {"latency_min_ms": 80, "latency_max_ms": 120, "link_bps": 3000}
-   ```
-9. (Optional) Send client input as a **command stream**. Declare the method a client calls once
-   per command as a reliable `@rpc`, and mark it before the first call:
-   ```gdscript
-   @rpc("any_peer", "call_remote", "reliable")
-   func submit_input(cmd: PackedByteArray) -> void:
-       var sender := multiplayer.get_remote_sender_id()
-       ...
-
-   func _ready() -> void:
-       CommandStream.mark(self, &"submit_input")
-   ```
-   The game code is the same with goldnet or without: every `submit_input.rpc_id(1, cmd)` runs
-   once on the server, in order, with the right sender. goldnet carries it over the uplink (see
-   **How it works**) instead of ENet's reliable channel, so a lost packet costs nothing while
-   the next one is on its way, and a long loss costs at most a round trip and a half. Only a
-   client's calls to the server are carried this way. A command still unacked after
-   `COMMAND_RING` (about a second at 60 Hz) is given up on, the one way it is weaker than the
-   reliable RPC. The arguments are the command's fields, delta-coded field by field against the
-   previous call, so declare their types: a small step in an `int` costs a byte, an unchanged
-   argument nothing. A command laid out elsewhere can be one `Dictionary` instead, declared by a
-   field table in `SyncSpec`'s shape and given to `mark` (see `command_stream.gd`).
-   ```gdscript
-   gn.command_rate = 30          # packets/sec (GoldSrc cl_cmdrate); 0 = as commands are made
-   gn.auto_command_rate = true   # or let goldnet pick it
-   ```
-10. (Optional) Keep an RPC off the netchan by declaring it on a channel other than 0. It goes
-   through the inner `SceneMultiplayer` straight away, ordered only against its own channel, as stock
-   orders each channel apart. That suits traffic with its own pacing, like voice, which shouldn't
-   compete with the snapshot's budget, and a call that can't wait for the next snapshot, like a
-   kick reason sent just before the disconnect.
-   ```gdscript
-   @rpc("authority", "call_remote", "unreliable", 1)
-   func sync_voice(packet: PackedByteArray) -> void: ...
-   ```
-   With `auto_command_rate` on, the client picks its command rate from the server's report of how
-   far behind its uplink packets arrive, carried in each snapshot header. It starts at 20 packets a
-   second and climbs quickly until the uplink first queues, so a slow link isn't flooded before a
-   report can say so; then it cuts under the rate the server sees packets arrive at, and climbs
-   slowly. It never goes past the physics tick rate.
-11. Read a link's stats with `get_peer_stats(peer)` (a client passes 1). Every key is present on both
-   ends and 0 where it doesn't apply.
-   ```gdscript
-   gn.get_peer_stats(peer)
-   # running totals, so diff two reads for a rate:
-   # server: chokes (snapshots withheld by the rate), messages_queued, messages_delivered
-   # client: snapshots_received, snapshots_lost, messages_queued, messages_delivered,
-   #         commands_pending, commands_dropped, recv_sim_bytes, recv_sim_packets (what
-   #         recv_sim_config let through; count these, not the transport's counters, while it is on)
-   # current values:
-   # both:   rate (bytes/sec in force), update_rate (snapshots/sec granted),
-   #         uplink_lag_ms, uplink_pps (measured by the server),
-   #         silent_ms (how long since the other end was last heard from: time it out on this)
-   # client: command_rate (packets/sec in force), command_rtt_ms, downlink_lag_ms, delivered_bps
-   ```
-12. Two builds with different wire versions can't talk: each drops the other's packets. `get_protocol_version()`
-   returns the version, for a game's own join handshake to compare and refuse with a reason.
-
-> **Headless note:** Godot registers `.gdextension` files via
-> `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
-> To add the extension without opening the editor, append
-> `res://addons/goldnet/goldnet.gdextension` to that file manually.
 
 ## Using the core without Godot
 
