@@ -1,6 +1,6 @@
 # goldnet-godot
 
-A Godot 4 GDExtension that provides **`GoldNetMultiplayer`**, a drop-in
+A Godot 4.7+ GDExtension that provides **`GoldNetMultiplayer`**, a drop-in
 `MultiplayerAPI` implementing **GoldSrc/Quake-style netcode** — an unreliable,
 delta-against-acked-baseline snapshot stream — served **behind the stock
 `MultiplayerSynchronizer` / `MultiplayerSpawner` API**. You keep your ordinary
@@ -176,8 +176,7 @@ per-peer visibility through the *push* API instead: compute the PVS predicate an
 call `set_visibility_for(peer, visible)` each net tick, with
 `public_visibility = false`. One `peer_visibility` map then serves both backends —
 the stock replicator reads it via `is_visible_to`, goldnet via
-`get_visibility_for`. (WizardWars does this with a small `NetworkManager` registry;
-see its `register_pvs_sync` / `push_pvs_visibility`.)
+`get_visibility_for`.
 
 > **Engine limitation — want to fix upstream.** The push detour exists only because
 > `MultiplayerSynchronizer::is_visible_to(peer)` is not exposed to GDExtension (it isn't
@@ -199,11 +198,10 @@ markers (the section above) for owned syncs that drop out of a peer's PVS, surfa
 the game as the `entity_relevance_lost(sync)` signal so it can hide/despawn its view of
 them. Turn it off with `set_relevance_events(false)` and goldnet stays a pure
 state-replication transport, leaving games to drive relevance however they like.
-(WizardWars connects `NetworkManager._on_entity_relevance_lost`.)
 
 ## Performance
 
-Measured in WizardWars (ww_2fort + 4 bots, stationary headless clients, server→client
+Measured in [Wizard Wars](https://github.com/alanfischer/wizardwars) (ww_2fort + 4 bots, stationary headless clients, server→client
 egress at the ENet socket), goldnet vs the **stock `MultiplayerSynchronizer`** path
 on the same build with the same PVS:
 
@@ -263,8 +261,7 @@ per-peer visibility with filter callbacks, but the query isn't exposed, so an ex
 "is this sync visible to peer N" through the engine's own filter chain.
 
 *Forces:* goldnet reads `is_visibility_public()` / `get_visibility_for()` directly, which means
-the game must push per-peer visibility itself every net tick (WizardWars does this in
-`NetworkManager.push_pvs_visibility`) rather than registering a filter and letting the engine
+the game must push per-peer visibility itself every net tick rather than registering a filter and letting the engine
 answer. Visibility *filters* are effectively unusable from an extension.
 
 **3. A spawner you can see before its first spawn.** `MultiplayerSpawner` is only revealed to a
@@ -317,9 +314,6 @@ objects through its virtuals, so every engine class's instance-binding callbacks
 must be linked in, not just the ones this extension names directly. Rebuild after
 any source change and relaunch the game — a running session won't pick up new native
 code.
-
-In this monorepo, `extern/godot-cpp` is a symlink to the shared checkout under
-`extern/hop-godot` so we don't vendor a second copy.
 
 ## Testing
 
@@ -617,8 +611,7 @@ something false.
 > **Headless note:** Godot registers `.gdextension` files via
 > `.godot/extension_list.cfg`, refreshed by an editor project scan (or export).
 > To add the extension without opening the editor, append
-> `res://addons/goldnet/goldnet.gdextension` to that file manually. WizardWars gates
-> the install behind the `--goldnet` command-line flag.
+> `res://addons/goldnet/goldnet.gdextension` to that file manually.
 
 ## Using the core without Godot
 
